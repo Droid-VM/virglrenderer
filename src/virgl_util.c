@@ -112,8 +112,28 @@ void flush_eventfd(int fd)
     } while ((len == -1 && errno == EINTR) || len == sizeof(value));
 }
 
+const struct log_levels_lut {
+   char *name;
+   enum virgl_log_level_flags log_level;
+} log_levels_table[] = {
+   {"debug", VIRGL_LOG_LEVEL_DEBUG},
+   {"info", VIRGL_LOG_LEVEL_INFO},
+   {"warning", VIRGL_LOG_LEVEL_WARNING},
+   {"error", VIRGL_LOG_LEVEL_ERROR},
+   { NULL, 0 },
+};
+
+#ifndef NDEBUG
+static enum virgl_log_level_flags virgl_log_level = VIRGL_LOG_LEVEL_WARNING;
+#else
+static enum virgl_log_level_flags virgl_log_level = VIRGL_LOG_LEVEL_ERROR;
+#endif
+static bool virgl_log_level_initialized = false;
+
 static
-void virgl_default_logger(const char *fmt, va_list va)
+void virgl_default_logger(UNUSED enum virgl_log_level_flags log_level,
+                          const char *message,
+                          UNUSED void* user_data)
 {
    static FILE* fp = NULL;
    if (NULL == fp) {
@@ -141,35 +161,62 @@ void virgl_default_logger(const char *fmt, va_list va)
             fp = stderr;
       }
    }
-   vfprintf(fp, fmt, va);
+
+   if (!virgl_log_level_initialized) {
+      const char* log_level_env = getenv("VIRGL_LOG_LEVEL");
+      if (log_level_env != NULL && log_level_env[0] != '\0') {
+         const struct log_levels_lut *lut = log_levels_table;
+         while (lut->name) {
+            if (!strcmp(lut->name, log_level_env)) {
+               virgl_log_level = lut->log_level;
+               break;
+            }
+         }
+
+         if (!lut->name)
+            fprintf(fp, "Unknown log level %s requested\n", log_level_env);
+      }
+
+      virgl_log_level_initialized = true;
+   }
+
+   if (log_level < virgl_log_level)
+      return;
+
+   fprintf(fp, "%s", message);
    fflush(fp);
 }
 
-static
-void virgl_null_logger(UNUSED const char *fmt, UNUSED va_list va)
+static struct {
+   virgl_log_callback_type log_cb;
+   virgl_free_data_callback_type free_data_cb;
+   void *user_data;
+} virgl_log_data = { virgl_default_logger, NULL, NULL };
+
+void virgl_log_set_handler(virgl_log_callback_type log_cb,
+                           void *user_data,
+                           virgl_free_data_callback_type free_data_cb)
 {
-}
+   if (virgl_log_data.free_data_cb)
+      virgl_log_data.free_data_cb(virgl_log_data.user_data);
 
-static virgl_debug_callback_type virgl_logger = virgl_default_logger;
-
-virgl_debug_callback_type virgl_log_set_logger(virgl_debug_callback_type logger)
-{
-   virgl_debug_callback_type old = virgl_logger;
-
-   /* virgl_null_logger is internal */
-   if (old == virgl_null_logger)
-      old = NULL;
-   if (!logger)
-      logger = virgl_null_logger;
-
-   virgl_logger = logger;
-   return old;
+   virgl_log_data.log_cb = log_cb;
+   virgl_log_data.free_data_cb = free_data_cb;
+   virgl_log_data.user_data = user_data;
 }
 
 void virgl_logv(const char *fmt, va_list va)
 {
-   assert(virgl_logger);
-   virgl_logger(fmt, va);
+   char *str = NULL;
+
+   if (!virgl_log_data.log_cb)
+      return;
+
+   if (vasprintf(&str, fmt, va) < 0)
+      return;
+
+   virgl_log_data.log_cb(VIRGL_LOG_LEVEL_INFO, str, virgl_log_data.user_data);
+   free (str);
 }
 
 #if ENABLE_TRACING == TRACE_WITH_PERCETTO

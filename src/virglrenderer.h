@@ -236,6 +236,18 @@ struct virgl_renderer_supported_structures {
 /* This typedef must be kept in sync with vrend_debug.h */
 typedef void (*virgl_debug_callback_type)(const char *fmt, va_list ap);
 
+enum virgl_log_level_flags {
+   VIRGL_LOG_LEVEL_DEBUG,
+   VIRGL_LOG_LEVEL_INFO,
+   VIRGL_LOG_LEVEL_WARNING,
+   VIRGL_LOG_LEVEL_ERROR,
+};
+
+typedef void (*virgl_free_data_callback_type)(void* user_data);
+typedef void (*virgl_log_callback_type) (enum virgl_log_level_flags log_level,
+                                         const char *message,
+                                         void* user_data);
+
 VIRGL_EXPORT int virgl_renderer_resource_create(struct virgl_renderer_resource_create_args *args, struct iovec *iov, uint32_t num_iovs);
 VIRGL_EXPORT int virgl_renderer_resource_import_eglimage(struct virgl_renderer_resource_create_args *args, void *image);
 VIRGL_EXPORT void virgl_renderer_resource_unref(uint32_t res_handle);
@@ -284,7 +296,14 @@ VIRGL_EXPORT void virgl_renderer_force_ctx_0(void);
 VIRGL_EXPORT void virgl_renderer_ctx_attach_resource(int ctx_id, int res_handle);
 VIRGL_EXPORT void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle);
 
+/* This API is deprecated, use virgl_set_log_callback instead */
 VIRGL_EXPORT virgl_debug_callback_type virgl_set_debug_callback(virgl_debug_callback_type cb);
+/* Redirects all the logs to the callback, the callback will be called with the given
+ * user_data, free_user_data_cb will be called if the callback is replaced or if
+ * the program ends to free user_data */
+VIRGL_EXPORT void virgl_set_log_callback(virgl_log_callback_type cb,
+                                         void* user_data,
+                                         virgl_free_data_callback_type free_user_data_cb);
 
 /* return information about a resource */
 

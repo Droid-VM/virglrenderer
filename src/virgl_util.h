@@ -67,7 +67,10 @@ int create_eventfd(unsigned int initval);
 int write_eventfd(int fd, uint64_t val);
 void flush_eventfd(int fd);
 
-virgl_debug_callback_type virgl_log_set_logger(virgl_debug_callback_type logger);
+void virgl_log_set_handler(virgl_log_callback_type log_cb,
+                           void *user_data,
+                           virgl_free_data_callback_type free_data_cb);
+
 void virgl_logv(const char *fmt, va_list va);
 
 static inline void PRINTFLIKE(1, 2) virgl_log(const char *fmt, ...)

@@ -863,9 +863,50 @@ int virgl_renderer_get_poll_fd(void)
    return -1;
 }
 
+static
+void virgl_null_logger(UNUSED const char *fmt, UNUSED va_list va)
+{
+}
+
+/* Compatibility layer for the virgl_set_debug_callback function */
+static inline void virgl_legacy_logger_wrapper(virgl_debug_callback_type cb,
+                                               const char *fmt,
+                                               ...)
+{
+   va_list va;
+   va_start(va, fmt);
+   cb(fmt, va);
+   va_end(va);
+}
+
+/* The logger need to be wrapped into a structure to be given as void* */
+struct virgl_legacy_logger_holder {
+   virgl_debug_callback_type logger;
+};
+
+static void virgl_legacy_logger(UNUSED enum virgl_log_level_flags log_level,
+                                const char *message,
+                                void* user_data)
+{
+   struct virgl_legacy_logger_holder *log_cb = user_data;
+   virgl_legacy_logger_wrapper(log_cb->logger, "%s", message);
+}
+
+static struct virgl_legacy_logger_holder legacy_logger = { virgl_null_logger };
+
 virgl_debug_callback_type virgl_set_debug_callback(virgl_debug_callback_type cb)
 {
-   return virgl_log_set_logger(cb);
+   virgl_debug_callback_type previous_cb = legacy_logger.logger;
+   legacy_logger.logger = cb;
+   virgl_log_set_handler(virgl_legacy_logger, &legacy_logger, NULL);
+   return previous_cb;
+}
+
+void virgl_set_log_callback(virgl_log_callback_type cb,
+                            void* user_data,
+                            virgl_free_data_callback_type free_user_data_cb)
+{
+   virgl_log_set_handler(cb, user_data, free_user_data_cb);
 }
 
 static int virgl_renderer_export_query(void *execute_args, uint32_t execute_size)

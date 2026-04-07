@@ -386,6 +386,13 @@ static struct global_renderer_state vrend_state;
 
 static inline bool has_feature(enum features_id feature_id)
 {
+#ifdef __ANDROID__
+   /* Adreno reports dual-source blend support, but the GLES path can fail to
+    * link virgl-generated fragment shaders that use multiple color outputs.
+    */
+   if (vrend_state.use_gles && feature_id == feat_dual_src_blend)
+      return false;
+#endif
    int slot = feature_id / 64;
    uint64_t mask = 1ull << (feature_id & 63);
    bool retval = vrend_state.features[slot] & mask ? true : false;
@@ -12552,4 +12559,3 @@ struct vrend_video_context *vrend_context_get_video_ctx(struct vrend_context *ct
     return ctx->video;
 }
 #endif
-

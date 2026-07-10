@@ -110,6 +110,7 @@ cc_library {
         "src/drm/drm_fence.c",
         "src/drm/drm_renderer.c",
         "src/drm/drm_util.c",
+        "src/drm/kgsl/kgsl_renderer.c",
         "src/mesa/util/anon_file.c",
         "src/mesa/util/bitscan.c",
         "src/mesa/util/hash_table.c",

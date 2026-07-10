@@ -54,6 +54,8 @@
 #define ENABLE_DRM 1
 /* ENABLE_DRM_MSM disabled: no drm/msm on this device; KGSL backend replaces it */
 /* #define ENABLE_DRM_MSM 1 */
+/* KGSL native-context backend: msm protocol server over Qualcomm KGSL uapi */
+#define ENABLE_DRM_KGSL 1
 
 // Disable render server (for now)
 //#define ENABLE_RENDER_SERVER 1

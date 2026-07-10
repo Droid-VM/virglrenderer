@@ -6,6 +6,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -17,6 +18,10 @@
 #include "drm_hw.h"
 #include "drm_renderer.h"
 #include "drm_util.h"
+
+#ifdef ENABLE_DRM_KGSL
+#  include "kgsl/kgsl_renderer.h"
+#endif
 
 #ifdef ENABLE_DRM_MSM
 #  include "msm/msm_renderer.h"
@@ -43,9 +48,25 @@ static struct virgl_renderer_capset_drm capset;
 static const struct backend {
    uint32_t context_type;
    const char *name;
+   /* KGSL is a plain character device, not a DRM node: it is opened by path
+    * and probed without drmGetVersion().
+    */
+   bool char_device;
+   const char *node;
    int (*probe)(int fd, struct virgl_renderer_capset_drm *capset);
    struct virgl_context *(*create)(int fd, size_t debug_len, const char *debug_name);
 } backends[] = {
+#ifdef ENABLE_DRM_KGSL
+   {
+      /* Guest speaks the msm protocol; host bridges it to KGSL. */
+      .context_type = VIRTGPU_DRM_CONTEXT_MSM,
+      .name = "kgsl",
+      .char_device = true,
+      .node = KGSL_DEVICE_NODE,
+      .probe = kgsl_renderer_probe,
+      .create = kgsl_renderer_create,
+   },
+#endif
 #ifdef ENABLE_DRM_MSM
    {
       .context_type = VIRTGPU_DRM_CONTEXT_MSM,
@@ -94,6 +115,27 @@ drm_renderer_init(int drm_fd)
    for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
       const struct backend *b = &backends[i];
       int fd;
+
+      /* Character-device backends (KGSL) have no DRM version node; open by
+       * path and let the backend fill the capset from its own properties.
+       */
+      if (b->char_device) {
+         if (drm_fd != -1)
+            continue;
+
+         fd = open(b->node, O_RDWR | O_CLOEXEC);
+         if (fd < 0)
+            continue;
+
+         capset.context_type = b->context_type;
+
+         int ret = b->probe(fd, &capset);
+         if (ret)
+            memset(&capset, 0, sizeof(capset));
+
+         close(fd);
+         return ret;
+      }
 
       if (drm_fd != -1) {
          fd = drm_fd;
@@ -172,6 +214,13 @@ drm_renderer_create(size_t debug_len, const char *debug_name, int drm_fd)
 
       if (b->context_type != capset.context_type)
          continue;
+
+      if (b->char_device) {
+         int fd = open(b->node, O_RDWR | O_CLOEXEC);
+         if (fd < 0)
+            return NULL;
+         return b->create(fd, debug_len, debug_name);
+      }
 
       int fd = drm_fd;
       if (fd < 0)

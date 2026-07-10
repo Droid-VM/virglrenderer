@@ -27,8 +27,8 @@ struct virgl_context;
 struct drm_timeline {
    struct virgl_context *vctx;
    const char *name;
-   int eventfd;
    int ring_idx;
+   virgl_context_fence_retire fence_retire;
 
    int last_fence_fd;
    struct list_head pending_fences;
@@ -40,7 +40,8 @@ struct drm_timeline {
 };
 
 void drm_timeline_init(struct drm_timeline *timeline, struct virgl_context *vctx,
-                       const char *name, int eventfd, int ring_idx);
+                       const char *name, int ring_idx,
+                       virgl_context_fence_retire fence_retire);
 
 void drm_timeline_fini(struct drm_timeline *timeline);
 

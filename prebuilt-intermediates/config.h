@@ -51,8 +51,9 @@
 //#define ENABLE_VENUS_VALIDATE 1
 
 // Disable direct DRM support - only used by freedreno
-//#define ENABLE_DRM 1
-//#define ENABLE_DRM_MSM 1
+#define ENABLE_DRM 1
+/* ENABLE_DRM_MSM disabled: no drm/msm on this device; KGSL backend replaces it */
+/* #define ENABLE_DRM_MSM 1 */
 
 // Disable render server (for now)
 //#define ENABLE_RENDER_SERVER 1

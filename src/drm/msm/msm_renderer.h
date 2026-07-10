@@ -20,6 +20,6 @@
 
 int msm_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
 
-struct virgl_context *msm_renderer_create(int fd);
+struct virgl_context *msm_renderer_create(int fd, size_t debug_len, const char *debug_name);
 
 #endif /* MSM_RENDERER_H_ */

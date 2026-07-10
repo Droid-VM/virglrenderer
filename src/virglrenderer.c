@@ -235,7 +235,8 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
          return EINVAL;
       break;
    case VIRGL_RENDERER_CAPSET_DRM:
-      ctx = drm_renderer_create(nlen, name);
+      /* -1: use the device picked at drm_renderer_init time (KGSL host: no /dev/dri). */
+      ctx = drm_renderer_create(nlen, name, -1);
       break;
    default:
       return EINVAL;

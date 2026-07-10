@@ -19,18 +19,22 @@
 
 #include "util/anon_file.h"
 #include "util/hash_table.h"
+#include "util/libsync.h"
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/u_atomic.h"
 #include "util/u_thread.h"
 
+#include "drm_context.h"
 #include "drm_fence.h"
+#include "drm_hw.h"
 
 #include "msm_drm.h"
 #include "msm_proto.h"
 #include "msm_renderer.h"
 
 static unsigned nr_timelines;
+static uint32_t uabi_version;
 
 /**
  * A single context (from the PoV of the virtio-gpu protocol) maps to
@@ -54,25 +58,14 @@ static unsigned nr_timelines;
  * entries in either hashtable at context teardown.
  */
 struct msm_context {
-   struct virgl_context base;
+   struct drm_context base;
 
    struct msm_shmem *shmem;
-   uint8_t *rsp_mem;
-   uint32_t rsp_mem_sz;
-
-   struct msm_ccmd_rsp *current_rsp;
-
-   int fd;
-
-   struct hash_table *blob_table;
-   struct hash_table *resource_table;
 
    /**
     * Maps submit-queue id to ring_idx
     */
    struct hash_table *sq_to_ring_idx_table;
-
-   int eventfd;
 
    /**
     * Indexed by ring_idx-1, which is the same as the submitqueue priority+1.
@@ -82,18 +75,9 @@ struct msm_context {
     */
    struct drm_timeline timelines[];
 };
-DEFINE_CAST(virgl_context, msm_context)
+DEFINE_CAST(drm_context, msm_context)
 
 #define valid_payload_len(req) ((req)->len <= ((req)->hdr.len - sizeof(*(req))))
-
-static struct hash_entry *
-table_search(struct hash_table *ht, uint32_t key)
-{
-   /* zero is not a valid key for u32_keys hashtable: */
-   if (!key)
-      return NULL;
-   return _mesa_hash_table_search(ht, (void *)(uintptr_t)key);
-}
 
 static int
 gem_info(struct msm_context *mctx, uint32_t handle, uint32_t param, uint64_t *val)
@@ -105,7 +89,7 @@ gem_info(struct msm_context *mctx, uint32_t handle, uint32_t param, uint64_t *va
    };
    int ret;
 
-   ret = drmCommandWriteRead(mctx->fd, DRM_MSM_GEM_INFO, &args, sizeof(args));
+   ret = drmCommandWriteRead(mctx->base.fd, DRM_MSM_GEM_INFO, &args, sizeof(args));
    if (ret)
       return ret;
 
@@ -123,95 +107,47 @@ gem_close(int fd, uint32_t handle)
 }
 
 struct msm_object {
-   uint32_t blob_id;
-   uint32_t res_id;
-   uint32_t handle;
+   struct drm_object base;
    uint32_t flags;
-   uint32_t size;
    bool exported   : 1;
    bool exportable : 1;
-   struct virgl_resource *res;
-   void *map;
+   uint8_t *map;
 };
+DEFINE_CAST(drm_object, msm_object)
 
 static struct msm_object *
-msm_object_create(uint32_t handle, uint32_t flags, uint32_t size)
+msm_object_create(uint32_t handle, uint32_t flags, uint64_t size)
 {
    struct msm_object *obj = calloc(1, sizeof(*obj));
 
    if (!obj)
       return NULL;
 
-   obj->handle = handle;
+   obj->base.handle = handle;
+   obj->base.size = size;
    obj->flags = flags;
-   obj->size = size;
 
    return obj;
-}
-
-static bool
-valid_blob_id(struct msm_context *mctx, uint32_t blob_id)
-{
-   /* must be non-zero: */
-   if (blob_id == 0)
-      return false;
-
-   /* must not already be in-use: */
-   if (table_search(mctx->blob_table, blob_id))
-      return false;
-
-   return true;
-}
-
-static void
-msm_object_set_blob_id(struct msm_context *mctx, struct msm_object *obj, uint32_t blob_id)
-{
-   assert(valid_blob_id(mctx, blob_id));
-
-   obj->blob_id = blob_id;
-   _mesa_hash_table_insert(mctx->blob_table, (void *)(uintptr_t)obj->blob_id, obj);
-}
-
-static bool
-valid_res_id(struct msm_context *mctx, uint32_t res_id)
-{
-   return !table_search(mctx->resource_table, res_id);
-}
-
-static void
-msm_object_set_res_id(struct msm_context *mctx, struct msm_object *obj, uint32_t res_id)
-{
-   assert(valid_res_id(mctx, res_id));
-
-   obj->res_id = res_id;
-   _mesa_hash_table_insert(mctx->resource_table, (void *)(uintptr_t)obj->res_id, obj);
-}
-
-static void
-msm_remove_object(struct msm_context *mctx, struct msm_object *obj)
-{
-   drm_dbg("obj=%p, blob_id=%u, res_id=%u", obj, obj->blob_id, obj->res_id);
-   _mesa_hash_table_remove_key(mctx->resource_table, (void *)(uintptr_t)obj->res_id);
 }
 
 static struct msm_object *
 msm_retrieve_object_from_blob_id(struct msm_context *mctx, uint64_t blob_id)
 {
-   assert((blob_id >> 32) == 0);
-   uint32_t id = blob_id;
-   struct hash_entry *entry = table_search(mctx->blob_table, id);
-   if (!entry)
+   struct drm_object *dobj = drm_context_retrieve_object_from_blob_id(&mctx->base, blob_id);
+   if (!dobj)
       return NULL;
-   struct msm_object *obj = entry->data;
-   _mesa_hash_table_remove(mctx->blob_table, entry);
-   return obj;
+
+   return to_msm_object(dobj);
 }
 
 static struct msm_object *
 msm_get_object_from_res_id(struct msm_context *mctx, uint32_t res_id)
 {
-   const struct hash_entry *entry = table_search(mctx->resource_table, res_id);
-   return likely(entry) ? entry->data : NULL;
+   struct drm_object *dobj = drm_context_get_object_from_res_id(&mctx->base, res_id);
+   if (!dobj)
+      return NULL;
+
+   return to_msm_object(dobj);
 }
 
 static uint32_t
@@ -220,7 +156,7 @@ handle_from_res_id(struct msm_context *mctx, uint32_t res_id)
    struct msm_object *obj = msm_get_object_from_res_id(mctx, res_id);
    if (!obj)
       return 0;    /* zero is an invalid GEM handle */
-   return obj->handle;
+   return obj->base.handle;
 }
 
 static bool
@@ -234,6 +170,25 @@ has_cached_coherent(int fd)
    /* Do a test allocation to see if cached-coherent is supported: */
    if (!drmCommandWriteRead(fd, DRM_MSM_GEM_NEW, &new_req, sizeof(new_req))) {
       gem_close(fd, new_req.handle);
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+has_preemption(int fd, uint32_t priorities)
+{
+   struct drm_msm_submitqueue req = {
+      .flags = MSM_SUBMITQUEUE_ALLOW_PREEMPT,
+      .prio = priorities / 2,
+   };
+
+   /* Attempt to create a submitqueue with preemption is enabled, to see
+    * if preemption is supported:
+    */
+   if (!drmCommandWriteRead(fd, DRM_MSM_SUBMITQUEUE_NEW, &req, sizeof(req))) {
+      drmCommandWrite(fd, DRM_MSM_SUBMITQUEUE_CLOSE, &req.id, sizeof(req.id));
       return true;
    }
 
@@ -269,6 +224,12 @@ get_param32(int fd, uint32_t param, uint32_t *value)
    return ret;
 }
 
+static void
+opt_cap_bool(uint32_t *val)
+{
+   *val = *val ? VIRTGPU_CAP_BOOL_TRUE : VIRTGPU_CAP_BOOL_FALSE;
+}
+
 /**
  * Probe capset params.
  */
@@ -284,7 +245,6 @@ msm_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    }
 
    capset->wire_format_version = 2;
-   capset->u.msm.has_cached_coherent = has_cached_coherent(fd);
 
    get_param32(fd, MSM_PARAM_PRIORITIES, &capset->u.msm.priorities);
    get_param64(fd, MSM_PARAM_VA_START,   &capset->u.msm.va_start);
@@ -294,8 +254,25 @@ msm_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    get_param64(fd, MSM_PARAM_GMEM_BASE,  &capset->u.msm.gmem_base);
    get_param64(fd, MSM_PARAM_CHIP_ID,    &capset->u.msm.chip_id);
    get_param32(fd, MSM_PARAM_MAX_FREQ,   &capset->u.msm.max_freq);
+   get_param32(fd, MSM_PARAM_HIGHEST_BANK_BIT, &capset->u.msm.highest_bank_bit);
+   get_param64(fd, MSM_PARAM_UBWC_SWIZZLE, &capset->u.msm.ubwc_swizzle);
+   get_param64(fd, MSM_PARAM_MACROTILE_MODE, &capset->u.msm.macrotile_mode);
+   get_param32(fd, MSM_PARAM_RAYTRACING, &capset->u.msm.has_raytracing);
+   get_param64(fd, MSM_PARAM_UCHE_TRAP_BASE, &capset->u.msm.uche_trap_base);
+
+   capset->u.msm.has_cached_coherent = has_cached_coherent(fd);
+   capset->u.msm.has_preemption = has_preemption(fd, capset->u.msm.priorities);
+
+   /* NOTE: on the guest side, with new guest userspace and old host
+    * virglrenderer, zero means "cap not supported".  So use 1 vs ~0
+    * to indicate true vs false.  The exception is bool caps that are
+    * present since the first version of the protocol.
+    */
+   opt_cap_bool(&capset->u.msm.has_preemption);
+   opt_cap_bool(&capset->u.msm.has_raytracing);
 
    nr_timelines = capset->u.msm.priorities;
+   uabi_version = capset->version_minor;
 
    drm_log("wire_format_version: %u", capset->wire_format_version);
    drm_log("version_major:       %u", capset->version_major);
@@ -310,6 +287,12 @@ msm_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    drm_log("gmem_base:           0x%0" PRIx64, capset->u.msm.gmem_base);
    drm_log("chip_id:             0x%0" PRIx64, capset->u.msm.chip_id);
    drm_log("max_freq:            %u", capset->u.msm.max_freq);
+   drm_log("highest_bank_bit:    %u", capset->u.msm.highest_bank_bit);
+   drm_log("ubwc_swizzle:        0x%" PRIx64, capset->u.msm.ubwc_swizzle);
+   drm_log("macrotile_mode:      %" PRIu64, capset->u.msm.macrotile_mode);
+   drm_log("has_raytracing:      %x", capset->u.msm.has_raytracing);
+   drm_log("has_preemption:      %d", capset->u.msm.has_preemption);
+   drm_log("uche_trap_base:      0x%" PRIx64, capset->u.msm.uche_trap_base);
 
    if (!capset->u.msm.va_size) {
       drm_log("Host kernel does not support userspace allocated IOVA");
@@ -320,39 +303,29 @@ msm_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
 }
 
 static void
-resource_delete_fxn(struct hash_entry *entry)
-{
-   free((void *)entry->data);
-}
-
-static void
 msm_renderer_destroy(struct virgl_context *vctx)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    for (unsigned i = 0; i < nr_timelines; i++)
       drm_timeline_fini(&mctx->timelines[i]);
 
-   close(mctx->eventfd);
+   drm_context_deinit(dctx);
 
-   if (mctx->shmem)
-      munmap(mctx->shmem, sizeof(*mctx->shmem));
-
-   _mesa_hash_table_destroy(mctx->resource_table, resource_delete_fxn);
-   _mesa_hash_table_destroy(mctx->blob_table, resource_delete_fxn);
    _mesa_hash_table_destroy(mctx->sq_to_ring_idx_table, NULL);
 
-   close(mctx->fd);
    free(mctx);
 }
 
 static void
 msm_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource *res)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_object *obj = msm_get_object_from_res_id(mctx, res->res_id);
 
-   drm_dbg("obj=%p, res_id=%u", obj, res->res_id);
+   drm_dbg("obj=%p, res_id=%u", (void*)obj, res->res_id);
 
    if (!obj) {
       int fd;
@@ -366,64 +339,48 @@ msm_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource *
          uint32_t handle;
          int ret;
 
-         ret = drmPrimeFDToHandle(mctx->fd, fd, &handle);
+         ret = drmPrimeFDToHandle(dctx->fd, fd, &handle);
          if (ret) {
-            drm_log("Could not import: %s", strerror(errno));
+            drm_err("Could not import: %s", strerror(errno));
             close(fd);
             return;
          }
 
          /* lseek() to get bo size */
-         int size = lseek(fd, 0, SEEK_END);
-         if (size < 0)
-            drm_log("lseek failed: %d (%s)", size, strerror(errno));
+         off_t size = lseek(fd, 0, SEEK_END);
          close(fd);
+         if (size < 0) {
+            drm_err("lseek failed: %" PRId64 " (%s)", size, strerror(errno));
+            gem_close(fd, handle);
+            return;
+         }
 
          obj = msm_object_create(handle, 0, size);
-         if (!obj)
+         if (!obj) {
+            gem_close(fd, handle);
             return;
+         }
 
-         msm_object_set_res_id(mctx, obj, res->res_id);
+         drm_context_object_set_res_id(dctx, &obj->base, res->res_id);
 
-         drm_dbg("obj=%p, res_id=%u, handle=%u", obj, obj->res_id, obj->handle);
+         drm_dbg("obj=%p, res_id=%u, handle=%u", (void*)obj, obj->base.res_id, obj->base.handle);
       } else {
          if (fd_type != VIRGL_RESOURCE_FD_INVALID)
             close(fd);
          return;
       }
    }
-
-   obj->res = res;
 }
 
 static void
-msm_renderer_detach_resource(struct virgl_context *vctx, struct virgl_resource *res)
+msm_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
-   struct msm_object *obj = msm_get_object_from_res_id(mctx, res->res_id);
-
-   drm_dbg("obj=%p, res_id=%u", obj, res->res_id);
-
-   if (!obj || (obj->res != res))
-      return;
-
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
-      munmap(mctx->shmem, sizeof(*mctx->shmem));
-
-      mctx->shmem = NULL;
-      mctx->rsp_mem = NULL;
-      mctx->rsp_mem_sz = 0;
-
-      /* shmem resources don't have an backing host GEM bo:, so bail now: */
-      return;
-   }
-
-   msm_remove_object(mctx, obj);
+   struct msm_object *obj = to_msm_object(dobj);
 
    if (obj->map)
-      munmap(obj->map, obj->size);
+      munmap(obj->map, obj->base.size);
 
-   gem_close(mctx->fd, obj->handle);
+   gem_close(dctx->fd, obj->base.handle);
 
    free(obj);
 }
@@ -432,14 +389,15 @@ static enum virgl_resource_fd_type
 msm_renderer_export_opaque_handle(struct virgl_context *vctx, struct virgl_resource *res,
                                   int *out_fd)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_object *obj = msm_get_object_from_res_id(mctx, res->res_id);
    int ret;
 
-   drm_dbg("obj=%p, res_id=%u", obj, res->res_id);
+   drm_dbg("obj=%p, res_id=%u", (void*)obj, res->res_id);
 
    if (!obj) {
-      drm_log("invalid res_id %u", res->res_id);
+      drm_err("invalid res_id %u", res->res_id);
       return VIRGL_RESOURCE_FD_INVALID;
    }
 
@@ -450,9 +408,9 @@ msm_renderer_export_opaque_handle(struct virgl_context *vctx, struct virgl_resou
       return VIRGL_RESOURCE_FD_INVALID;
    }
 
-   ret = drmPrimeHandleToFD(mctx->fd, obj->handle, DRM_CLOEXEC | DRM_RDWR, out_fd);
+   ret = drmPrimeHandleToFD(dctx->fd, obj->base.handle, DRM_CLOEXEC | DRM_RDWR, out_fd);
    if (ret) {
-      drm_log("failed to get dmabuf fd: %s", strerror(errno));
+      drm_err("failed to get dmabuf fd: %s", strerror(errno));
       return VIRGL_RESOURCE_FD_INVALID;
    }
 
@@ -460,79 +418,35 @@ msm_renderer_export_opaque_handle(struct virgl_context *vctx, struct virgl_resou
 }
 
 static int
-msm_renderer_transfer_3d(UNUSED struct virgl_context *vctx,
-                         UNUSED struct virgl_resource *res,
-                         UNUSED const struct vrend_transfer_info *info,
-                         UNUSED int transfer_mode)
-{
-   drm_log("unsupported");
-   return -1;
-}
-
-static int
 msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
                       uint64_t blob_size, uint32_t blob_flags,
                       struct virgl_context_blob *blob)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    drm_dbg("blob_id=%" PRIu64 ", res_id=%u, blob_size=%" PRIu64 ", blob_flags=0x%x",
            blob_id, res_id, blob_size, blob_flags);
 
    if ((blob_id >> 32) != 0) {
-      drm_log("invalid blob_id: %" PRIu64, blob_id);
+      drm_err("invalid blob_id: %" PRIu64, blob_id);
       return -EINVAL;
    }
 
    /* blob_id of zero is reserved for the shmem buffer: */
    if (blob_id == 0) {
-      int fd;
+      int ret = drm_context_get_shmem_blob(dctx, "msm-shmem", sizeof(*mctx->shmem),
+                                           blob_size, blob_flags, blob);
+      if (ret)
+         return ret;
 
-      if (blob_flags != VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
-         drm_log("invalid blob_flags: 0x%x", blob_flags);
-         return -EINVAL;
-      }
-
-      if (mctx->shmem) {
-         drm_log("There can be only one!");
-         return -EINVAL;
-      }
-
-      fd = os_create_anonymous_file(blob_size, "msm-shmem");
-      if (fd < 0) {
-         drm_log("Failed to create shmem file: %s", strerror(errno));
-         return -ENOMEM;
-      }
-
-      int ret = fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW);
-      if (ret) {
-         drm_log("fcntl failed: %s", strerror(errno));
-         close(fd);
-         return -ENOMEM;
-      }
-
-      mctx->shmem = mmap(NULL, blob_size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-      if (mctx->shmem == MAP_FAILED) {
-         drm_log("shmem mmap failed: %s", strerror(errno));
-         close(fd);
-         return -ENOMEM;
-      }
-
-      mctx->shmem->rsp_mem_offset = sizeof(*mctx->shmem);
-
-      uint8_t *ptr = (uint8_t *)mctx->shmem;
-      mctx->rsp_mem = &ptr[mctx->shmem->rsp_mem_offset];
-      mctx->rsp_mem_sz = blob_size - mctx->shmem->rsp_mem_offset;
-
-      blob->type = VIRGL_RESOURCE_FD_SHM;
-      blob->u.fd = fd;
-      blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+      mctx->shmem = to_msm_shmem(dctx->shmem);
 
       return 0;
    }
 
-   if (!valid_res_id(mctx, res_id)) {
-      drm_log("Invalid res_id %u", res_id);
+   if (!drm_context_res_id_unused(dctx, res_id)) {
+      drm_err("Invalid res_id %u", res_id);
       return -EINVAL;
    }
 
@@ -540,7 +454,7 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
 
    /* If GEM_NEW fails, we can end up here without a backing obj: */
    if (!obj) {
-      drm_log("No object");
+      drm_err("No object");
       return -ENOENT;
    }
 
@@ -548,18 +462,28 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
     * to the same storage.
     */
    if (obj->exported) {
-      drm_log("Already exported!");
+      drm_err("Already exported!");
       return -EINVAL;
    }
 
-   msm_object_set_res_id(mctx, obj, res_id);
+   /* The size we get from guest userspace is not necessarily rounded up to the
+    * nearest page size, but the actual GEM buffer allocation is, as is the
+    * guest GEM buffer (and therefore the blob_size value we get from the guest
+    * kernel).
+    */
+   if (ALIGN_POT(obj->base.size, getpagesize()) != blob_size) {
+      drm_err("Invalid blob size");
+      return -EINVAL;
+   }
+
+   drm_context_object_set_res_id(dctx, &obj->base, res_id);
 
    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE) {
       int fd, ret;
 
-      ret = drmPrimeHandleToFD(mctx->fd, obj->handle, DRM_CLOEXEC | DRM_RDWR, &fd);
+      ret = drmPrimeHandleToFD(dctx->fd, obj->base.handle, DRM_CLOEXEC | DRM_RDWR, &fd);
       if (ret) {
-         drm_log("Export to fd failed");
+         drm_err("Export to fd failed: %s", strerror(errno));
          return -EINVAL;
       }
 
@@ -567,7 +491,7 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
       blob->u.fd = fd;
    } else {
       blob->type = VIRGL_RESOURCE_OPAQUE_HANDLE;
-      blob->u.opaque_handle = obj->handle;
+      blob->u.opaque_handle = obj->base.handle;
    }
 
    if (obj->flags & MSM_BO_CACHED_COHERENT) {
@@ -583,64 +507,33 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
 }
 
 static void *
-msm_context_rsp_noshadow(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_context_rsp(struct msm_context *mctx, const struct vdrm_ccmd_req *hdr, size_t len)
 {
-   return &mctx->rsp_mem[hdr->rsp_off];
-}
-
-static void *
-msm_context_rsp(struct msm_context *mctx, const struct msm_ccmd_req *hdr, unsigned len)
-{
-   unsigned rsp_mem_sz = mctx->rsp_mem_sz;
-   unsigned off = hdr->rsp_off;
-
-   if ((off > rsp_mem_sz) || (len > rsp_mem_sz - off)) {
-      drm_log("invalid shm offset: off=%u, len=%u (shmem_size=%u)", off, len, rsp_mem_sz);
-      return NULL;
-   }
-
-   struct msm_ccmd_rsp *rsp = msm_context_rsp_noshadow(mctx, hdr);
-
-   assert(len >= sizeof(*rsp));
-
-   /* With newer host and older guest, we could end up wanting a larger rsp struct
-    * than guest expects, so allocate a shadow buffer in this case rather than
-    * having to deal with this in all the different ccmd handlers.  This is similar
-    * in a way to what drm_ioctl() does.
-    */
-   if (len > rsp->len) {
-      rsp = malloc(len);
-      if (!rsp)
-         return NULL;
-      rsp->len = len;
-   }
-
-   mctx->current_rsp = rsp;
-
-   return rsp;
+   return drm_context_rsp(&mctx->base, hdr, len);
 }
 
 static int
-msm_ccmd_nop(UNUSED struct msm_context *mctx, UNUSED const struct msm_ccmd_req *hdr)
+msm_ccmd_nop(UNUSED struct drm_context *dctx, UNUSED struct vdrm_ccmd_req *hdr)
 {
    return 0;
 }
 
 static int
-msm_ccmd_ioctl_simple(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_ioctl_simple_req *req = to_msm_ccmd_ioctl_simple_req(hdr);
    unsigned payload_len = _IOC_SIZE(req->cmd);
-   unsigned req_len = size_add(sizeof(*req), payload_len);
+   size_t req_len = size_add(sizeof(*req), payload_len);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    if (hdr->len != req_len) {
-      drm_log("%u != %u", hdr->len, req_len);
+      drm_err("%u != %zu", hdr->len, req_len);
       return -EINVAL;
    }
 
    /* Apply a reasonable upper bound on ioctl size: */
    if (payload_len > 128) {
-      drm_log("invalid ioctl payload length: %u", payload_len);
+      drm_err("invalid ioctl payload length: %u", payload_len);
       return -EINVAL;
    }
 
@@ -652,12 +545,12 @@ msm_ccmd_ioctl_simple(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    case DRM_MSM_SUBMITQUEUE_CLOSE:
       break;
    default:
-      drm_log("invalid ioctl: %08x (%u)", req->cmd, iocnr);
+      drm_err("invalid ioctl: %08x (%u)", req->cmd, iocnr);
       return -EINVAL;
    }
 
    struct msm_ccmd_ioctl_simple_rsp *rsp;
-   unsigned rsp_len = sizeof(*rsp);
+   size_t rsp_len = sizeof(*rsp);
 
    if (req->cmd & IOC_OUT)
       rsp_len = size_add(rsp_len, payload_len);
@@ -673,7 +566,7 @@ msm_ccmd_ioctl_simple(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    char payload[payload_len];
    memcpy(payload, req->payload, payload_len);
 
-   rsp->ret = drmIoctl(mctx->fd, req->cmd, payload);
+   rsp->ret = drmIoctl(dctx->fd, req->cmd, payload);
 
    if (req->cmd & IOC_OUT)
       memcpy(rsp->payload, payload, payload_len);
@@ -691,13 +584,14 @@ msm_ccmd_ioctl_simple(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
 }
 
 static int
-msm_ccmd_gem_new(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_new_req *req = to_msm_ccmd_gem_new_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    int ret = 0;
 
-   if (!valid_blob_id(mctx, req->blob_id)) {
-      drm_log("Invalid blob_id %u", req->blob_id);
+   if (!drm_context_blob_id_valid(dctx, req->blob_id)) {
+      drm_err("Invalid blob_id %u", req->blob_id);
       ret = -EINVAL;
       goto out_error;
    }
@@ -710,9 +604,9 @@ msm_ccmd_gem_new(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       .flags = req->flags,
    };
 
-   ret = drmCommandWriteRead(mctx->fd, DRM_MSM_GEM_NEW, &gem_new, sizeof(gem_new));
+   ret = drmCommandWriteRead(dctx->fd, DRM_MSM_GEM_NEW, &gem_new, sizeof(gem_new));
    if (ret) {
-      drm_log("GEM_NEW failed: %d (%s)", ret, strerror(errno));
+      drm_err("GEM_NEW failed: %d (%s)", ret, strerror(errno));
       goto out_error;
    }
 
@@ -722,7 +616,7 @@ msm_ccmd_gem_new(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    uint64_t iova = req->iova;
    ret = gem_info(mctx, gem_new.handle, MSM_INFO_SET_IOVA, &iova);
    if (ret) {
-      drm_log("SET_IOVA failed: %d (%s)", ret, strerror(errno));
+      drm_err("SET_IOVA failed: %d (%s)", ret, strerror(errno));
       goto out_close;
    }
 
@@ -737,15 +631,15 @@ msm_ccmd_gem_new(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       goto out_close;
    }
 
-   msm_object_set_blob_id(mctx, obj, req->blob_id);
+   drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
 
-   drm_dbg("obj=%p, blob_id=%u, handle=%u, iova=%" PRIx64, obj, obj->blob_id,
-           obj->handle, iova);
+   drm_dbg("obj=%p, blob_id=%u, handle=%u, iova=%" PRIx64,
+           (void*)obj, obj->base.blob_id, obj->base.handle, iova);
 
    return 0;
 
 out_close:
-   gem_close(mctx->fd, gem_new.handle);
+   gem_close(dctx->fd, gem_new.handle);
 out_error:
    if (mctx->shmem)
       mctx->shmem->async_error++;
@@ -753,35 +647,34 @@ out_error:
 }
 
 static int
-msm_ccmd_gem_set_iova(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_set_iova_req *req = to_msm_ccmd_gem_set_iova_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_object *obj = msm_get_object_from_res_id(mctx, req->res_id);
    int ret = 0;
 
    if (!obj) {
-      drm_log("Could not lookup obj: res_id=%u", req->res_id);
+      drm_err("Could not lookup obj: res_id=%u", req->res_id);
       ret = -ENOENT;
       goto out_error;
    }
 
    uint64_t iova = req->iova;
    if (iova) {
-      TRACE_SCOPE_BEGIN("SET_IOVA");
-      ret = gem_info(mctx, obj->handle, MSM_INFO_SET_IOVA, &iova);
-      TRACE_SCOPE_END("SET_IOVA");
+      TRACE_SCOPE("SET_IOVA");
+      ret = gem_info(mctx, obj->base.handle, MSM_INFO_SET_IOVA, &iova);
    } else {
-      TRACE_SCOPE_BEGIN("CLEAR_IOVA");
-      ret = gem_info(mctx, obj->handle, MSM_INFO_SET_IOVA, &iova);
-      TRACE_SCOPE_END("CLEAR_IOVA");
+      TRACE_SCOPE("CLEAR_IOVA");
+      ret = gem_info(mctx, obj->base.handle, MSM_INFO_SET_IOVA, &iova);
    }
    if (ret) {
-      drm_log("SET_IOVA failed: %d (%s)", ret, strerror(errno));
+      drm_err("SET_IOVA failed: %d (%s)", ret, strerror(errno));
       goto out_error;
    }
 
-   drm_dbg("obj=%p, blob_id=%u, handle=%u, iova=%" PRIx64, obj, obj->blob_id,
-           obj->handle, iova);
+   drm_dbg("obj=%p, blob_id=%u, handle=%u, iova=%" PRIx64, (void*)obj, obj->base.blob_id,
+           obj->base.handle, iova);
 
    return 0;
 
@@ -792,9 +685,10 @@ out_error:
 }
 
 static int
-msm_ccmd_gem_cpu_prep(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_cpu_prep(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_cpu_prep_req *req = to_msm_ccmd_gem_cpu_prep_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_ccmd_gem_cpu_prep_rsp *rsp = msm_context_rsp(mctx, hdr, sizeof(*rsp));
 
    if (!rsp)
@@ -805,15 +699,19 @@ msm_ccmd_gem_cpu_prep(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       .op = req->op | MSM_PREP_NOSYNC,
    };
 
-   rsp->ret = drmCommandWrite(mctx->fd, DRM_MSM_GEM_CPU_PREP, &args, sizeof(args));
+   if (uabi_version >= 11)
+      args.op |= MSM_PREP_BOOST;
+
+   rsp->ret = drmCommandWrite(dctx->fd, DRM_MSM_GEM_CPU_PREP, &args, sizeof(args));
 
    return 0;
 }
 
 static int
-msm_ccmd_gem_set_name(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_set_name(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_set_name_req *req = to_msm_ccmd_gem_set_name_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    struct drm_msm_gem_info args = {
       .handle = handle_from_res_id(mctx, req->res_id),
@@ -825,9 +723,9 @@ msm_ccmd_gem_set_name(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    if (!valid_payload_len(req))
       return -EINVAL;
 
-   int ret = drmCommandWrite(mctx->fd, DRM_MSM_GEM_INFO, &args, sizeof(args));
+   int ret = drmCommandWrite(dctx->fd, DRM_MSM_GEM_INFO, &args, sizeof(args));
    if (ret)
-      drm_log("ret=%d, len=%u, name=%.*s", ret, req->len, req->len, req->payload);
+      drm_err("ret=%d, len=%u, name=%.*s", ret, req->len, req->len, req->payload);
 
    return 0;
 }
@@ -854,9 +752,10 @@ msm_dump_submit(struct drm_msm_gem_submit *req)
 }
 
 static int
-msm_ccmd_gem_submit(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_submit_req *req = to_msm_ccmd_gem_submit_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    size_t sz = sizeof(*req);
    sz = size_add(sz, size_mul(req->nr_bos,  sizeof(struct drm_msm_gem_submit_bo)));
@@ -867,7 +766,7 @@ msm_ccmd_gem_submit(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
     * guest can't trigger us to make an out of bounds memory access:
     */
    if (sz > hdr->len) {
-      drm_log("out of bounds: nr_bos=%u, nr_cmds=%u", req->nr_bos, req->nr_cmds);
+      drm_err("out of bounds: nr_bos=%u, nr_cmds=%u", req->nr_bos, req->nr_cmds);
       return -ENOSPC;
    }
 
@@ -889,9 +788,16 @@ msm_ccmd_gem_submit(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    for (uint32_t i = 0; i < req->nr_bos; i++)
       bos[i].handle = handle_from_res_id(mctx, bos[i].handle);
 
+   uint32_t fence_flags = MSM_SUBMIT_FENCE_FD_OUT | MSM_SUBMIT_FENCE_SN_IN;
+
+   int in_fence_fd = virgl_context_take_in_fence_fd(&dctx->base);
+   if (in_fence_fd >= 0)
+         fence_flags |= MSM_SUBMIT_FENCE_FD_IN;
+
    struct drm_msm_gem_submit args = {
-      .flags = req->flags | MSM_SUBMIT_FENCE_FD_OUT | MSM_SUBMIT_FENCE_SN_IN,
+      .flags = req->flags | fence_flags,
       .fence = req->fence,
+      .fence_fd = in_fence_fd,
       .nr_bos = req->nr_bos,
       .nr_cmds = req->nr_cmds,
       .bos = VOID2U64(bos),
@@ -899,20 +805,20 @@ msm_ccmd_gem_submit(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       .queueid = req->queue_id,
    };
 
-   int ret = drmCommandWriteRead(mctx->fd, DRM_MSM_GEM_SUBMIT, &args, sizeof(args));
+   int ret = drmCommandWriteRead(dctx->fd, DRM_MSM_GEM_SUBMIT, &args, sizeof(args));
    drm_dbg("fence=%u, ret=%d", args.fence, ret);
 
    if (unlikely(ret)) {
-      drm_log("submit failed: %s", strerror(errno));
+      drm_err("submit failed: %s", strerror(errno));
       msm_dump_submit(&args);
       if (mctx->shmem)
          mctx->shmem->async_error++;
    } else {
       const struct hash_entry *entry =
-            table_search(mctx->sq_to_ring_idx_table, args.queueid);
+            hash_table_search(mctx->sq_to_ring_idx_table, args.queueid);
 
       if (!entry) {
-         drm_log("unknown submitqueue: %u", args.queueid);
+         drm_err("unknown submitqueue: %u", args.queueid);
          goto out;
       }
 
@@ -922,6 +828,8 @@ msm_ccmd_gem_submit(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    }
 
 out:
+   if (in_fence_fd >= 0)
+      close(in_fence_fd);
    if (!bos_on_stack)
       free(bos);
    return 0;
@@ -930,23 +838,23 @@ out:
 static int
 map_object(struct msm_context *mctx, struct msm_object *obj)
 {
-   uint64_t offset;
+   uint64_t offset = 0;
    int ret;
 
    if (obj->map)
       return 0;
 
-   uint32_t handle = handle_from_res_id(mctx, obj->res_id);
+   uint32_t handle = handle_from_res_id(mctx, obj->base.res_id);
    ret = gem_info(mctx, handle, MSM_INFO_GET_OFFSET, &offset);
    if (ret) {
-      drm_log("alloc failed: %s", strerror(errno));
+      drm_err("alloc failed: %s", strerror(errno));
       return ret;
    }
 
    uint8_t *map =
-      mmap(0, obj->size, PROT_READ | PROT_WRITE, MAP_SHARED, mctx->fd, offset);
+      mmap(0, obj->base.size, PROT_READ | PROT_WRITE, MAP_SHARED, mctx->base.fd, offset);
    if (map == MAP_FAILED) {
-      drm_log("mmap failed: %s", strerror(errno));
+      drm_err("mmap failed: %s", strerror(errno));
       return -ENOMEM;
    }
 
@@ -956,21 +864,25 @@ map_object(struct msm_context *mctx, struct msm_object *obj)
 }
 
 static int
-msm_ccmd_gem_upload(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_gem_upload(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_gem_upload_req *req = to_msm_ccmd_gem_upload_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    int ret;
 
    if (req->pad || !valid_payload_len(req)) {
-      drm_log("Invalid upload ccmd");
+      drm_err("Invalid upload ccmd");
       return -EINVAL;
    }
 
    struct msm_object *obj = msm_get_object_from_res_id(mctx, req->res_id);
    if (!obj) {
-      drm_log("No obj: res_id=%u", req->res_id);
+      drm_err("No obj: res_id=%u", req->res_id);
       return -ENOENT;
    }
+
+   if (size_add(req->off, req->len) > obj->base.size)
+      return -EFAULT;
 
    ret = map_object(mctx, obj);
    if (ret)
@@ -982,10 +894,11 @@ msm_ccmd_gem_upload(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
 }
 
 static int
-msm_ccmd_submitqueue_query(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_submitqueue_query(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_submitqueue_query_req *req =
       to_msm_ccmd_submitqueue_query_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_ccmd_submitqueue_query_rsp *rsp =
       msm_context_rsp(mctx, hdr, size_add(sizeof(*rsp), req->len));
 
@@ -1000,7 +913,7 @@ msm_ccmd_submitqueue_query(struct msm_context *mctx, const struct msm_ccmd_req *
    };
 
    rsp->ret =
-      drmCommandWriteRead(mctx->fd, DRM_MSM_SUBMITQUEUE_QUERY, &args, sizeof(args));
+      drmCommandWriteRead(dctx->fd, DRM_MSM_SUBMITQUEUE_QUERY, &args, sizeof(args));
 
    rsp->out_len = args.len;
 
@@ -1008,9 +921,10 @@ msm_ccmd_submitqueue_query(struct msm_context *mctx, const struct msm_ccmd_req *
 }
 
 static int
-msm_ccmd_wait_fence(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_wait_fence_req *req = to_msm_ccmd_wait_fence_req(hdr);
+   struct msm_context *mctx = to_msm_context(dctx);
    struct msm_ccmd_wait_fence_rsp *rsp = msm_context_rsp(mctx, hdr, sizeof(*rsp));
 
    if (!rsp)
@@ -1023,6 +937,7 @@ msm_ccmd_wait_fence(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
 
    struct drm_msm_wait_fence args = {
       .fence = req->fence,
+      .flags = (uabi_version) >= 11 ? MSM_WAIT_FENCE_BOOST : 0,
       .queueid = req->queue_id,
       .timeout =
          {
@@ -1031,13 +946,13 @@ msm_ccmd_wait_fence(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
          },
    };
 
-   rsp->ret = drmCommandWrite(mctx->fd, DRM_MSM_WAIT_FENCE, &args, sizeof(args));
+   rsp->ret = drmCommandWrite(dctx->fd, DRM_MSM_WAIT_FENCE, &args, sizeof(args));
 
    return 0;
 }
 
 static int
-msm_ccmd_set_debuginfo(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
+msm_ccmd_set_debuginfo(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
    const struct msm_ccmd_set_debuginfo_req *req = to_msm_ccmd_set_debuginfo_req(hdr);
 
@@ -1046,7 +961,7 @@ msm_ccmd_set_debuginfo(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
    sz = size_add(sz, req->cmdline_len);
 
    if (sz > hdr->len) {
-      drm_log("out of bounds: comm_len=%u, cmdline_len=%u", req->comm_len, req->cmdline_len);
+      drm_err("out of bounds: comm_len=%u, cmdline_len=%u", req->comm_len, req->cmdline_len);
       return -ENOSPC;
    }
 
@@ -1057,7 +972,7 @@ msm_ccmd_set_debuginfo(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       .len = req->comm_len,
    };
 
-   drmCommandWriteRead(mctx->fd, DRM_MSM_SET_PARAM, &set_comm, sizeof(set_comm));
+   drmCommandWriteRead(dctx->fd, DRM_MSM_SET_PARAM, &set_comm, sizeof(set_comm));
 
    struct drm_msm_param set_cmdline = {
       .pipe = MSM_PIPE_3D0,
@@ -1066,16 +981,12 @@ msm_ccmd_set_debuginfo(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
       .len = req->cmdline_len,
    };
 
-   drmCommandWriteRead(mctx->fd, DRM_MSM_SET_PARAM, &set_cmdline, sizeof(set_cmdline));
+   drmCommandWriteRead(dctx->fd, DRM_MSM_SET_PARAM, &set_cmdline, sizeof(set_cmdline));
 
    return 0;
 }
 
-static const struct ccmd {
-   const char *name;
-   int (*handler)(struct msm_context *mctx, const struct msm_ccmd_req *hdr);
-   size_t size;
-} ccmd_dispatch[] = {
+static const struct drm_ccmd ccmd_dispatch[] = {
 #define HANDLER(N, n)                                                                    \
    [MSM_CCMD_##N] = {#N, msm_ccmd_##n, sizeof(struct msm_ccmd_##n##_req)}
    HANDLER(NOP, nop),
@@ -1091,143 +1002,32 @@ static const struct ccmd {
    HANDLER(SET_DEBUGINFO, set_debuginfo),
 };
 
-static int
-submit_cmd_dispatch(struct msm_context *mctx, const struct msm_ccmd_req *hdr)
-{
-   int ret;
-
-   if (hdr->cmd >= ARRAY_SIZE(ccmd_dispatch)) {
-      drm_log("invalid cmd: %u", hdr->cmd);
-      return -EINVAL;
-   }
-
-   const struct ccmd *ccmd = &ccmd_dispatch[hdr->cmd];
-
-   if (!ccmd->handler) {
-      drm_log("no handler: %u", hdr->cmd);
-      return -EINVAL;
-   }
-
-   drm_dbg("%s: hdr={cmd=%u, len=%u, seqno=%u, rsp_off=0x%x)", ccmd->name, hdr->cmd,
-           hdr->len, hdr->seqno, hdr->rsp_off);
-
-   TRACE_SCOPE_BEGIN(ccmd->name);
-
-   /* If the request length from the guest is smaller than the expected
-    * size, ie. newer host and older guest, we need to make a copy of
-    * the request with the new fields at the end zero initialized.
-    */
-   if (ccmd->size > hdr->len) {
-      uint8_t buf[ccmd->size];
-
-      memcpy(&buf[0], hdr, hdr->len);
-      memset(&buf[hdr->len], 0, ccmd->size - hdr->len);
-
-      ret = ccmd->handler(mctx, (struct msm_ccmd_req *)buf);
-   } else {
-      ret = ccmd->handler(mctx, hdr);
-   }
-
-   TRACE_SCOPE_END(ccmd->name);
-
-   if (ret) {
-      drm_log("%s: dispatch failed: %d (%s)", ccmd->name, ret, strerror(errno));
-      return ret;
-   }
-
-   /* If the response length from the guest is smaller than the
-    * expected size, ie. newer host and older guest, then a shadow
-    * copy is used, and we need to copy back to the actual rsp
-    * buffer.
-    */
-   struct msm_ccmd_rsp *rsp = msm_context_rsp_noshadow(mctx, hdr);
-   if (mctx->current_rsp && (mctx->current_rsp != rsp)) {
-      unsigned len = rsp->len;
-      memcpy(rsp, mctx->current_rsp, len);
-      rsp->len = len;
-      free(mctx->current_rsp);
-   }
-   mctx->current_rsp = NULL;
-
-   /* Note that commands with no response, like SET_DEBUGINFO, could
-    * be sent before the shmem buffer is allocated:
-    */
-   if (mctx->shmem) {
-      /* TODO better way to do this?  We need ACQ_REL semanatics (AFAIU)
-       * to ensure that writes to response buffer are visible to the
-       * guest process before the update of the seqno.  Otherwise we
-       * could just use p_atomic_set.
-       */
-      uint32_t seqno = hdr->seqno;
-      p_atomic_xchg(&mctx->shmem->seqno, seqno);
-   }
-
-   return 0;
-}
-
-static int
-msm_renderer_submit_cmd(struct virgl_context *vctx, const void *_buffer, size_t size)
-{
-   struct msm_context *mctx = to_msm_context(vctx);
-   const uint8_t *buffer = _buffer;
-
-   while (size >= sizeof(struct msm_ccmd_req)) {
-      const struct msm_ccmd_req *hdr = (const struct msm_ccmd_req *)buffer;
-
-      /* Sanity check first: */
-      if ((hdr->len > size) || (hdr->len < sizeof(*hdr)) || (hdr->len % 4)) {
-         drm_log("bad size, %u vs %zu (%u)", hdr->len, size, hdr->cmd);
-         return -EINVAL;
-      }
-
-      if (hdr->rsp_off % 4) {
-         drm_log("bad rsp_off, %u", hdr->rsp_off);
-         return -EINVAL;
-      }
-
-      int ret = submit_cmd_dispatch(mctx, hdr);
-      if (ret) {
-         drm_log("dispatch failed: %d (%u)", ret, hdr->cmd);
-         return ret;
-      }
-
-      buffer += hdr->len;
-      size -= hdr->len;
-   }
-
-   if (size > 0) {
-      drm_log("bad size, %zu trailing bytes", size);
-      return -EINVAL;
-   }
-
-   return 0;
-}
-
-static int
-msm_renderer_get_fencing_fd(struct virgl_context *vctx)
-{
-   struct msm_context *mctx = to_msm_context(vctx);
-   return mctx->eventfd;
-}
-
 static void
-msm_renderer_retire_fences(UNUSED struct virgl_context *vctx)
+msm_renderer_fence_retire(struct virgl_context *vctx,
+                          uint32_t ring_idx,
+                          uint64_t fence_id)
 {
-   /* No-op as VIRGL_RENDERER_ASYNC_FENCE_CB is required */
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
+
+   get_param32(dctx->fd, MSM_PARAM_FAULTS, &mctx->shmem->global_faults);
+
+   vctx->fence_retire(vctx, ring_idx, fence_id);
 }
 
 static int
 msm_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags, uint32_t ring_idx,
                           uint64_t fence_id)
 {
-   struct msm_context *mctx = to_msm_context(vctx);
+   struct drm_context *dctx = to_drm_context(vctx);
+   struct msm_context *mctx = to_msm_context(dctx);
 
    drm_dbg("flags=0x%x, ring_idx=%" PRIu32 ", fence_id=%" PRIu64, flags,
            ring_idx, fence_id);
 
    /* timeline is ring_idx-1 (because ring_idx 0 is host CPU timeline) */
    if (ring_idx > nr_timelines) {
-      drm_log("invalid ring_idx: %" PRIu32, ring_idx);
+      drm_err("invalid ring_idx: %" PRIu32, ring_idx);
       return -EINVAL;
    }
 
@@ -1235,7 +1035,7 @@ msm_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags, uint32_t r
     * meaning by the time ->submit_fence() is called, the fence has
     * already passed.. so just immediate signal:
     */
-   if (ring_idx == 0) {
+   if (ring_idx == 0 || mctx->timelines[ring_idx - 1].last_fence_fd < 0) {
       vctx->fence_retire(vctx, ring_idx, fence_id);
       return 0;
    }
@@ -1244,7 +1044,7 @@ msm_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags, uint32_t r
 }
 
 struct virgl_context *
-msm_renderer_create(int fd)
+msm_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
 {
    struct msm_context *mctx;
 
@@ -1254,33 +1054,30 @@ msm_renderer_create(int fd)
    if (!mctx)
       return NULL;
 
-   mctx->fd = fd;
+   if (!drm_context_init(&mctx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch))) {
+      free(mctx);
+      return NULL;
+   }
 
-   /* Indexed by blob_id, but only lower 32b of blob_id are used: */
-   mctx->blob_table = _mesa_hash_table_create_u32_keys(NULL);
-   /* Indexed by res_id: */
-   mctx->resource_table = _mesa_hash_table_create_u32_keys(NULL);
    /* Indexed by submitqueue-id: */
    mctx->sq_to_ring_idx_table = _mesa_hash_table_create_u32_keys(NULL);
 
-   mctx->eventfd = create_eventfd(0);
-
    for (unsigned i = 0; i < nr_timelines; i++) {
       unsigned ring_idx = i + 1; /* ring_idx 0 is host CPU */
-      drm_timeline_init(&mctx->timelines[i], &mctx->base, "msm-sync", mctx->eventfd,
-                        ring_idx);
+      drm_timeline_init(&mctx->timelines[i], &mctx->base.base, "msm-sync",
+                        ring_idx, msm_renderer_fence_retire);
    }
 
-   mctx->base.destroy = msm_renderer_destroy;
-   mctx->base.attach_resource = msm_renderer_attach_resource;
-   mctx->base.detach_resource = msm_renderer_detach_resource;
-   mctx->base.export_opaque_handle = msm_renderer_export_opaque_handle;
-   mctx->base.transfer_3d = msm_renderer_transfer_3d;
-   mctx->base.get_blob = msm_renderer_get_blob;
-   mctx->base.submit_cmd = msm_renderer_submit_cmd;
-   mctx->base.get_fencing_fd = msm_renderer_get_fencing_fd;
-   mctx->base.retire_fences = msm_renderer_retire_fences;
-   mctx->base.submit_fence = msm_renderer_submit_fence;
+   mctx->base.base.destroy = msm_renderer_destroy;
+   mctx->base.base.attach_resource = msm_renderer_attach_resource;
+   mctx->base.base.export_opaque_handle = msm_renderer_export_opaque_handle;
+   mctx->base.base.get_blob = msm_renderer_get_blob;
+   mctx->base.base.submit_fence = msm_renderer_submit_fence;
+   mctx->base.base.supports_fence_sharing = true;
+   mctx->base.free_object = msm_renderer_free_object;
 
-   return &mctx->base;
+   /* Only 4 byte alignment is required for legacy reasons. */
+   mctx->base.ccmd_alignment = 4;
+
+   return &mctx->base.base;
 }

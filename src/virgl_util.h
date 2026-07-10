@@ -125,8 +125,43 @@ void trace_end(const char **scope);
 #define TRACE_FUNC()
 #define TRACE_SCOPE(SCOPE)
 #define TRACE_SCOPE_SLOW(SCOPE)
-#define TRACE_SCOPE_BEGIN(SCOPE)
-#define TRACE_SCOPE_END(VAR)
+/* Valued so `void *s = TRACE_SCOPE_BEGIN(x);` compiles with tracing disabled
+ * (the upstream DRM native-context framework uses the return value). */
+#define TRACE_SCOPE_BEGIN(SCOPE) (NULL)
+#define TRACE_SCOPE_END(VAR) ((void)(VAR))
 #endif /* ENABLE_TRACING */
+
+/* --- DRM-native-context back-port compat ---------------------------------
+ * The upstream src/drm framework and virgl_fence.c expect the newer leveled
+ * virgl logging API; this vendored core only has the level-less virgl_log().
+ * Map the leveled entry points onto it so the framework builds unchanged. */
+#ifndef VIRGL_LOG_LEVEL_FLAGS_DEFINED
+#define VIRGL_LOG_LEVEL_FLAGS_DEFINED
+enum virgl_log_level_flags {
+   VIRGL_LOG_LEVEL_DEBUG = 0,
+   VIRGL_LOG_LEVEL_INFO,
+   VIRGL_LOG_LEVEL_WARNING,
+   VIRGL_LOG_LEVEL_ERROR,
+};
+static inline void PRINTFLIKE(1, 2) virgl_info(const char *fmt, ...)
+{
+   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+}
+static inline void PRINTFLIKE(1, 2) virgl_error(const char *fmt, ...)
+{
+   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+}
+static inline void PRINTFLIKE(1, 2) virgl_warn(const char *fmt, ...)
+{
+   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+}
+static inline void
+virgl_prefixed_logv(const char *domain, enum virgl_log_level_flags level,
+                    const char *fmt, va_list va)
+{
+   (void)domain; (void)level;
+   virgl_logv(fmt, va);
+}
+#endif /* VIRGL_LOG_LEVEL_FLAGS_DEFINED */
 
 #endif /* VIRGL_UTIL_H */

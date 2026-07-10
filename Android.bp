@@ -65,6 +65,10 @@ cc_library {
     // This project's unreachable() macro conflicts with the C23 one.
     c_std: "gnu17",
 
+    // DRM native context backend (src/drm) needs libdrm's xf86drm.h ioctl wrappers
+    // on every target, not just the host glibc build below.
+    header_libs: ["libdrm_headers"],
+
     cflags: [
         "-DHAVE_CONFIG_H",
         "-include prebuilt-intermediates/config.h",
@@ -101,6 +105,11 @@ cc_library {
         "src/gallium/auxiliary/util/u_format.c",
         "src/gallium/auxiliary/util/u_hash_table.c",
         "src/gallium/auxiliary/util/u_texture.c",
+        "src/virgl_fence.c",
+        "src/drm/drm_context.c",
+        "src/drm/drm_fence.c",
+        "src/drm/drm_renderer.c",
+        "src/drm/drm_util.c",
         "src/mesa/util/anon_file.c",
         "src/mesa/util/bitscan.c",
         "src/mesa/util/hash_table.c",

@@ -108,6 +108,14 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
+/* The single VBO shared by every context (see kgsl_renderer_create).  Allocated
+ * once at probe and kept alive for the renderer's lifetime by g_keeper_fd (the
+ * probe fd is closed by drm_renderer_init; KGSL memory is freed when the last fd
+ * of the process closes, so we hold one open).
+ */
+static uint32_t g_vbo_id;
+static int g_keeper_fd = -1;
+
 static const char dma_heap_path[] = "/dev/dma_heap/system";
 
 /*
@@ -1041,8 +1049,7 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
    drm_context_deinit(dctx); /* frees remaining objects via free_object */
 
-   if (kctx->vbo_id)
-      kgsl_free_gpuobj(dctx->fd, kctx->vbo_id);
+   /* The VBO is global (shared by all contexts) -- do not free it here. */
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
 
@@ -1113,26 +1120,17 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
       goto fail_early;
    }
 
-   /* Reserve the guest VA range as this context's VBO.  It must land at the
-    * globally-reported va_start; KGSL's allocator is deterministic for the
-    * first allocation in a fresh (empty) per-context pagetable, so this
-    * normally holds.  If it does not, the guest's iovas would fall outside the
-    * VBO -- fail loudly rather than corrupt addressing.
+   /* All contexts share the single global VBO allocated at probe time.  KGSL
+    * memory ids are per-process, so g_vbo_id is valid on this context's fd too.
+    * Sharing one VBO keeps va_start stable regardless of what else (e.g. the
+    * virgl 2D path) allocates GPU VA between probe and context creation -- a
+    * per-context VBO would drift and no longer match the reported va_start.
     */
-   uint64_t vbo_base, vbo_size;
-   if (kgsl_alloc_vbo(fd, &kctx->vbo_id, &vbo_base, &vbo_size))
-      goto fail_early;
-
-   if (vbo_base != g_va_start || vbo_size != g_va_size) {
-      drm_err("VBO layout mismatch: got base=0x%" PRIx64 " size=0x%" PRIx64
-              ", expected base=0x%" PRIx64 " size=0x%" PRIx64,
-              vbo_base, vbo_size, g_va_start, g_va_size);
-      goto fail_vbo;
-   }
-   kctx->vbo_base = vbo_base;
+   kctx->vbo_id = g_vbo_id;
+   kctx->vbo_base = g_va_start;
 
    if (!drm_context_init(&kctx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch)))
-      goto fail_vbo;
+      goto fail_early;
 
    kctx->sq_to_ring_idx_table = _mesa_hash_table_create_u32_keys(NULL);
 
@@ -1152,8 +1150,6 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
 
    return &kctx->base.base;
 
-fail_vbo:
-   kgsl_free_gpuobj(fd, kctx->vbo_id);
 fail_early:
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
@@ -1205,13 +1201,18 @@ kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
                     sizeof(g_uche_trap_base)))
       g_uche_trap_base = 0x1fffffffff000ull; /* known hardcoded fallback */
 
-   /* Discover the VA layout by reserving (and freeing) a probe VBO.  Each
-    * context will reserve an identical one at the same base.
+   /* Reserve the one global VBO covering the guest VA range and report its
+    * base/size as va_start/va_size.  Keep it (and an fd to keep KGSL's
+    * per-process memory alive) for the whole renderer lifetime; every context
+    * binds into this same VBO.
     */
-   uint32_t probe_vbo;
-   if (kgsl_alloc_vbo(fd, &probe_vbo, &g_va_start, &g_va_size))
+   if (kgsl_alloc_vbo(fd, &g_vbo_id, &g_va_start, &g_va_size))
       return -ENOTSUP;
-   kgsl_free_gpuobj(fd, probe_vbo);
+   g_keeper_fd = dup(fd);
+   if (g_keeper_fd < 0) {
+      drm_err("dup keeper fd failed: %s", strerror(errno));
+      return -ENOMEM;
+   }
 
    /* KGSL supports a single priority band per drawctxt here; expose one ring.
     * (Priorities are encoded in the drawctxt flags but map to one timeline.)

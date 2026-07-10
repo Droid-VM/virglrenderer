@@ -135,14 +135,9 @@ void trace_end(const char **scope);
  * The upstream src/drm framework and virgl_fence.c expect the newer leveled
  * virgl logging API; this vendored core only has the level-less virgl_log().
  * Map the leveled entry points onto it so the framework builds unchanged. */
+/* enum virgl_log_level_flags comes from virglrenderer.h (included above). */
 #ifndef VIRGL_LOG_LEVEL_FLAGS_DEFINED
 #define VIRGL_LOG_LEVEL_FLAGS_DEFINED
-enum virgl_log_level_flags {
-   VIRGL_LOG_LEVEL_DEBUG = 0,
-   VIRGL_LOG_LEVEL_INFO,
-   VIRGL_LOG_LEVEL_WARNING,
-   VIRGL_LOG_LEVEL_ERROR,
-};
 static inline void PRINTFLIKE(1, 2) virgl_info(const char *fmt, ...)
 {
    va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);

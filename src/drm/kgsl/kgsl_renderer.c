@@ -1061,26 +1061,32 @@ kgsl_alloc_vbo(int fd, uint32_t *out_id, uint64_t *out_base, uint64_t *out_size)
 {
    /* The VBO flag lives in bit 34, so it can only be expressed through the
     * 64-bit-flags GPUOBJ_ALLOC ioctl (GPUMEM_ALLOC_ID's flags are 32-bit).
-    * A VBO is virtual-only: size (physical backing) is 0, va_len reserves the
-    * address range.  GPUOBJ_ALLOC does not return the gpuaddr, so query it
-    * separately with GPUOBJ_INFO.
+    * For a VBO, `size` is the virtual address range to reserve; the VBO flag
+    * makes it virtual-only (no physical backing).  The alloc path does not use
+    * va_len.  GPUOBJ_ALLOC does not return the gpuaddr, so query it separately
+    * with GPUOBJ_INFO.
     */
    for (unsigned i = 0; i < ARRAY_SIZE(vbo_size_ladder); i++) {
       struct kgsl_gpuobj_alloc req = {
-         .size = 0,
+         .size = vbo_size_ladder[i],
          .flags = KGSL_MEMFLAGS_VBO,
-         .va_len = vbo_size_ladder[i],
       };
 
-      if (kgsl_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req))
+      if (kgsl_ioctl(fd, IOCTL_KGSL_GPUOBJ_ALLOC, &req)) {
+         drm_dbg("GPUOBJ_ALLOC(VBO, size=0x%" PRIx64 ") failed: %s",
+                 vbo_size_ladder[i], strerror(errno));
          continue;
+      }
 
       struct kgsl_gpuobj_info info = { .id = req.id };
       if (kgsl_ioctl(fd, IOCTL_KGSL_GPUOBJ_INFO, &info)) {
+         drm_dbg("GPUOBJ_INFO(id=%u) failed: %s", req.id, strerror(errno));
          kgsl_free_gpuobj(fd, req.id);
          continue;
       }
 
+      drm_log("VBO ok: id=%u gpuaddr=0x%" PRIx64 " size=0x%" PRIx64,
+              req.id, (uint64_t)info.gpuaddr, vbo_size_ladder[i]);
       *out_id = req.id;
       *out_base = info.gpuaddr;
       *out_size = vbo_size_ladder[i];
@@ -1173,10 +1179,18 @@ kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOTSUP;
    }
 
-   g_chip_id = devinfo.chip_id;
+   /* freedreno's device table keys chip_id with the low (fuse/patch) byte 0 --
+    * e.g. Adreno 830 is FD830 = 0x44050000 -- but KGSL reports the actual fuse
+    * revision (e.g. 0x44050001).  fd_dev_info() needs an exact match (or a 0xff
+    * patch wildcard the table doesn't carry), so strip the fuse byte to hit the
+    * canonical entry; otherwise the guest enumerates zero devices.
+    */
+   g_chip_id = devinfo.chip_id & ~UINT64_C(0xff);
    g_gpu_id = ((devinfo.chip_id >> 24) & 0xff) * 100 +
               ((devinfo.chip_id >> 16) & 0xff) * 10 +
               ((devinfo.chip_id >>  8) & 0xff);
+   drm_log("KGSL chip_id=0x%" PRIx64 " -> reported 0x%" PRIx64 " gpu_id=%u",
+           (uint64_t)devinfo.chip_id, g_chip_id, g_gpu_id);
    g_gmem_size = devinfo.gmem_sizebytes;
 
    uint64_t gmem_iova = 0;

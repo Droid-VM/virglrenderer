@@ -120,6 +120,17 @@ static unsigned g_nr_timelines;
 static uint32_t g_vbo_id;
 static int g_keeper_fd = -1;
 
+/* Per-context VA slicing: KGSL pagetables are per-process, so every guest
+ * process's turnip shares one host VBO.  All guests allocate iovas from the
+ * same capset va_start, so concurrent clients (gnome-shell + Xwayland +
+ * greeter + ...) clobber each other's VBO bindings — the deterministic
+ * CP opcode-0 faults and smashed desktop geometry.  Each context therefore
+ * gets a disjoint slice of the VBO, handed to the guest via GET_PARAM
+ * (MSM_PARAM_VA_START/VA_SIZE), which the patched guest prefers over the
+ * (global) capset values. */
+#define KGSL_VA_SLICE_SIZE (8ull << 30)
+static uint32_t g_va_slices_used; /* bitmask; bit i = slice i in use */
+
 static const char dma_heap_path[] = "/dev/dma_heap/system";
 
 /*
@@ -167,6 +178,11 @@ struct kgsl_context {
 
    /* dma-heap fd for exportable backing allocations. */
    int dma_heap_fd;
+
+   /* This context's disjoint VA slice (see g_va_slices_used). */
+   uint64_t va_slice_base;
+   uint64_t va_slice_size;
+   int va_slice_idx;
 
    /* The blessed arena object (gem_new covering the whole reported VA range):
     * one backing + one bind + one guest map for the context's lifetime; every
@@ -575,8 +591,8 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
    case MSM_PARAM_CHIP_ID:     return g_chip_id;
    case MSM_PARAM_GMEM_SIZE:   return g_gmem_size;
    case MSM_PARAM_GMEM_BASE:   return g_gmem_base;
-   case MSM_PARAM_VA_START:    return g_va_start;
-   case MSM_PARAM_VA_SIZE:     return g_va_size;
+   case MSM_PARAM_VA_START:    return kctx->va_slice_base;
+   case MSM_PARAM_VA_SIZE:     return kctx->va_slice_size;
    case MSM_PARAM_PRIORITIES:  return g_nr_timelines; /* == MSM_PARAM_NR_RINGS */
    case MSM_PARAM_HIGHEST_BANK_BIT: return g_highest_bank_bit;
    case MSM_PARAM_UCHE_TRAP_BASE:   return g_uche_trap_base;
@@ -1471,6 +1487,7 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
 
    /* The VBO is global (shared by all contexts) -- do not free it here. */
+   g_va_slices_used &= ~(1u << kctx->va_slice_idx);
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
 
@@ -1549,6 +1566,27 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
     */
    kctx->vbo_id = g_vbo_id;
    kctx->vbo_base = g_va_start;
+
+   /* Claim a disjoint VA slice for this context. */
+   {
+      unsigned nslices = MIN2(32, g_va_size / KGSL_VA_SLICE_SIZE);
+      int idx = -1;
+      for (unsigned i = 0; i < nslices; i++) {
+         if (!(g_va_slices_used & (1u << i))) {
+            idx = i;
+            break;
+         }
+      }
+      if (idx < 0) {
+         drm_err("out of VA slices (%u contexts)", nslices);
+         goto fail_early;
+      }
+      g_va_slices_used |= 1u << idx;
+      kctx->va_slice_idx = idx;
+      kctx->va_slice_base = g_va_start + (uint64_t)idx * KGSL_VA_SLICE_SIZE;
+      kctx->va_slice_size = KGSL_VA_SLICE_SIZE;
+      drm_log("VA slice %d: [0x%" PRIx64 ", +8GB)", idx, kctx->va_slice_base);
+   }
 
    if (!drm_context_init(&kctx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch)))
       goto fail_early;

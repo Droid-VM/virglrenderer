@@ -70,6 +70,7 @@
 #include "virglrenderer.h"
 
 #include "util/hash_table.h"
+#include "util/list.h"
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/u_atomic.h"
@@ -404,7 +405,7 @@ kgsl_vbo_bind(struct kgsl_context *kctx, struct kgsl_object *obj, uint64_t iova)
 }
 
 static inline void
-kgsl_vbo_unbind(struct kgsl_context *kctx, struct kgsl_object *obj)
+kgsl_vbo_unbind(UNUSED struct kgsl_context *kctx, UNUSED struct kgsl_object *obj)
 {
    if (!obj->iova)
       return;
@@ -455,14 +456,17 @@ kgsl_object_from_blob_id(struct kgsl_context *kctx, uint64_t blob_id)
 static void
 kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
 {
-   struct kgsl_context *kctx = to_kgsl_context(dctx);
    struct kgsl_object *obj = to_kgsl_object(dobj);
+
+   /* Note: no explicit VBO unbind here (see kgsl_ccmd_gem_set_iova) — the
+    * bind holds its own reference on the child, so the pages stay mapped for
+    * any in-flight submit until the guest reuses the VA, and GPUOBJ_FREE
+    * below only drops our id. */
 
    /* obj->map aliases host_map for our memfd BOs -- only free a distinct one. */
    if (obj->map && obj->map != obj->host_map)
       munmap(obj->map, obj->blob_size);
 
-   kgsl_vbo_unbind(kctx, obj);
    kgsl_free_gpuobj(dctx->fd, obj->mem_id); /* releases the useraddr pin first */
 
    if (obj->host_map)
@@ -645,12 +649,18 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
-   /* Map msm cache flags to KGSL import flags. */
-   uint32_t kgsl_flags = 0;
-   if (req->flags & MSM_BO_CACHED_COHERENT)
-      kgsl_flags |= KGSL_MEMFLAGS_IOCOHERENT |
-                    (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT);
-   else if (req->flags & MSM_BO_CACHED)
+   /* Map msm cache flags to KGSL import flags.
+    *
+    * Every BO is imported IO-coherent regardless of the guest's cache mode:
+    * the guest CPU writes BOs through its own stage-1 mapping (often cached)
+    * and nobody on this path issues KGSL cache-maintenance ops (real turnip's
+    * tu_knl_kgsl does its own GPUOBJ_SYNC; the vdrm guest cannot).  A
+    * non-snooping GPU read then sees stale DRAM — deterministic smashed
+    * geometry on the desktop.  Adreno 830 supports full IO coherency, so let
+    * the GPU snoop the (shared) CPU caches instead.
+    */
+   uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT;
+   if (req->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED))
       kgsl_flags |= KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT;
    else
       kgsl_flags |= KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT;
@@ -713,13 +723,20 @@ kgsl_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
+   /* Never explicitly unbind: a submit referencing this BO may still be on
+    * the GPU (drm/msm pins submit BOs until retire; guest turnip relies on
+    * that — eager unbinds made the CP read zeros mid-flight, deterministic
+    * "opcode error | opcode=0x00000000" hard faults).  KGSL's VBO machinery
+    * makes stale ranges safe: a bind holds a reference on the child (pages
+    * outlive GPUOBJ_FREE) and a later bind over the same range removes or
+    * splits the stale entries and drops their references (kgsl_vbo.c,
+    * kgsl_memdesc_add_range).  The range simply stays mapped until the guest
+    * reuses the VA — exactly the msm lifetime the guest assumes.
+    */
    if (!req->iova) {
-      kgsl_vbo_unbind(kctx, obj);
+      obj->iova = 0;
       return 0;
    }
-
-   if (obj->iova && obj->iova != req->iova)
-      kgsl_vbo_unbind(kctx, obj);
 
    if (obj->iova != req->iova) {
       int ret = kgsl_vbo_bind(kctx, obj, req->iova);
@@ -875,6 +892,54 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
          .flags = KGSL_CMDLIST_IB,
          .id = kctx->vbo_id, /* address lives in the VBO's mapping */
       };
+
+      /* NCTX_IB_CHECK: host-side visibility probe for the CP-reads-zeros
+       * fault — dump the IB's first/last dwords as the CPU sees them at
+       * submit time.  Valid cmdstreams start with type4/type7 headers
+       * (0x4xxxxxxx/0x7xxxxxxx); zeros here mean the guest's writes never
+       * reached these pages, zeros only at the GPU mean a bad VBO binding. */
+      if (getenv("NCTX_IB_CHECK") && !kgsl_map_object(obj)) {
+         const uint32_t *ib = (uint32_t *)(obj->map + c->submit_offset);
+         uint32_t nd = c->size / 4;
+         drm_log("IB-CHECK iova=0x%" PRIx64 " size=0x%x head=%08x %08x %08x %08x tail=%08x %08x %08x %08x",
+                 obj->iova + c->submit_offset, c->size,
+                 nd > 0 ? ib[0] : 0, nd > 1 ? ib[1] : 0,
+                 nd > 2 ? ib[2] : 0, nd > 3 ? ib[3] : 0,
+                 nd > 3 ? ib[nd - 4] : 0, nd > 2 ? ib[nd - 3] : 0,
+                 nd > 1 ? ib[nd - 2] : 0, nd > 0 ? ib[nd - 1] : 0);
+      }
+
+      /* NCTX_IB_SCAN: walk the IB1 for CP_INDIRECT_BUFFER (type7, opcode
+       * 0x3f) calls and verify each IB2 target against our object table:
+       * is the target iova inside a bound BO, and is its content non-zero
+       * host-side?  Directly answers "unbound target" vs "unwritten pages"
+       * for the recurring CP opcode-0 hard fault at ib1+0xD968. */
+      if (getenv("NCTX_IB_SCAN") && !kgsl_map_object(obj)) {
+         const uint32_t *ib = (uint32_t *)(obj->map + c->submit_offset);
+         uint32_t nd = c->size / 4;
+         for (uint32_t w = 0; w + 3 < nd; w++) {
+            if ((ib[w] >> 28) != 0x7 || ((ib[w] >> 16) & 0x7f) != 0x3f)
+               continue;
+            uint64_t tgt = (uint64_t)ib[w + 1] | ((uint64_t)ib[w + 2] << 32);
+            uint32_t tsz = ib[w + 3] & 0xfffff; /* dwords */
+            /* find a BO covering tgt */
+            struct kgsl_object *tobj = NULL;
+            hash_table_foreach(dctx->resource_table, ent) {
+               struct kgsl_object *o = (struct kgsl_object *)ent->data;
+               if (o->iova && tgt >= o->iova && tgt < o->iova + o->blob_size) {
+                  tobj = o;
+                  break;
+               }
+            }
+            uint32_t thead = 0;
+            if (tobj && !kgsl_map_object(tobj))
+               thead = *(uint32_t *)(tobj->map + (tgt - tobj->iova));
+            drm_log("IB-SCAN ib1=0x%" PRIx64 "+0x%x -> ib2=0x%" PRIx64 " sz=0x%x %s head=%08x",
+                    obj->iova + c->submit_offset, w * 4, tgt, tsz,
+                    tobj ? "BOUND" : "UNBOUND!", thead);
+            w += 3;
+         }
+      }
    }
 
    const struct hash_entry *entry = _mesa_hash_table_search(
@@ -904,6 +969,7 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
          kctx->shmem->async_error++;
       return 0; /* async error, not a protocol error */
    }
+
 
    /* Obtain a sync_file for this submit's completion and feed the ring
     * timeline, so the vdrm ring fence signals when the GPU passes the seqno.
@@ -1186,6 +1252,7 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
       drm_timeline_fini(&kctx->timelines[i]);
 
    drm_context_deinit(dctx); /* frees remaining objects via free_object */
+
 
    /* The VBO is global (shared by all contexts) -- do not free it here. */
    if (kctx->dma_heap_fd >= 0)

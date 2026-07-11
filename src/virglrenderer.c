@@ -47,6 +47,7 @@
 #include "virglrenderer_hw.h"
 
 #include "virgl_context.h"
+#include "virgl_fence.h"
 #include "virgl_resource.h"
 #include "virgl_util.h"
 
@@ -63,6 +64,7 @@ struct global_state {
    bool vkr_initialized;
    bool proxy_initialized;
    bool external_winsys_initialized;
+   bool fence_initialized;
 };
 
 static struct global_state state;
@@ -719,6 +721,9 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    if (state.vrend_initialized)
       vrend_renderer_fini();
 
+   if (state.fence_initialized)
+      virgl_fence_table_cleanup();
+
    if (state.winsys_initialized || state.external_winsys_initialized)
       vrend_winsys_cleanup();
 
@@ -870,6 +875,19 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
          drm_fd = cbs->get_drm_fd(cookie);
 
       drm_renderer_init(drm_fd);
+   }
+
+   /* Upstream initializes the fence table here; the vendoring dropped the
+    * call, leaving virgl_fence_table NULL — the first drm-context submit
+    * that exports a fence (drm_timeline_submit_fence -> virgl_fence_set_fd)
+    * then dereferenced NULL and killed crosvm right after GEM_SUBMIT. */
+   if (!state.fence_initialized) {
+      ret = virgl_fence_table_init();
+      if (ret) {
+         virgl_error("failed to initialize fence table\n");
+         goto fail;
+      }
+      state.fence_initialized = true;
    }
 
    return 0;

@@ -51,9 +51,12 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 
 #include <linux/dma-heap.h>
+#include <linux/memfd.h>
+#include <linux/udmabuf.h>
 
 /* The vendored KGSL/msm uapi headers carry the kernel's __user annotation,
  * which is not defined in a pure userspace build; neutralise it.
@@ -132,12 +135,17 @@ static const char dma_heap_path[] = "/dev/dma_heap/system";
 struct kgsl_object {
    struct drm_object base;
    uint32_t mem_id;
-   int dmabuf_fd;
+   int dmabuf_fd;      /* the blob-backing fd: a THP memfd for our BOs, or an
+                        * imported dmabuf for external (attach_resource) BOs */
+   void *host_map;     /* our own mapping of a memfd BO (kept for the KGSL
+                        * useraddr import lifetime; NULL for imported dmabufs) */
+   uint64_t host_map_size;
    uint64_t iova;
    uint64_t blob_size;
    uint32_t flags;
    bool exported   : 1;
    bool exportable : 1;
+   bool is_shm     : 1; /* backing is a memfd (SHM blob) vs an imported dmabuf */
    uint8_t *map;
 };
 DEFINE_CAST(drm_object, kgsl_object)
@@ -205,6 +213,15 @@ kgsl_dma_heap_alloc(int heap_fd, uint64_t size)
    return alloc.fd;
 }
 
+/*
+ * Allocate BO backing that crosvm's GuestAccept share can pin.  The share does
+ * pin_user_pages_fast(FOLL_LONGTERM), which fails on ZONE_MOVABLE pages; this
+ * device has no unmovable zone to migrate to.  A shmem THP (2 MiB) faulted here
+ * is served by the gh_hugepage_reserve pool -> non-movable -> pinnable.  We back
+ * the BO with a memfd (so it has an fd for the blob), fault it as a huge page,
+ * and import it into KGSL by user address.  Returns the KGSL memory id (0 on
+ * failure) and, on success, *out_memfd / *out_map / *out_map_size.
+ */
 /* Import a dmabuf into KGSL, returning its GPU memory id (0 on failure). */
 static uint32_t
 kgsl_import_dmabuf(int fd, int dmabuf_fd, uint32_t kgsl_flags)
@@ -225,6 +242,107 @@ kgsl_import_dmabuf(int fd, int dmabuf_fd, uint32_t kgsl_flags)
    }
 
    return req.id;
+}
+
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+/*
+ * Allocate BO backing store that crosvm's GuestAccept share can actually pin.
+ *
+ * dma-heap / plain shmem memory is ZONE_MOVABLE; crosvm shares blobs with
+ * pin_user_pages_fast(FOLL_LONGTERM), which refuses movable pages (EFAULT).
+ * Instead we collapse a sealed memfd into a single order-9 (2MB) folio the same
+ * way gfxstream's RingBlob pool does: fault it through a PMD-aligned mapping and
+ * MADV_COLLAPSE.  The in-process collapse allocation is what gh_hugepage_reserve
+ * intercepts, so the folio comes from the module's non-movable reserve pool
+ * (plain MADV_HUGEPAGE + fault is NOT intercepted for shmem and stays movable).
+ * The memfd itself becomes the guest-shared SHM blob; a transient udmabuf view
+ * of it is imported into KGSL for GPU access (see below).
+ *
+ * Returns the KGSL memory id (0 on failure); *out_dmabuf gets the memfd.
+ */
+static uint32_t
+kgsl_alloc_thp_bo(int fd, uint64_t size, uint32_t kgsl_flags, int *out_dmabuf)
+{
+   uint64_t map_size = ALIGN_POT(size, 0x200000); /* 2 MiB for the THP path */
+
+   int memfd = syscall(__NR_memfd_create, "kgsl-bo",
+                       MFD_CLOEXEC | MFD_ALLOW_SEALING);
+   if (memfd < 0) {
+      drm_err("memfd_create failed: %s", strerror(errno));
+      return 0;
+   }
+   if (ftruncate(memfd, map_size) ||
+       fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK)) {  /* udmabuf requires it */
+      drm_err("ftruncate/seal(%" PRIu64 ") failed: %s", map_size, strerror(errno));
+      close(memfd);
+      return 0;
+   }
+
+   /* Collapse each 2MB chunk into a reserve-pool order-9 folio before the
+    * udmabuf GUP-pins it.  Reserve map_size + 2MB, carve out a PMD-aligned
+    * window, map the memfd there, MADV_HUGEPAGE + fault + MADV_COLLAPSE.  The
+    * folio persists in the shmem page cache after the temp mapping is torn down.
+    */
+   void *rsv = mmap(NULL, map_size + 0x200000, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+   if (rsv == MAP_FAILED) {
+      drm_err("reserve mmap failed: %s", strerror(errno));
+      close(memfd);
+      return 0;
+   }
+   uintptr_t aligned_addr =
+      ((uintptr_t)rsv + 0x200000 - 1) & ~(uintptr_t)(0x200000 - 1);
+   void *aligned = mmap((void *)aligned_addr, map_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED, memfd, 0);
+   if (aligned != MAP_FAILED) {
+      madvise(aligned, map_size, MADV_HUGEPAGE);
+      memset(aligned, 0, map_size);
+      madvise(aligned, map_size, MADV_COLLAPSE);
+   }
+   munmap(rsv, map_size + 0x200000);
+
+   /* Import a *transient* udmabuf view of the collapsed memfd into KGSL for GPU
+    * access.  Split rationale: KGSL needs a dmabuf (useraddr import EINVALs
+    * here), but crosvm must GuestAccept-share the *memfd* (SHM) not the udmabuf
+    * — udmabuf VMAs are VM_PFNMAP, so crosvm's pin_user_pages_fast(FOLL_LONGTERM)
+    * EFAULTs on them; a shmem memfd mapping pins fine.  Both fds reference the
+    * same non-movable reserve folio, so the BO stays zero-copy.  KGSL's dma_buf
+    * attachment holds a ref to the udmabuf, so its fd can close after import.
+    */
+   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   if (udev < 0) {
+      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
+      close(memfd);
+      return 0;
+   }
+   struct udmabuf_create uc = {
+      .memfd = memfd,
+      .flags = UDMABUF_FLAGS_CLOEXEC,
+      .offset = 0,
+      .size = map_size,
+   };
+   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
+   close(udev);
+   if (udmabuf < 0) {
+      drm_err("UDMABUF_CREATE failed: %s", strerror(errno));
+      close(memfd);
+      return 0;
+   }
+
+   uint32_t mem_id = kgsl_import_dmabuf(fd, udmabuf, kgsl_flags);
+   close(udmabuf);  /* KGSL's dma_buf attachment keeps the pages */
+   if (!mem_id) {
+      close(memfd);
+      return 0;
+   }
+
+   *out_dmabuf = memfd;  /* SHM handle crosvm hands to the guest */
+   return mem_id;
 }
 
 static void
@@ -340,12 +458,15 @@ kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
    struct kgsl_context *kctx = to_kgsl_context(dctx);
    struct kgsl_object *obj = to_kgsl_object(dobj);
 
-   if (obj->map)
+   /* obj->map aliases host_map for our memfd BOs -- only free a distinct one. */
+   if (obj->map && obj->map != obj->host_map)
       munmap(obj->map, obj->blob_size);
 
    kgsl_vbo_unbind(kctx, obj);
-   kgsl_free_gpuobj(dctx->fd, obj->mem_id);
+   kgsl_free_gpuobj(dctx->fd, obj->mem_id); /* releases the useraddr pin first */
 
+   if (obj->host_map)
+      munmap(obj->host_map, obj->host_map_size);
    if (obj->dmabuf_fd >= 0)
       close(obj->dmabuf_fd);
 
@@ -524,23 +645,6 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
-   /* NOTE (unsolved): the BO backing must live in non-movable memory, because
-    * crosvm's GuestAccept share pins it with pin_user_pages_fast(FOLL_LONGTERM),
-    * which fails with EFAULT on ZONE_MOVABLE pages (this device has no free
-    * unmovable zone to migrate to, and KGSL's import pins them in place so
-    * migration can't proceed).  dma-heap system gives movable pages; rounding to
-    * 2 MiB did not help (dma-heap doesn't route through the gh_hugepage_reserve
-    * pool).  gfxstream avoids this by taking crosvm's VmMemorySource::Vulkan
-    * path (gralloc import) whose memory is reserve-backed/pinnable.  TODO: source
-    * BO backing from the reserve pool, or expose vulkan_info so the blob takes
-    * the Vulkan map path.
-    */
-   int dmabuf_fd = kgsl_dma_heap_alloc(kctx->dma_heap_fd, blob_size);
-   if (dmabuf_fd < 0) {
-      ret = -ENOMEM;
-      goto out_error;
-   }
-
    /* Map msm cache flags to KGSL import flags. */
    uint32_t kgsl_flags = 0;
    if (req->flags & MSM_BO_CACHED_COHERENT)
@@ -551,9 +655,15 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    else
       kgsl_flags |= KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT;
 
-   uint32_t mem_id = kgsl_import_dmabuf(dctx->fd, dmabuf_fd, kgsl_flags);
+   /* Back the BO with a reserve-pool collapsed memfd (see kgsl_alloc_thp_bo):
+    * its pages are non-movable, so crosvm's FOLL_LONGTERM GuestAccept share can
+    * pin them.  The memfd is shared to the guest as SHM; KGSL gets the same
+    * pages via a transient udmabuf import.  dma-heap / plain shmem memory is
+    * movable and fails that pin (EFAULT).
+    */
+   int dmabuf_fd = -1;  /* actually the memfd backing the SHM blob */
+   uint32_t mem_id = kgsl_alloc_thp_bo(dctx->fd, blob_size, kgsl_flags, &dmabuf_fd);
    if (!mem_id) {
-      close(dmabuf_fd);
       ret = -ENOMEM;
       goto out_error;
    }
@@ -566,6 +676,7 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       ret = -ENOMEM;
       goto out_error;
    }
+   obj->is_shm = true;  /* backing fd is a memfd, shared to the guest as SHM */
 
    ret = kgsl_vbo_bind(kctx, obj, req->iova);
    if (ret) {
@@ -629,6 +740,14 @@ kgsl_map_object(struct kgsl_object *obj)
 {
    if (obj->map)
       return 0;
+
+   /* Our own BOs already keep a host mapping of the memfd for the KGSL useraddr
+    * import -- reuse it rather than mapping twice.
+    */
+   if (obj->host_map) {
+      obj->map = obj->host_map;
+      return 0;
+   }
 
    uint8_t *map = mmap(NULL, obj->blob_size, PROT_READ | PROT_WRITE,
                        MAP_SHARED, obj->dmabuf_fd, 0);
@@ -788,20 +907,24 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 
    /* Obtain a sync_file for this submit's completion and feed the ring
     * timeline, so the vdrm ring fence signals when the GPU passes the seqno.
+    * NCTX_NO_FENCE: skip the out-fence entirely (submit_fence then retires the
+    * ring immediately) -- diagnostic A/B for the post-submit crosvm exit(1).
     */
-   struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
-   struct kgsl_timestamp_event event = {
-      .type = KGSL_TIMESTAMP_EVENT_FENCE,
-      .timestamp = req->fence,
-      .context_id = req->queue_id,
-      .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
-      .len = sizeof(fence_priv),
-   };
+   if (!getenv("NCTX_NO_FENCE")) {
+      struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
+      struct kgsl_timestamp_event event = {
+         .type = KGSL_TIMESTAMP_EVENT_FENCE,
+         .timestamp = req->fence,
+         .context_id = req->queue_id,
+         .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
+         .len = sizeof(fence_priv),
+      };
 
-   if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event) &&
-       fence_priv.fence_fd >= 0) {
-      drm_timeline_set_last_fence_fd(&kctx->timelines[ring_idx - 1],
-                                     fence_priv.fence_fd);
+      if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event) &&
+          fence_priv.fence_fd >= 0) {
+         drm_timeline_set_last_fence_fd(&kctx->timelines[ring_idx - 1],
+                                        fence_priv.fence_fd);
+      }
    }
 
    return 0;
@@ -1000,8 +1123,8 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
 
    drm_context_object_set_res_id(dctx, &obj->base, res_id);
 
-   /* The backing is always a real dmabuf (from the dma-heap), so we can hand
-    * back a shareable fd -- this is what flows through GuestAccept.
+   /* Hand back the backing fd for the guest to map through GuestAccept.  Our own
+    * BOs are THP memfds (SHM); externally-imported BOs are dmabufs.
     */
    int fd = os_dupfd_cloexec(obj->dmabuf_fd);
    if (fd < 0) {
@@ -1009,7 +1132,7 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
       return -EINVAL;
    }
 
-   blob->type = VIRGL_RESOURCE_FD_DMABUF;
+   blob->type = obj->is_shm ? VIRGL_RESOURCE_FD_SHM : VIRGL_RESOURCE_FD_DMABUF;
    blob->u.fd = fd;
 
    if (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT))

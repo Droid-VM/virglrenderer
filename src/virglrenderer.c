@@ -287,6 +287,68 @@ int virgl_renderer_submit_cmd(void *buffer,
    return ctx->submit_cmd(ctx, buffer, ndw * sizeof(uint32_t));
 }
 
+/* CPU-copy fallback for transfers on fd-backed blob resources that have no
+ * vrend pipe resource (e.g. DRM native-context BOs used as KMS scanout).
+ * crosvm's display readback (the VNC / screenshot fallback when the display
+ * backend cannot import a dmabuf) issues transfer_read with ctx_id 0, which
+ * previously returned EINVAL for such blobs, leaving the display black.
+ *
+ * The blob carries no format/pitch metadata, so interpret the transfer as a
+ * linear 32bpp image with a host pitch equal to the caller's stride (crosvm
+ * passes its framebuffer stride; scanout BOs are linear and 32bpp on this
+ * stack, so the pitches match for the full-width flush this path serves).
+ */
+static int
+virgl_resource_transfer_blob(struct virgl_resource *res,
+                             const struct vrend_transfer_info *info,
+                             int transfer_mode)
+{
+   const struct pipe_box *box = info->box;
+   const uint32_t bpp = 4;
+   void *map = res->mapped;
+   bool tmp_map = false;
+   int ret = 0;
+
+   if (res->fd < 0 ||
+       (res->fd_type != VIRGL_RESOURCE_FD_SHM &&
+        res->fd_type != VIRGL_RESOURCE_FD_DMABUF))
+      return EINVAL;
+   if (!box || box->width < 0 || box->height < 0 || !res->map_size)
+      return EINVAL;
+
+   if (!map) {
+      map = mmap(NULL, res->map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 res->fd, 0);
+      if (map == MAP_FAILED)
+         return EINVAL;
+      tmp_map = true;
+   }
+
+   const uint32_t row_len = (uint32_t)box->width * bpp;
+   const uint32_t stride = info->stride ? info->stride : row_len;
+
+   for (int h = 0; h < box->height; h++) {
+      const uint64_t iov_off = info->offset + (uint64_t)h * stride;
+      const uint64_t res_off =
+         ((uint64_t)box->y + h) * stride + (uint64_t)box->x * bpp;
+
+      if (res_off + row_len > res->map_size) {
+         ret = EINVAL;
+         break;
+      }
+      if (transfer_mode == VIRGL_TRANSFER_FROM_HOST)
+         vrend_write_to_iovec(info->iovec, info->iovec_cnt, iov_off,
+                              (char *)map + res_off, row_len);
+      else
+         vrend_read_from_iovec(info->iovec, info->iovec_cnt, iov_off,
+                               (char *)map + res_off, row_len);
+   }
+
+   if (tmp_map)
+      munmap(map, res->map_size);
+   return ret;
+}
+
 int virgl_renderer_transfer_write_iov(uint32_t handle,
                                       uint32_t ctx_id,
                                       int level,
@@ -323,7 +385,8 @@ int virgl_renderer_transfer_write_iov(uint32_t handle,
                               VIRGL_TRANSFER_TO_HOST);
    } else {
       if (!res->pipe_resource)
-         return EINVAL;
+         return virgl_resource_transfer_blob(res, &transfer_info,
+                                             VIRGL_TRANSFER_TO_HOST);
 
       return vrend_renderer_transfer_pipe(res->pipe_resource, &transfer_info,
                                           VIRGL_TRANSFER_TO_HOST);
@@ -362,7 +425,8 @@ int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
                               VIRGL_TRANSFER_FROM_HOST);
    } else {
       if (!res->pipe_resource)
-         return EINVAL;
+         return virgl_resource_transfer_blob(res, &transfer_info,
+                                             VIRGL_TRANSFER_FROM_HOST);
 
       return vrend_renderer_transfer_pipe(res->pipe_resource, &transfer_info,
                                           VIRGL_TRANSFER_FROM_HOST);

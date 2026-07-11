@@ -524,6 +524,17 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
+   /* NOTE (unsolved): the BO backing must live in non-movable memory, because
+    * crosvm's GuestAccept share pins it with pin_user_pages_fast(FOLL_LONGTERM),
+    * which fails with EFAULT on ZONE_MOVABLE pages (this device has no free
+    * unmovable zone to migrate to, and KGSL's import pins them in place so
+    * migration can't proceed).  dma-heap system gives movable pages; rounding to
+    * 2 MiB did not help (dma-heap doesn't route through the gh_hugepage_reserve
+    * pool).  gfxstream avoids this by taking crosvm's VmMemorySource::Vulkan
+    * path (gralloc import) whose memory is reserve-backed/pinnable.  TODO: source
+    * BO backing from the reserve pool, or expose vulkan_info so the blob takes
+    * the Vulkan map path.
+    */
    int dmabuf_fd = kgsl_dma_heap_alloc(kctx->dma_heap_fd, blob_size);
    if (dmabuf_fd < 0) {
       ret = -ENOMEM;

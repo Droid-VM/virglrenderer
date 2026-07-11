@@ -147,6 +147,11 @@ struct kgsl_object {
    bool exported   : 1;
    bool exportable : 1;
    bool is_shm     : 1; /* backing is a memfd (SHM blob) vs an imported dmabuf */
+   /* Paged arena BO (mem_id == 0): scattered arena backing, stitched to the
+    * contiguous iova via multi-entry BIND_RANGES; map is a MAP_FIXED stitch of
+    * the arena memfd (owned, munmap on free). */
+   struct msm_gem_new_run *runs;
+   uint32_t nr_runs;
    uint8_t *map;
 };
 DEFINE_CAST(drm_object, kgsl_object)
@@ -162,6 +167,12 @@ struct kgsl_context {
 
    /* dma-heap fd for exportable backing allocations. */
    int dma_heap_fd;
+
+   /* The blessed arena object (gem_new covering the whole reported VA range):
+    * one backing + one bind + one guest map for the context's lifetime; every
+    * non-SCANOUT BO afterwards is bookkeeping aliasing into it.  NULL until
+    * the guest blesses (legacy guests never do — full per-BO path remains). */
+   struct kgsl_object *arena;
 
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
@@ -414,6 +425,54 @@ kgsl_vbo_unbind(UNUSED struct kgsl_context *kctx, UNUSED struct kgsl_object *obj
    obj->iova = 0;
 }
 
+/* Stitch a paged-arena BO's scattered runs to its contiguous iova with a
+ * single multi-entry BIND_RANGES against the arena child. */
+static int
+kgsl_vbo_bind_runs(struct kgsl_context *kctx, struct kgsl_object *obj,
+                   uint64_t iova)
+{
+   if (iova < kctx->vbo_base ||
+       iova + obj->blob_size > kctx->vbo_base + g_va_size) {
+      drm_err("iova 0x%" PRIx64 " (size 0x%" PRIx64 ") outside VBO", iova,
+              obj->blob_size);
+      return -EINVAL;
+   }
+
+   struct kgsl_gpumem_bind_range *ranges =
+      calloc(obj->nr_runs, sizeof(*ranges));
+   if (!ranges)
+      return -ENOMEM;
+
+   uint64_t off = 0;
+   for (uint32_t i = 0; i < obj->nr_runs; i++) {
+      ranges[i] = (struct kgsl_gpumem_bind_range) {
+         .child_offset = obj->runs[i].arena_off,
+         .target_offset = (iova + off) - kctx->vbo_base,
+         .length = obj->runs[i].len,
+         .child_id = kctx->arena->mem_id,
+         .op = KGSL_GPUMEM_RANGE_OP_BIND,
+      };
+      off += obj->runs[i].len;
+   }
+
+   struct kgsl_gpumem_bind_ranges req = {
+      .ranges = (uintptr_t)ranges,
+      .ranges_nents = obj->nr_runs,
+      .ranges_size = sizeof(*ranges),
+      .id = kctx->vbo_id,
+      .flags = 0, /* synchronous */
+   };
+
+   int ret = kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_GPUMEM_BIND_RANGES, &req);
+   free(ranges);
+   if (ret) {
+      drm_err("BIND_RANGES(%u runs @ 0x%" PRIx64 ") failed: %s", obj->nr_runs,
+              iova, strerror(errno));
+      return -errno;
+   }
+   return 0;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Object lifecycle
@@ -456,12 +515,24 @@ kgsl_object_from_blob_id(struct kgsl_context *kctx, uint64_t blob_id)
 static void
 kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
 {
+   struct kgsl_context *kctx = to_kgsl_context(dctx);
    struct kgsl_object *obj = to_kgsl_object(dobj);
 
-   /* Note: no explicit VBO unbind here (see kgsl_ccmd_gem_set_iova) — the
-    * bind holds its own reference on the child, so the pages stay mapped for
-    * any in-flight submit until the guest reuses the VA, and GPUOBJ_FREE
-    * below only drops our id. */
+   /* Note: no explicit VBO unbind here (see kgsl_ccmd_gem_set_iova) — a bind
+    * holds its own reference on the child, so pages stay mapped for any
+    * in-flight submit until the guest reuses the VA. */
+
+   /* Paged arena BO: bookkeeping + the stitched host view only. */
+   if (!obj->mem_id) {
+      if (obj->map)
+         munmap(obj->map, obj->blob_size);
+      free(obj->runs);
+      free(obj);
+      return;
+   }
+
+   if (obj == kctx->arena)
+      kctx->arena = NULL;
 
    /* obj->map aliases host_map for our memfd BOs -- only free a distinct one. */
    if (obj->map && obj->map != obj->host_map)
@@ -649,6 +720,87 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
+   /* Arena v2 (see ARENA_V2_PLAN.md and msm_proto.h):
+    *  - iova == 0                  -> arena blessing (allocate the page pool)
+    *  - trailing run list present  -> paged arena BO (stitch runs, bookkeeping)
+    *  - otherwise                  -> full legacy per-BO path
+    */
+   const bool is_arena = req->iova == 0;
+
+   uint32_t nr_runs = 0;
+   const struct msm_gem_new_run *runs = NULL;
+   if (hdr->len > sizeof(*req)) {
+      if (hdr->len < sizeof(*req) + 2 * sizeof(uint32_t)) {
+         drm_err("malformed gem_new run list");
+         ret = -EINVAL;
+         goto out_error;
+      }
+      const uint32_t *tail = (const uint32_t *)((const uint8_t *)req + sizeof(*req));
+      nr_runs = tail[0];
+      runs = (const struct msm_gem_new_run *)(tail + 2);
+      if (hdr->len <
+          sizeof(*req) + 2 * sizeof(uint32_t) + (uint64_t)nr_runs * sizeof(*runs)) {
+         drm_err("gem_new run list overflows ccmd (nr_runs=%u)", nr_runs);
+         ret = -EINVAL;
+         goto out_error;
+      }
+   }
+
+   /* Paged arena BO: validate the runs, stitch them to the contiguous guest
+    * iova with one multi-entry BIND_RANGES against the arena child, and keep
+    * only bookkeeping.  No memfd, no import, no GuestAccept share.
+    */
+   if (nr_runs && !is_arena) {
+      if (!kctx->arena) {
+         drm_err("run-list gem_new before arena blessing");
+         ret = -EINVAL;
+         goto out_error;
+      }
+      uint64_t total = 0;
+      for (uint32_t i = 0; i < nr_runs; i++) {
+         if (!runs[i].len || (runs[i].arena_off | runs[i].len) & (getpagesize() - 1) ||
+             runs[i].arena_off + runs[i].len > kctx->arena->blob_size) {
+            drm_err("bad arena run %u: off=0x%" PRIx64 " len=0x%" PRIx64,
+                    i, runs[i].arena_off, runs[i].len);
+            ret = -EINVAL;
+            goto out_error;
+         }
+         total += runs[i].len;
+      }
+      if (total < blob_size) {
+         drm_err("runs cover 0x%" PRIx64 " < blob 0x%" PRIx64, total, blob_size);
+         ret = -EINVAL;
+         goto out_error;
+      }
+
+      struct kgsl_object *obj =
+         kgsl_object_create(0 /* no own kgsl object */, -1, req->flags,
+                            req->size, blob_size);
+      if (!obj) {
+         ret = -ENOMEM;
+         goto out_error;
+      }
+      obj->runs = malloc(nr_runs * sizeof(*obj->runs));
+      if (!obj->runs) {
+         free(obj);
+         ret = -ENOMEM;
+         goto out_error;
+      }
+      memcpy(obj->runs, runs, nr_runs * sizeof(*obj->runs));
+      obj->nr_runs = nr_runs;
+      obj->is_shm = true;
+
+      ret = kgsl_vbo_bind_runs(kctx, obj, req->iova);
+      if (ret) {
+         free(obj->runs);
+         free(obj);
+         goto out_error;
+      }
+      obj->iova = req->iova;
+      drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
+      return 0;
+   }
+
    /* Map msm cache flags to KGSL import flags.
     *
     * Every BO is imported IO-coherent regardless of the guest's cache mode:
@@ -688,13 +840,23 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    }
    obj->is_shm = true;  /* backing fd is a memfd, shared to the guest as SHM */
 
-   ret = kgsl_vbo_bind(kctx, obj, req->iova);
-   if (ret) {
-      kgsl_renderer_free_object(dctx, &obj->base);
-      goto out_error;
+   /* The arena is a pure page pool: it has no GPU VA of its own; its pages
+    * reach the GPU through per-BO run stitching. */
+   if (!is_arena) {
+      ret = kgsl_vbo_bind(kctx, obj, req->iova);
+      if (ret) {
+         kgsl_renderer_free_object(dctx, &obj->base);
+         goto out_error;
+      }
    }
 
    drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
+
+   if (is_arena) {
+      kctx->arena = obj;
+      drm_log("ARENA blessed: pool=0x%" PRIx64 " bytes mem_id=%u", blob_size,
+              mem_id);
+   }
 
    drm_dbg("obj=%p blob_id=%u mem_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64,
            (void *)obj, req->blob_id, mem_id, req->iova, blob_size);
@@ -738,6 +900,15 @@ kgsl_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       return 0;
    }
 
+   /* Paged arena BOs: re-stitch the same runs at the new iova (old ranges
+    * stay until overwritten, per the no-unbind rule). */
+   if (!obj->mem_id) {
+      if (obj->nr_runs && kgsl_vbo_bind_runs(kctx, obj, req->iova))
+         goto out_error;
+      obj->iova = req->iova;
+      return 0;
+   }
+
    if (obj->iova != req->iova) {
       int ret = kgsl_vbo_bind(kctx, obj, req->iova);
       if (ret)
@@ -753,10 +924,36 @@ out_error:
 }
 
 static int
-kgsl_map_object(struct kgsl_object *obj)
+kgsl_map_object(struct kgsl_context *kctx, struct kgsl_object *obj)
 {
    if (obj->map)
       return 0;
+
+   /* Paged arena BOs have no backing fd of their own: stitch their runs of
+    * the arena memfd into one linear view (mirror of what the guest does with
+    * its stage-1 tables). */
+   if (!obj->mem_id) {
+      if (!kctx->arena || !obj->nr_runs)
+         return -ENOENT;
+      uint8_t *span = mmap(NULL, obj->blob_size, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (span == MAP_FAILED)
+         return -ENOMEM;
+      uint64_t off = 0;
+      for (uint32_t i = 0; i < obj->nr_runs && off < obj->blob_size; i++) {
+         uint64_t len = MIN2(obj->runs[i].len, obj->blob_size - off);
+         if (mmap(span + off, len, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_FIXED, kctx->arena->dmabuf_fd,
+                  obj->runs[i].arena_off) == MAP_FAILED) {
+            drm_err("stitch mmap failed: %s", strerror(errno));
+            munmap(span, obj->blob_size);
+            return -ENOMEM;
+         }
+         off += len;
+      }
+      obj->map = span;
+      return 0;
+   }
 
    /* Our own BOs already keep a host mapping of the memfd for the KGSL useraddr
     * import -- reuse it rather than mapping twice.
@@ -824,7 +1021,7 @@ kgsl_ccmd_gem_upload(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (size_add(req->off, req->len) > obj->base.size)
       return -EFAULT;
 
-   int ret = kgsl_map_object(obj);
+   int ret = kgsl_map_object(kctx, obj);
    if (ret)
       return ret;
 
@@ -898,7 +1095,7 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
        * submit time.  Valid cmdstreams start with type4/type7 headers
        * (0x4xxxxxxx/0x7xxxxxxx); zeros here mean the guest's writes never
        * reached these pages, zeros only at the GPU mean a bad VBO binding. */
-      if (getenv("NCTX_IB_CHECK") && !kgsl_map_object(obj)) {
+      if (getenv("NCTX_IB_CHECK") && !kgsl_map_object(kctx, obj)) {
          const uint32_t *ib = (uint32_t *)(obj->map + c->submit_offset);
          uint32_t nd = c->size / 4;
          drm_log("IB-CHECK iova=0x%" PRIx64 " size=0x%x head=%08x %08x %08x %08x tail=%08x %08x %08x %08x",
@@ -914,7 +1111,7 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
        * is the target iova inside a bound BO, and is its content non-zero
        * host-side?  Directly answers "unbound target" vs "unwritten pages"
        * for the recurring CP opcode-0 hard fault at ib1+0xD968. */
-      if (getenv("NCTX_IB_SCAN") && !kgsl_map_object(obj)) {
+      if (getenv("NCTX_IB_SCAN") && !kgsl_map_object(kctx, obj)) {
          const uint32_t *ib = (uint32_t *)(obj->map + c->submit_offset);
          uint32_t nd = c->size / 4;
          for (uint32_t w = 0; w + 3 < nd; w++) {
@@ -932,7 +1129,7 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
                }
             }
             uint32_t thead = 0;
-            if (tobj && !kgsl_map_object(tobj))
+            if (tobj && !kgsl_map_object(kctx, tobj))
                thead = *(uint32_t *)(tobj->map + (tgt - tobj->iova));
             drm_log("IB-SCAN ib1=0x%" PRIx64 "+0x%x -> ib2=0x%" PRIx64 " sz=0x%x %s head=%08x",
                     obj->iova + c->submit_offset, w * 4, tgt, tsz,
@@ -1188,6 +1385,25 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
    }
 
    drm_context_object_set_res_id(dctx, &obj->base, res_id);
+
+   /* Paged arena BOs have no backing fd of their own, but the guest still
+    * creates a virtio resource for each one (submits reference BOs by res_id).
+    * Hand back a dup of the arena memfd so the resource plumbing is satisfied;
+    * the guest never maps these (CPU access goes through its own stage-1
+    * stitch of the arena) and the fd dies with the resource. */
+   if (!obj->mem_id) {
+      if (!kctx->arena)
+         return -EINVAL;
+      int afd = os_dupfd_cloexec(kctx->arena->dmabuf_fd);
+      if (afd < 0)
+         return -EINVAL;
+      blob->type = VIRGL_RESOURCE_FD_SHM;
+      blob->u.fd = afd;
+      blob->map_info = VIRGL_RENDERER_MAP_CACHE_WC;
+      obj->exported = true;
+      obj->exportable = false;
+      return 0;
+   }
 
    /* Hand back the backing fd for the guest to map through GuestAccept.  Our own
     * BOs are THP memfds (SHM); externally-imported BOs are dmabufs.

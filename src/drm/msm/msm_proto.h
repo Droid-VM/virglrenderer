@@ -131,6 +131,27 @@ struct msm_ccmd_gem_new_req {
 DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_new_req)
 
 /*
+ * Arena v2 extension (DroidVM KGSL native-context):
+ *
+ *  - GEM_NEW with iova == 0 "blesses" the arena: the host allocates the
+ *    physical page pool (req->size bytes) once; the guest then creates and
+ *    maps a single virtio blob for it (the only GuestAccept of the session).
+ *  - GEM_NEW whose hdr.len extends past the base struct carries a run list
+ *    describing scattered arena backing for this BO:
+ *       uint32_t nr_runs; uint32_t pad; struct msm_gem_new_run runs[nr_runs];
+ *    The host stitches the runs to the (contiguous) guest iova with one
+ *    multi-entry BIND_RANGES; the guest stitches the same runs into a linear
+ *    CPU mapping with its own stage-1 page tables.  No per-BO backing, share
+ *    or accept.
+ *  - GEM_NEW without a run list keeps the full legacy per-BO path (SCANOUT /
+ *    export BOs, or a guest that predates the arena).
+ */
+struct msm_gem_new_run {
+   uint64_t arena_off;
+   uint64_t len;
+} DRM_ALIGN_4;
+
+/*
  * MSM_CCMD_GEM_SET_IOVA
  *
  * Set the buffer iova (for imported BOs).  Also used to release the iova

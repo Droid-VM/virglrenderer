@@ -396,14 +396,18 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
 }
 
 static int
-kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, uint32_t *out_id)
+kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *out_id)
 {
+   /* Mirror the flags turnip's own KGSL backend uses (proven on this device);
+    * the guest submits its own fence seqno (MSM_SUBMIT_FENCE_SN_IN), so add
+    * USER_GENERATED_TS so KGSL takes the timestamp from us.  Adding TYPE_VK /
+    * PER_CONTEXT_TS / a priority band made DRAWCTXT_CREATE return EINVAL.
+    */
    struct kgsl_drawctxt_create req = {
-      .flags = KGSL_CONTEXT_PREAMBLE |
-               KGSL_CONTEXT_PER_CONTEXT_TS |
-               KGSL_CONTEXT_USER_GENERATED_TS |
-               (KGSL_CONTEXT_TYPE_VK << KGSL_CONTEXT_TYPE_SHIFT) |
-               ((prio << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK),
+      .flags = KGSL_CONTEXT_SAVE_GMEM |
+               KGSL_CONTEXT_NO_GMEM_ALLOC |
+               KGSL_CONTEXT_PREAMBLE |
+               KGSL_CONTEXT_USER_GENERATED_TS,
    };
 
    if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {

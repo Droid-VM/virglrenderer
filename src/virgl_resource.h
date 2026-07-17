@@ -100,6 +100,7 @@ struct virgl_resource {
 
    uint64_t map_size;
    void *mapped;
+   void *map_ptr;
 
    struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
 

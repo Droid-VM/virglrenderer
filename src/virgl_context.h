@@ -46,6 +46,10 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
+   /* Optional persistent host mapping supplied by the context. The generic resource_map path
+    * returns this pointer directly and never munmaps it. */
+   void *map_ptr;
+
    struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
 };
 

@@ -1069,7 +1069,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    TRACE_FUNC();
    struct virgl_resource *res;
    struct virgl_context *ctx;
-   struct virgl_context_blob blob;
+   struct virgl_context_blob blob = { 0 };
    bool has_host_storage;
    bool has_guest_storage;
    int ret;
@@ -1158,6 +1158,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
 
    res->map_info = blob.map_info;
    res->map_size = args->size;
+   res->map_ptr = blob.map_ptr;
 
    return 0;
 }
@@ -1172,7 +1173,10 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
    if (!res || res->mapped)
       return -EINVAL;
 
-   if (res->pipe_resource) {
+   if (res->map_ptr) {
+      map = res->map_ptr;
+      map_size = res->map_size;
+   } else if (res->pipe_resource) {
       ret = vrend_renderer_resource_map(res->pipe_resource, &map, &map_size);
       if (!ret)
          res->map_size = map_size;
@@ -1208,7 +1212,9 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
    if (!res || !res->mapped)
       return -EINVAL;
 
-   if (res->pipe_resource) {
+   if (res->map_ptr) {
+      ret = 0;
+   } else if (res->pipe_resource) {
       ret = vrend_renderer_resource_unmap(res->pipe_resource);
    } else {
       switch (res->fd_type) {

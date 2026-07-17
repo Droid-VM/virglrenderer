@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,6 +121,25 @@ static unsigned g_nr_timelines;
 static uint32_t g_vbo_id;
 static int g_keeper_fd = -1;
 
+struct kgsl_arena_extent {
+   uint64_t offset;
+   uint64_t size;
+   struct kgsl_arena_extent *next;
+};
+
+static struct {
+   pthread_mutex_t lock;
+   bool initialized;
+   bool enabled;
+   int fd;
+   uint8_t *host_va;
+   uint64_t size;
+   struct kgsl_arena_extent *free_list;
+} g_blob_arena = {
+   .lock = PTHREAD_MUTEX_INITIALIZER,
+   .fd = -1,
+};
+
 /* Per-context VA slicing: KGSL pagetables are per-process, so every guest
  * process's turnip shares one host VBO.  All guests allocate iovas from the
  * same capset va_start, so concurrent clients (gnome-shell + Xwayland +
@@ -158,6 +178,8 @@ struct kgsl_object {
    bool exported   : 1;
    bool exportable : 1;
    bool is_shm     : 1; /* backing is a memfd (SHM blob) vs an imported dmabuf */
+   bool arena_backed : 1;
+   uint64_t arena_offset;
    /* Paged arena BO (mem_id == 0): scattered arena backing, stitched to the
     * contiguous iova via multi-entry BIND_RANGES; map is a MAP_FIXED stitch of
     * the arena memfd (owned, munmap on free). */
@@ -189,6 +211,12 @@ struct kgsl_context {
     * non-SCANOUT BO afterwards is bookkeeping aliasing into it.  NULL until
     * the guest blesses (legacy guests never do — full per-BO path remains). */
    struct kgsl_object *arena;
+
+   /* blob_id 0 (the msm shmem control buffer) sub-allocated from the
+    * pre-shared blob arena instead of its own memfd; the range must be
+    * detached before drm_context_deinit() (see kgsl_renderer_destroy). */
+   bool shmem_arena_backed;
+   uint64_t shmem_arena_offset;
 
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
@@ -222,6 +250,151 @@ kgsl_getprop(int fd, unsigned int type, void *value, size_t size)
       .sizebytes = size,
    };
    return kgsl_ioctl(fd, IOCTL_KGSL_DEVICE_GETPROPERTY, &req);
+}
+
+/* Clean+invalidate [va, va+len) to the point of coherency.  DC CIVAC is
+ * EL0-legal under SCTLR_EL1.UCI (Linux sets it), and arm64 D-caches are PIPT,
+ * so this scrubs every alias of the underlying pages — including lines the
+ * kernel dirtied while zero-filling fresh shmem folios. */
+static void
+kgsl_cache_clean_inv(void *va, size_t len)
+{
+#if defined(__aarch64__)
+   uint64_t ctr;
+   __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+   size_t line = 4u << ((ctr >> 16) & 0xf); /* DminLine, in bytes */
+   uintptr_t p = (uintptr_t)va & ~(uintptr_t)(line - 1);
+   uintptr_t end = (uintptr_t)va + len;
+   for (; p < end; p += line)
+      __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
+   __asm__ volatile("dsb sy" ::: "memory");
+#else
+   (void)va;
+   (void)len;
+#endif
+}
+
+static bool
+kgsl_parse_u64_env(const char *name, uint64_t *value)
+{
+   const char *str = getenv(name);
+   if (!str || !*str)
+      return false;
+
+   char *end = NULL;
+   errno = 0;
+   unsigned long long parsed = strtoull(str, &end, 0);
+   if (errno || !end || *end)
+      return false;
+   *value = parsed;
+   return true;
+}
+
+static bool
+kgsl_blob_arena_init(void)
+{
+   pthread_mutex_lock(&g_blob_arena.lock);
+   if (g_blob_arena.initialized) {
+      bool enabled = g_blob_arena.enabled;
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return enabled;
+   }
+
+   g_blob_arena.initialized = true;
+   uint64_t fd_value, host_va, size;
+   if (!kgsl_parse_u64_env("CROSVM_KGSL_ARENA_FD", &fd_value) ||
+       !kgsl_parse_u64_env("CROSVM_KGSL_ARENA_HOST_VA", &host_va) ||
+       !kgsl_parse_u64_env("CROSVM_KGSL_ARENA_SIZE", &size) ||
+       fd_value > INT32_MAX || !host_va || !size ||
+       (host_va | size) & (getpagesize() - 1) ||
+       fcntl((int)fd_value, F_GETFD) < 0) {
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return false;
+   }
+
+   struct kgsl_arena_extent *extent = calloc(1, sizeof(*extent));
+   if (!extent) {
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return false;
+   }
+   extent->size = size;
+   g_blob_arena.fd = (int)fd_value;
+   g_blob_arena.host_va = (uint8_t *)(uintptr_t)host_va;
+   g_blob_arena.size = size;
+   g_blob_arena.free_list = extent;
+   g_blob_arena.enabled = true;
+   pthread_mutex_unlock(&g_blob_arena.lock);
+
+   drm_log("pre-shared blob arena: fd=%d host_va=%p size=0x%" PRIx64,
+           g_blob_arena.fd, g_blob_arena.host_va, g_blob_arena.size);
+   return true;
+}
+
+static bool
+kgsl_blob_arena_alloc(uint64_t size, uint64_t *out_offset)
+{
+   if (!kgsl_blob_arena_init())
+      return false;
+
+   size = ALIGN_POT(size, getpagesize());
+   pthread_mutex_lock(&g_blob_arena.lock);
+   struct kgsl_arena_extent **link = &g_blob_arena.free_list;
+   while (*link && (*link)->size < size)
+      link = &(*link)->next;
+   if (!*link) {
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return false;
+   }
+
+   struct kgsl_arena_extent *extent = *link;
+   *out_offset = extent->offset;
+   extent->offset += size;
+   extent->size -= size;
+   if (!extent->size) {
+      *link = extent->next;
+      free(extent);
+   }
+   pthread_mutex_unlock(&g_blob_arena.lock);
+   return true;
+}
+
+static void
+kgsl_blob_arena_free(uint64_t offset, uint64_t size)
+{
+   size = ALIGN_POT(size, getpagesize());
+   struct kgsl_arena_extent *extent = calloc(1, sizeof(*extent));
+   if (!extent) {
+      drm_err("failed to return arena range off=0x%" PRIx64 " size=0x%" PRIx64,
+              offset, size);
+      return;
+   }
+   extent->offset = offset;
+   extent->size = size;
+
+   pthread_mutex_lock(&g_blob_arena.lock);
+   struct kgsl_arena_extent **link = &g_blob_arena.free_list;
+   while (*link && (*link)->offset < offset)
+      link = &(*link)->next;
+   extent->next = *link;
+   *link = extent;
+
+   if (extent->next && extent->offset + extent->size == extent->next->offset) {
+      struct kgsl_arena_extent *next = extent->next;
+      extent->size += next->size;
+      extent->next = next->next;
+      free(next);
+   }
+
+   struct kgsl_arena_extent *prev = NULL;
+   for (struct kgsl_arena_extent *it = g_blob_arena.free_list;
+        it && it != extent; it = it->next)
+      prev = it;
+   if (prev && prev->offset + prev->size == extent->offset) {
+      prev->size += extent->size;
+      prev->next = extent->next;
+      free(extent);
+   }
+   pthread_mutex_unlock(&g_blob_arena.lock);
 }
 
 /* Allocate an exportable dmabuf from the system dma-heap. */
@@ -331,6 +504,13 @@ kgsl_alloc_thp_bo(int fd, uint64_t size, uint32_t kgsl_flags, int *out_dmabuf)
       madvise(aligned, map_size, MADV_HUGEPAGE);
       memset(aligned, 0, map_size);
       madvise(aligned, map_size, MADV_COLLAPSE);
+      /* Evict our zero-fill from the (PIPT) CPU caches to PoC.  The guest maps
+       * most BOs write-combine, so its writes go straight to DRAM; any clean
+       * zero lines left here (from this memset or the kernel's page clearing)
+       * alias those writes and are exactly what the host CPU and the
+       * IO-coherent GPU keep snooping — CP then executes zeros (type-0 write
+       * to reg 0 -> AHB error + opcode-0 fault, the glmark2 DEVICE LOST). */
+      kgsl_cache_clean_inv(aligned, map_size);
    }
    munmap(rsv, map_size + 0x200000);
 
@@ -370,6 +550,52 @@ kgsl_alloc_thp_bo(int fd, uint64_t size, uint32_t kgsl_flags, int *out_dmabuf)
    }
 
    *out_dmabuf = memfd;  /* SHM handle crosvm hands to the guest */
+   return mem_id;
+}
+
+static uint32_t
+kgsl_alloc_arena_bo(int fd, uint64_t size, uint32_t kgsl_flags,
+                    uint64_t *out_offset)
+{
+   uint64_t offset;
+   if (!kgsl_blob_arena_alloc(size, &offset)) {
+      drm_err("pre-shared blob arena exhausted (request=0x%" PRIx64 ")", size);
+      return 0;
+   }
+
+   uint8_t *host_ptr = g_blob_arena.host_va + offset;
+   memset(host_ptr, 0, size);
+   kgsl_cache_clean_inv(host_ptr, size);
+
+   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   if (udev < 0) {
+      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
+      kgsl_blob_arena_free(offset, size);
+      return 0;
+   }
+   struct udmabuf_create uc = {
+      .memfd = g_blob_arena.fd,
+      .flags = UDMABUF_FLAGS_CLOEXEC,
+      .offset = offset,
+      .size = size,
+   };
+   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
+   close(udev);
+   if (udmabuf < 0) {
+      drm_err("UDMABUF_CREATE(arena off=0x%" PRIx64 ") failed: %s",
+              offset, strerror(errno));
+      kgsl_blob_arena_free(offset, size);
+      return 0;
+   }
+
+   uint32_t mem_id = kgsl_import_dmabuf(fd, udmabuf, kgsl_flags);
+   close(udmabuf);
+   if (!mem_id) {
+      kgsl_blob_arena_free(offset, size);
+      return 0;
+   }
+
+   *out_offset = offset;
    return mem_id;
 }
 
@@ -549,6 +775,13 @@ kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
 
    if (obj == kctx->arena)
       kctx->arena = NULL;
+
+   if (obj->arena_backed) {
+      kgsl_free_gpuobj(dctx->fd, obj->mem_id);
+      kgsl_blob_arena_free(obj->arena_offset, obj->blob_size);
+      free(obj);
+      return;
+   }
 
    /* obj->map aliases host_map for our memfd BOs -- only free a distinct one. */
    if (obj->map && obj->map != obj->host_map)
@@ -833,14 +1066,14 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    else
       kgsl_flags |= KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT;
 
-   /* Back the BO with a reserve-pool collapsed memfd (see kgsl_alloc_thp_bo):
-    * its pages are non-movable, so crosvm's FOLL_LONGTERM GuestAccept share can
-    * pin them.  The memfd is shared to the guest as SHM; KGSL gets the same
-    * pages via a transient udmabuf import.  dma-heap / plain shmem memory is
-    * movable and fails that pin (EFAULT).
-    */
+   /* Prefer the boot-time pre-shared memfd. When configured, exhaustion is a hard failure: mixing
+    * arena and per-blob backing would require a second guest allocation protocol. */
    int dmabuf_fd = -1;  /* actually the memfd backing the SHM blob */
-   uint32_t mem_id = kgsl_alloc_thp_bo(dctx->fd, blob_size, kgsl_flags, &dmabuf_fd);
+   uint64_t arena_offset = 0;
+   bool arena_enabled = kgsl_blob_arena_init();
+   uint32_t mem_id = arena_enabled
+      ? kgsl_alloc_arena_bo(dctx->fd, blob_size, kgsl_flags, &arena_offset)
+      : kgsl_alloc_thp_bo(dctx->fd, blob_size, kgsl_flags, &dmabuf_fd);
    if (!mem_id) {
       ret = -ENOMEM;
       goto out_error;
@@ -850,11 +1083,16 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       kgsl_object_create(mem_id, dmabuf_fd, req->flags, req->size, blob_size);
    if (!obj) {
       kgsl_free_gpuobj(dctx->fd, mem_id);
-      close(dmabuf_fd);
+      if (arena_enabled)
+         kgsl_blob_arena_free(arena_offset, blob_size);
+      else
+         close(dmabuf_fd);
       ret = -ENOMEM;
       goto out_error;
    }
    obj->is_shm = true;  /* backing fd is a memfd, shared to the guest as SHM */
+   obj->arena_backed = arena_enabled;
+   obj->arena_offset = arena_offset;
 
    /* The arena is a pure page pool: it has no GPU VA of its own; its pages
     * reach the GPU through per-BO run stitching. */
@@ -944,6 +1182,11 @@ kgsl_map_object(struct kgsl_context *kctx, struct kgsl_object *obj)
 {
    if (obj->map)
       return 0;
+
+   if (obj->arena_backed) {
+      obj->map = g_blob_arena.host_va + obj->arena_offset;
+      return 0;
+   }
 
    /* Paged arena BOs have no backing fd of their own: stitch their runs of
     * the arena memfd into one linear view (mirror of what the guest does with
@@ -1346,14 +1589,72 @@ kgsl_renderer_export_opaque_handle(struct virgl_context *vctx,
    if (!obj->exportable)
       return VIRGL_RESOURCE_FD_INVALID;
 
-   int fd = os_dupfd_cloexec(obj->dmabuf_fd);
+   int fd = os_dupfd_cloexec(obj->arena_backed ? g_blob_arena.fd : obj->dmabuf_fd);
    if (fd < 0) {
       drm_err("dup failed: %s", strerror(errno));
       return VIRGL_RESOURCE_FD_INVALID;
    }
 
    *out_fd = fd;
-   return VIRGL_RESOURCE_FD_DMABUF;
+   return obj->arena_backed ? VIRGL_RESOURCE_FD_SHM : VIRGL_RESOURCE_FD_DMABUF;
+}
+
+/* Arena-mode variant of drm_context_get_shmem_blob(): the generic helper backs
+ * the shmem control buffer with its own memfd, whose host mapping lies outside
+ * the pre-shared arena — crosvm's arena mode (sentinel offsets only) rejects
+ * such blobs.  Sub-allocate from the arena instead and hand back map_ptr so
+ * the resource maps inside it.  Host and guest both map this range cacheable,
+ * so no explicit maintenance is needed (unlike the WC-mapped BOs). */
+static int
+kgsl_get_arena_shmem_blob(struct kgsl_context *kctx, uint64_t blob_size,
+                          uint32_t blob_flags, struct virgl_context_blob *blob)
+{
+   struct drm_context *dctx = &kctx->base;
+
+   if (blob_flags != VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
+      drm_err("invalid blob_flags: 0x%x", blob_flags);
+      return -EINVAL;
+   }
+   if (dctx->shmem || dctx->blob_size) {
+      drm_err("there can be only one!");
+      return -EINVAL;
+   }
+   if (blob_size < sizeof(*kctx->shmem) || blob_size > UINT32_MAX) {
+      drm_err("invalid blob size 0x%" PRIx64, blob_size);
+      return -EINVAL;
+   }
+
+   int fd = os_dupfd_cloexec(g_blob_arena.fd);
+   if (fd < 0) {
+      drm_err("arena dup failed: %s", strerror(errno));
+      return -ENOMEM;
+   }
+
+   uint64_t offset;
+   if (!kgsl_blob_arena_alloc(blob_size, &offset)) {
+      drm_err("arena exhausted for shmem blob (size=0x%" PRIx64 ")", blob_size);
+      close(fd);
+      return -ENOMEM;
+   }
+
+   /* Arena ranges are recycled — scrub whatever the last tenant left. */
+   uint8_t *ptr = g_blob_arena.host_va + offset;
+   memset(ptr, 0, blob_size);
+
+   dctx->shmem = (struct vdrm_shmem *)ptr;
+   dctx->shmem->rsp_mem_offset = sizeof(*kctx->shmem);
+   dctx->rsp_mem = ptr + sizeof(*kctx->shmem);
+   dctx->rsp_mem_sz = blob_size - sizeof(*kctx->shmem);
+   dctx->blob_size = blob_size;
+
+   kctx->shmem_arena_backed = true;
+   kctx->shmem_arena_offset = offset;
+
+   blob->type = VIRGL_RESOURCE_FD_SHM;
+   blob->u.fd = fd;
+   blob->map_ptr = ptr;
+   blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+   return 0;
 }
 
 static int
@@ -1371,8 +1672,10 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
 
    /* blob_id 0 is the msm shmem control buffer. */
    if (blob_id == 0) {
-      int ret = drm_context_get_shmem_blob(dctx, "kgsl-shmem", sizeof(*kctx->shmem),
-                                           blob_size, blob_flags, blob);
+      int ret = kgsl_blob_arena_init()
+         ? kgsl_get_arena_shmem_blob(kctx, blob_size, blob_flags, blob)
+         : drm_context_get_shmem_blob(dctx, "kgsl-shmem", sizeof(*kctx->shmem),
+                                      blob_size, blob_flags, blob);
       if (ret)
          return ret;
       kctx->shmem = to_msm_shmem(dctx->shmem);
@@ -1418,6 +1721,23 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
       blob->map_info = VIRGL_RENDERER_MAP_CACHE_WC;
       obj->exported = true;
       obj->exportable = false;
+      return 0;
+   }
+
+   if (obj->arena_backed) {
+      int fd = os_dupfd_cloexec(g_blob_arena.fd);
+      if (fd < 0) {
+         drm_err("arena dup failed: %s", strerror(errno));
+         return -EINVAL;
+      }
+      blob->type = VIRGL_RESOURCE_FD_SHM;
+      blob->u.fd = fd;
+      blob->map_ptr = g_blob_arena.host_va + obj->arena_offset;
+      blob->map_info = (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT))
+         ? VIRGL_RENDERER_MAP_CACHE_CACHED
+         : VIRGL_RENDERER_MAP_CACHE_WC;
+      obj->exported = true;
+      obj->exportable = !!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE);
       return 0;
    }
 
@@ -1482,6 +1802,19 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
    for (unsigned i = 0; i < g_nr_timelines; i++)
       drm_timeline_fini(&kctx->timelines[i]);
+
+   /* Arena-backed shmem: return the range and detach it, or
+    * drm_context_unmap_shmem_blob() would munmap a hole into the long-lived
+    * arena mapping (SIGSEGV once the offset is reused by a later BO). */
+   if (kctx->shmem_arena_backed) {
+      kgsl_blob_arena_free(kctx->shmem_arena_offset, dctx->blob_size);
+      dctx->shmem = NULL;
+      dctx->rsp_mem = NULL;
+      dctx->rsp_mem_sz = 0;
+      dctx->blob_size = 0;
+      kctx->shmem = NULL;
+      kctx->shmem_arena_backed = false;
+   }
 
    drm_context_deinit(dctx); /* frees remaining objects via free_object */
 

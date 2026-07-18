@@ -607,6 +607,45 @@ kgsl_free_gpuobj(int fd, uint32_t mem_id)
 }
 
 /*
+ * Import an existing sub-region [offset, offset+size) of the pre-shared arena
+ * as its own KGSL mem_id, via a udmabuf window over the arena memfd.  Unlike
+ * kgsl_alloc_arena_bo() this does NOT reserve the range from the arena
+ * free-list and does NOT scrub it — the range is already owned & populated by
+ * the exporting context; we only need a second KGSL handle so a second context
+ * can bind the same pages at its own iova (cross-context dmabuf import).  The
+ * returned mem_id is freed with kgsl_free_gpuobj(); it must NOT be returned to
+ * the arena free-list (see kgsl_renderer_free_object: the alias obj is created
+ * without arena_backed for exactly this reason).
+ */
+static uint32_t
+kgsl_import_arena_region(int fd, uint64_t offset, uint64_t size,
+                         uint32_t kgsl_flags)
+{
+   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   if (udev < 0) {
+      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
+      return 0;
+   }
+   struct udmabuf_create uc = {
+      .memfd = g_blob_arena.fd,
+      .flags = UDMABUF_FLAGS_CLOEXEC,
+      .offset = offset,
+      .size = size,
+   };
+   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
+   close(udev);
+   if (udmabuf < 0) {
+      drm_err("UDMABUF_CREATE(arena import off=0x%" PRIx64 ") failed: %s",
+              offset, strerror(errno));
+      return 0;
+   }
+
+   uint32_t mem_id = kgsl_import_dmabuf(fd, udmabuf, kgsl_flags);
+   close(udmabuf);
+   return mem_id;
+}
+
+/*
  * Bind (op == KGSL_GPUMEM_RANGE_OP_BIND) or unbind a child object into this
  * context's VBO at the guest-chosen iova.  This is what makes the BO visible
  * to the GPU at exactly the address the guest baked into its cmdstreams.
@@ -1546,6 +1585,55 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
 
    if (obj)
       return;
+
+   drm_dbg("attach res_id=%u map_ptr=%p map_size=0x%" PRIx64 " map_info=0x%x",
+           res->res_id, res->map_ptr, res->map_size, res->map_info);
+
+   /* Cross-context import of an arena-backed BO.  Every BO on this path lives in
+    * the single pre-shared arena, so when one context shares a BO to another
+    * (e.g. vkcube's presented swapchain buffer imported by the weston-zink
+    * compositor) the exporter (kgsl_renderer_get_blob) hands crosvm a dup of the
+    * whole arena memfd (VIRGL_RESOURCE_FD_SHM) plus map_ptr = arena base + the
+    * BO's offset.  virgl_resource_export_fd() would report SHM and the DMABUF-only
+    * path below would silently skip it -> res_id never registered -> the guest's
+    * following GEM_SET_IOVA misses -> we bump async_error -> turnip escalates that
+    * to a phantom "GPU faulted or hung" device-lost (the whole 71s-crash cascade).
+    * Instead recover the sub-region from map_ptr, re-import it as our own mem_id,
+    * and register res_id so GEM_SET_IOVA binds it into this context's VBO. */
+   if (kgsl_blob_arena_init() && res->map_ptr &&
+       (uint8_t *)res->map_ptr >= g_blob_arena.host_va &&
+       (uint8_t *)res->map_ptr < g_blob_arena.host_va + g_blob_arena.size) {
+      uint64_t offset = (uint8_t *)res->map_ptr - g_blob_arena.host_va;
+      uint64_t size = ALIGN_POT(res->map_size, getpagesize());
+      if (!size || offset + size > g_blob_arena.size) {
+         drm_err("arena import res_id=%u bad range off=0x%" PRIx64
+                 " size=0x%" PRIx64, res->res_id, offset, size);
+         return;
+      }
+
+      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
+         ((res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED)
+             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
+             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+
+      uint32_t mem_id = kgsl_import_arena_region(dctx->fd, offset, size, kgsl_flags);
+      if (!mem_id)
+         return;
+
+      /* Deliberately NOT arena_backed: kgsl_renderer_free_object would otherwise
+       * return the source context's range to the arena free-list.  The generic
+       * free path frees only our mem_id (dmabuf_fd = -1 so nothing else). */
+      struct kgsl_object *nobj = kgsl_object_create(mem_id, -1, 0, size, size);
+      if (!nobj) {
+         kgsl_free_gpuobj(dctx->fd, mem_id);
+         return;
+      }
+
+      drm_context_object_set_res_id(dctx, &nobj->base, res->res_id);
+      drm_dbg("arena cross-ctx import res_id=%u off=0x%" PRIx64 " size=0x%" PRIx64
+              " mem_id=%u", res->res_id, offset, size, mem_id);
+      return;
+   }
 
    int fd;
    enum virgl_resource_fd_type fd_type = virgl_resource_export_fd(res, &fd);

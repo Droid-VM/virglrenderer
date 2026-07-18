@@ -1427,25 +1427,35 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    }
 
 
-   /* Obtain a sync_file for this submit's completion and feed the ring
-    * timeline, so the vdrm ring fence signals when the GPU passes the seqno.
-    * NCTX_NO_FENCE: skip the out-fence entirely (submit_fence then retires the
-    * ring immediately) -- diagnostic A/B for the post-submit crosvm exit(1).
+   /* Feed the ring timeline so the vdrm ring fence signals when the GPU passes
+    * the seqno.  Default: stash (ctx, timestamp) and let the per-context sync
+    * thread block in IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID -- no extra
+    * TIMESTAMP_EVENT ioctl, no sync_file fd lifecycle (saves 1 ioctl/frame +
+    * fd churn on the completion path).
+    * NCTX_NO_WAITTS: fall back to the TIMESTAMP_EVENT(FENCE) sync_file out-fence
+    *                 (A/B against the WAITTIMESTAMP path).
+    * NCTX_NO_FENCE:  skip the out-fence entirely (submit_fence retires the ring
+    *                 immediately) -- diagnostic A/B for the crosvm exit(1).
     */
    if (!getenv("NCTX_NO_FENCE")) {
-      struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
-      struct kgsl_timestamp_event event = {
-         .type = KGSL_TIMESTAMP_EVENT_FENCE,
-         .timestamp = req->fence,
-         .context_id = req->queue_id,
-         .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
-         .len = sizeof(fence_priv),
-      };
+      if (!getenv("NCTX_NO_WAITTS")) {
+         drm_timeline_set_last_timestamp(&kctx->timelines[ring_idx - 1],
+                                         req->queue_id, req->fence);
+      } else {
+         struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
+         struct kgsl_timestamp_event event = {
+            .type = KGSL_TIMESTAMP_EVENT_FENCE,
+            .timestamp = req->fence,
+            .context_id = req->queue_id,
+            .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
+            .len = sizeof(fence_priv),
+         };
 
-      if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event) &&
-          fence_priv.fence_fd >= 0) {
-         drm_timeline_set_last_fence_fd(&kctx->timelines[ring_idx - 1],
-                                        fence_priv.fence_fd);
+         if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event) &&
+             fence_priv.fence_fd >= 0) {
+            drm_timeline_set_last_fence_fd(&kctx->timelines[ring_idx - 1],
+                                           fence_priv.fence_fd);
+         }
       }
    }
 
@@ -1764,6 +1774,26 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
    return 0;
 }
 
+/* drm_timeline wait_timestamp hook: block the per-context sync thread until the
+ * GPU retires (ctx_id, timestamp), bypassing TIMESTAMP_EVENT(FENCE)+sync_file.
+ * arg is the KGSL device fd.  Chunked timeout keeps drm_timeline_fini responsive
+ * (ETIMEDOUT => caller re-waits); GPU fault/recovery returns an error that the
+ * caller treats as retired, matching the sync_file signal-on-error behavior. */
+static int
+kgsl_timeline_wait_timestamp(void *arg, uint32_t ctx_id, uint32_t timestamp)
+{
+   int fd = (int)(intptr_t)arg;
+   struct kgsl_device_waittimestamp_ctxtid wait = {
+      .context_id = ctx_id,
+      .timestamp = timestamp,
+      .timeout = 3000, /* ms */
+   };
+
+   if (kgsl_ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait) == 0)
+      return 0; /* retired */
+   return errno == ETIMEDOUT ? ETIMEDOUT : (errno ? errno : -1);
+}
+
 static int
 kgsl_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags,
                            uint32_t ring_idx, uint64_t fence_id)
@@ -1777,9 +1807,9 @@ kgsl_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags,
    }
 
    /* ring_idx 0 is the host-CPU timeline: already passed by the time we are
-    * called.  Likewise if the queue produced no fence fd, signal immediately.
+    * called.  Likewise if the queue produced no out-fence, signal immediately.
     */
-   if (ring_idx == 0 || kctx->timelines[ring_idx - 1].last_fence_fd < 0) {
+   if (ring_idx == 0 || !drm_timeline_has_pending(&kctx->timelines[ring_idx - 1])) {
       vctx->fence_retire(vctx, ring_idx, fence_id);
       return 0;
    }
@@ -1926,9 +1956,16 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
 
    kctx->sq_to_ring_idx_table = _mesa_hash_table_create_u32_keys(NULL);
 
-   for (unsigned i = 0; i < g_nr_timelines; i++)
+   for (unsigned i = 0; i < g_nr_timelines; i++) {
       drm_timeline_init(&kctx->timelines[i], &kctx->base.base, "kgsl-sync",
                         i + 1, kgsl_renderer_fence_retire);
+      /* Default: sync thread blocks in WAITTIMESTAMP_CTXTID (no sync_file).
+       * NCTX_NO_WAITTS keeps the legacy TIMESTAMP_EVENT(FENCE)+poll path. */
+      if (!getenv("NCTX_NO_WAITTS"))
+         drm_timeline_set_wait_timestamp_fn(&kctx->timelines[i],
+                                            kgsl_timeline_wait_timestamp,
+                                            (void *)(intptr_t)fd);
+   }
 
    kctx->base.base.destroy = kgsl_renderer_destroy;
    kctx->base.base.attach_resource = kgsl_renderer_attach_resource;

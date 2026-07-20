@@ -124,6 +124,7 @@ static int g_keeper_fd = -1;
 struct kgsl_arena_extent {
    uint64_t offset;
    uint64_t size;
+   uint32_t refs;
    struct kgsl_arena_extent *next;
 };
 
@@ -135,6 +136,7 @@ static struct {
    uint8_t *host_va;
    uint64_t size;
    struct kgsl_arena_extent *free_list;
+   struct kgsl_arena_extent *allocations;
 } g_blob_arena = {
    .lock = PTHREAD_MUTEX_INITIALIZER,
    .fd = -1,
@@ -378,12 +380,17 @@ kgsl_blob_arena_alloc(uint64_t size, uint64_t *out_offset)
       return false;
 
    size = ALIGN_POT(size, getpagesize());
+   struct kgsl_arena_extent *allocation = calloc(1, sizeof(*allocation));
+   if (!allocation)
+      return false;
+
    pthread_mutex_lock(&g_blob_arena.lock);
    struct kgsl_arena_extent **link = &g_blob_arena.free_list;
    while (*link && (*link)->size < size)
       link = &(*link)->next;
    if (!*link) {
       pthread_mutex_unlock(&g_blob_arena.lock);
+      free(allocation);
       return false;
    }
 
@@ -395,7 +402,38 @@ kgsl_blob_arena_alloc(uint64_t size, uint64_t *out_offset)
       *link = extent->next;
       free(extent);
    }
+
+   allocation->offset = *out_offset;
+   allocation->size = size;
+   allocation->refs = 1;
+   allocation->next = g_blob_arena.allocations;
+   g_blob_arena.allocations = allocation;
    pthread_mutex_unlock(&g_blob_arena.lock);
+   drm_dbg("arena alloc off=0x%" PRIx64 " size=0x%" PRIx64 " refs=1",
+           *out_offset, size);
+   return true;
+}
+
+static bool
+kgsl_blob_arena_retain(uint64_t offset, uint64_t size)
+{
+   size = ALIGN_POT(size, getpagesize());
+   pthread_mutex_lock(&g_blob_arena.lock);
+   struct kgsl_arena_extent *allocation = g_blob_arena.allocations;
+   while (allocation &&
+          (allocation->offset != offset || allocation->size != size))
+      allocation = allocation->next;
+   if (!allocation) {
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      drm_err("arena retain unknown range off=0x%" PRIx64 " size=0x%" PRIx64,
+              offset, size);
+      return false;
+   }
+
+   uint32_t refs = ++allocation->refs;
+   pthread_mutex_unlock(&g_blob_arena.lock);
+   drm_dbg("arena retain off=0x%" PRIx64 " size=0x%" PRIx64 " refs=%u",
+           offset, size, refs);
    return true;
 }
 
@@ -403,16 +441,31 @@ static void
 kgsl_blob_arena_free(uint64_t offset, uint64_t size)
 {
    size = ALIGN_POT(size, getpagesize());
-   struct kgsl_arena_extent *extent = calloc(1, sizeof(*extent));
-   if (!extent) {
-      drm_err("failed to return arena range off=0x%" PRIx64 " size=0x%" PRIx64,
+
+   pthread_mutex_lock(&g_blob_arena.lock);
+   struct kgsl_arena_extent **allocation_link = &g_blob_arena.allocations;
+   while (*allocation_link &&
+          ((*allocation_link)->offset != offset ||
+           (*allocation_link)->size != size))
+      allocation_link = &(*allocation_link)->next;
+   if (!*allocation_link) {
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      drm_err("arena release unknown range off=0x%" PRIx64 " size=0x%" PRIx64,
               offset, size);
       return;
    }
-   extent->offset = offset;
-   extent->size = size;
 
-   pthread_mutex_lock(&g_blob_arena.lock);
+   struct kgsl_arena_extent *extent = *allocation_link;
+   if (--extent->refs) {
+      uint32_t refs = extent->refs;
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      drm_dbg("arena release off=0x%" PRIx64 " size=0x%" PRIx64 " refs=%u",
+              offset, size, refs);
+      return;
+   }
+   *allocation_link = extent->next;
+   extent->next = NULL;
+
    struct kgsl_arena_extent **link = &g_blob_arena.free_list;
    while (*link && (*link)->offset < offset)
       link = &(*link)->next;
@@ -436,6 +489,8 @@ kgsl_blob_arena_free(uint64_t offset, uint64_t size)
       free(extent);
    }
    pthread_mutex_unlock(&g_blob_arena.lock);
+   drm_dbg("arena release off=0x%" PRIx64 " size=0x%" PRIx64 " refs=0",
+           offset, size);
 }
 
 /* Allocate an exportable dmabuf from the system dma-heap. */
@@ -654,9 +709,9 @@ kgsl_free_gpuobj(int fd, uint32_t mem_id)
  * free-list and does NOT scrub it — the range is already owned & populated by
  * the exporting context; we only need a second KGSL handle so a second context
  * can bind the same pages at its own iova (cross-context dmabuf import).  The
- * returned mem_id is freed with kgsl_free_gpuobj(); it must NOT be returned to
- * the arena free-list (see kgsl_renderer_free_object: the alias obj is created
- * without arena_backed for exactly this reason).
+ * The caller also retains the source allocation while the imported object is
+ * alive.  This prevents source-context teardown from returning a range that is
+ * still mapped by another context.
  */
 static uint32_t
 kgsl_import_arena_region(int fd, uint64_t offset, uint64_t size,
@@ -1657,18 +1712,26 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
              ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
              : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
 
-      uint32_t mem_id = kgsl_import_arena_region(dctx->fd, offset, size, kgsl_flags);
-      if (!mem_id)
+      if (!kgsl_blob_arena_retain(offset, size))
          return;
 
-      /* Deliberately NOT arena_backed: kgsl_renderer_free_object would otherwise
-       * return the source context's range to the arena free-list.  The generic
-       * free path frees only our mem_id (dmabuf_fd = -1 so nothing else). */
-      struct kgsl_object *nobj = kgsl_object_create(mem_id, -1, 0, size, size);
-      if (!nobj) {
-         kgsl_free_gpuobj(dctx->fd, mem_id);
+      uint32_t mem_id = kgsl_import_arena_region(dctx->fd, offset, size, kgsl_flags);
+      if (!mem_id) {
+         kgsl_blob_arena_free(offset, size);
          return;
       }
+
+      uint32_t flags = res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED
+         ? MSM_BO_CACHED : 0;
+      struct kgsl_object *nobj = kgsl_object_create(mem_id, -1, flags, size, size);
+      if (!nobj) {
+         kgsl_free_gpuobj(dctx->fd, mem_id);
+         kgsl_blob_arena_free(offset, size);
+         return;
+      }
+      nobj->is_shm = true;
+      nobj->arena_backed = true;
+      nobj->arena_offset = offset;
 
       drm_context_object_set_res_id(dctx, &nobj->base, res->res_id);
       drm_dbg("arena cross-ctx import res_id=%u off=0x%" PRIx64 " size=0x%" PRIx64

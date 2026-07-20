@@ -254,6 +254,48 @@ kgsl_ioctl(int fd, unsigned long request, void *arg)
    return ret;
 }
 
+/* Guest turnip allocates every BO from the VA range returned by GET_PARAM.
+ * That range is per renderer context in the KGSL nctx backend, even though
+ * the backing VBO is shared by the host process. Keep the check overflow-safe
+ * because both endpoints are guest-controlled 64-bit values. */
+static bool
+kgsl_iova_in_slice(const struct kgsl_context *kctx, uint64_t iova,
+                   uint64_t size)
+{
+   if (!size || size > kctx->va_slice_size || iova < kctx->va_slice_base)
+      return false;
+
+   return iova - kctx->va_slice_base <= kctx->va_slice_size - size;
+}
+
+static bool
+kgsl_relax_slice_checks(void)
+{
+   return getenv("NCTX_RELAX_SLICE") != NULL;
+}
+
+/* The KGSL fault log reports the address actually dereferenced by the GPU,
+ * while the submit log reports only the IB start.  During a reproduction we
+ * can therefore look for a 64-bit field carrying the fault's low dword.  The
+ * default is the low dword from the current 0x31008fd438 fault; override it
+ * with NCTX_IB_FAULT_LO32=0x... for a later fault. */
+static bool
+kgsl_nctx_fault_low32(uint32_t *out)
+{
+   const char *value = getenv("NCTX_IB_FAULT_LO32");
+   if (!value || !*value)
+      value = "0x008fd438";
+
+   char *end = NULL;
+   errno = 0;
+   unsigned long long parsed = strtoull(value, &end, 0);
+   if (errno || end == value || *end || parsed > UINT32_MAX)
+      return false;
+
+   *out = (uint32_t)parsed;
+   return true;
+}
+
 static int
 kgsl_va_slice_claim(void)
 {
@@ -750,7 +792,17 @@ static int
 kgsl_vbo_op(struct kgsl_context *kctx, uint32_t child_id, uint64_t iova,
             uint64_t size, uint32_t op)
 {
-   if (iova < kctx->vbo_base || iova + size > kctx->vbo_base + g_va_size) {
+   if (!kgsl_iova_in_slice(kctx, iova, size)) {
+      drm_err("iova 0x%" PRIx64 " (size 0x%" PRIx64
+              ") outside ctx slice %d [0x%" PRIx64 ", 0x%" PRIx64 ")",
+              iova, size, kctx->va_slice_idx, kctx->va_slice_base,
+              kctx->va_slice_base + kctx->va_slice_size);
+      if (!kgsl_relax_slice_checks())
+         return -EINVAL;
+   }
+
+   if (size > g_va_size || iova < kctx->vbo_base ||
+       iova - kctx->vbo_base > g_va_size - size) {
       drm_err("iova 0x%" PRIx64 " (size 0x%" PRIx64 ") outside VBO [0x%" PRIx64
               ", 0x%" PRIx64 ")", iova, size, kctx->vbo_base,
               kctx->vbo_base + g_va_size);
@@ -808,8 +860,17 @@ static int
 kgsl_vbo_bind_runs(struct kgsl_context *kctx, struct kgsl_object *obj,
                    uint64_t iova)
 {
-   if (iova < kctx->vbo_base ||
-       iova + obj->blob_size > kctx->vbo_base + g_va_size) {
+   if (!kgsl_iova_in_slice(kctx, iova, obj->blob_size)) {
+      drm_err("paged BO iova 0x%" PRIx64 " (size 0x%" PRIx64
+              ") outside ctx slice %d [0x%" PRIx64 ", 0x%" PRIx64 ")",
+              iova, obj->blob_size, kctx->va_slice_idx, kctx->va_slice_base,
+              kctx->va_slice_base + kctx->va_slice_size);
+      if (!kgsl_relax_slice_checks())
+         return -EINVAL;
+   }
+
+   if (obj->blob_size > g_va_size || iova < kctx->vbo_base ||
+       iova - kctx->vbo_base > g_va_size - obj->blob_size) {
       drm_err("iova 0x%" PRIx64 " (size 0x%" PRIx64 ") outside VBO", iova,
               obj->blob_size);
       return -EINVAL;
@@ -1285,8 +1346,22 @@ kgsl_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     * reuses the VA — exactly the msm lifetime the guest assumes.
     */
    if (!req->iova) {
+      drm_dbg("GEM_SET_IOVA ctx-slice=%d res_id=%u old=0x%" PRIx64
+              " new=0x0", kctx->va_slice_idx, req->res_id, obj->iova);
       obj->iova = 0;
       return 0;
+   }
+
+   drm_dbg("GEM_SET_IOVA ctx-slice=%d res_id=%u old=0x%" PRIx64
+           " new=0x%" PRIx64 " size=0x%" PRIx64,
+           kctx->va_slice_idx, req->res_id, obj->iova, req->iova,
+           obj->blob_size);
+   if (!kgsl_iova_in_slice(kctx, req->iova, obj->blob_size)) {
+      drm_err("GEM_SET_IOVA res_id=%u crosses ctx slice=%d: iova=0x%" PRIx64
+              " size=0x%" PRIx64, req->res_id, kctx->va_slice_idx,
+              req->iova, obj->blob_size);
+      if (!kgsl_relax_slice_checks())
+         goto out_error;
    }
 
    /* Paged arena BOs: re-stitch the same runs at the new iova (old ranges
@@ -1423,6 +1498,97 @@ kgsl_ccmd_gem_upload(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    return 0;
 }
 
+static void
+kgsl_scan_fault_addresses(struct drm_context *dctx, uint64_t ib_iova,
+                          const uint32_t *ib, uint32_t nd)
+{
+   uint32_t fault_low32;
+   if (!kgsl_nctx_fault_low32(&fault_low32))
+      return;
+
+   for (uint32_t w = 0; w + 1 < nd; w++) {
+      if (ib[w] != fault_low32)
+         continue;
+
+      uint64_t candidate =
+         (uint64_t)ib[w] | ((uint64_t)ib[w + 1] << 32);
+      struct kgsl_object *cover = NULL;
+      struct kgsl_object *low_owner = NULL;
+      uint64_t expected = 0;
+      hash_table_foreach(dctx->resource_table, ent) {
+         struct kgsl_object *o = (struct kgsl_object *)ent->data;
+         if (!o->iova)
+            continue;
+         if (candidate >= o->iova && candidate - o->iova < o->blob_size)
+            cover = o;
+         uint32_t low_offset = fault_low32 - (uint32_t)o->iova;
+         if ((uint64_t)low_offset < o->blob_size) {
+            low_owner = o;
+            expected = o->iova + low_offset;
+         }
+      }
+
+      if (!cover) {
+         drm_log("IB-SCAN FAULT-LOW ib=0x%" PRIx64
+                 "+0x%x raw=%08x:%08x candidate=0x%" PRIx64
+                 " UNBOUND low-owner=%p base=0x%" PRIx64
+                 " expected=0x%" PRIx64 " size=0x%" PRIx64,
+                 ib_iova, w * 4, ib[w + 1], ib[w], candidate,
+                 (void *)low_owner, low_owner ? low_owner->iova : 0,
+                 expected, low_owner ? low_owner->blob_size : 0);
+      }
+   }
+}
+
+static void
+kgsl_scan_reg_to_mem_addresses(struct drm_context *dctx, uint64_t ib_iova,
+                               const uint32_t *ib, uint32_t nd)
+{
+   for (uint32_t w = 0; w < nd; w++) {
+      if ((ib[w] >> 28) != 0x7 || ((ib[w] >> 16) & 0x7f) != 0x3e)
+         continue;
+
+      uint32_t payload_dwords = ib[w] & 0x3fff;
+      if (payload_dwords < 3)
+         continue;
+
+      if (w + 3 >= nd) {
+         drm_log("IB-SCAN TRUNCATED REG_TO_MEM ib=0x%" PRIx64
+                 "+0x%x packet-dwords=%u remaining=%u",
+                 ib_iova, w * 4, payload_dwords + 1, nd - w);
+         continue;
+      }
+
+      uint64_t candidate =
+         (uint64_t)ib[w + 2] | ((uint64_t)ib[w + 3] << 32);
+      struct kgsl_object *cover = NULL;
+      struct kgsl_object *low_owner = NULL;
+      uint64_t expected = 0;
+      hash_table_foreach(dctx->resource_table, ent) {
+         struct kgsl_object *o = (struct kgsl_object *)ent->data;
+         if (!o->iova)
+            continue;
+         if (candidate >= o->iova && candidate - o->iova < o->blob_size)
+            cover = o;
+         uint32_t low_offset = ib[w + 2] - (uint32_t)o->iova;
+         if ((uint64_t)low_offset < o->blob_size) {
+            low_owner = o;
+            expected = o->iova + low_offset;
+         }
+      }
+
+      if (!cover && low_owner) {
+         drm_log("IB-SCAN BAD REG_TO_MEM ib=0x%" PRIx64
+                 "+0x%x raw=%08x:%08x candidate=0x%" PRIx64
+                 " low-owner=%p base=0x%" PRIx64
+                 " expected=0x%" PRIx64 " size=0x%" PRIx64,
+                 ib_iova, (w + 2) * 4, ib[w + 3], ib[w + 2], candidate,
+                 (void *)low_owner, low_owner->iova, expected,
+                 low_owner->blob_size);
+      }
+   }
+}
+
 /*
  * GEM_SUBMIT: translate the msm submit (bo table + cmd table) into a KGSL
  * GPU_COMMAND.  Each IB cmd references the VBO (which holds every BO mapping)
@@ -1477,6 +1643,25 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
          return -EINVAL;
       }
 
+      /* KGSL receives a raw GPU command object. Reject wrapped or truncated
+       * ranges before constructing it; otherwise a malformed guest command can
+       * make the CP fetch beyond the host mapping and turn into a page fault. */
+      if ((uint64_t)c->submit_offset > obj->blob_size ||
+          (uint64_t)c->size > obj->blob_size - c->submit_offset) {
+         drm_err("submit range out of bounds: ctx-slice=%d res_id=%u "
+                 "offset=0x%x size=0x%x blob=0x%" PRIx64,
+                 kctx->va_slice_idx, bos[c->submit_idx].handle,
+                 c->submit_offset, c->size, obj->blob_size);
+         free(kcmds);
+         return -EINVAL;
+      }
+
+      drm_dbg("GEM_SUBMIT ctx-slice=%d queue=%u fence=%u res_id=%u "
+              "iova=0x%" PRIx64 " offset=0x%x size=0x%x",
+              kctx->va_slice_idx, req->queue_id, req->fence,
+              bos[c->submit_idx].handle, obj->iova, c->submit_offset,
+              c->size);
+
       kcmds[n++] = (struct kgsl_command_object) {
          .gpuaddr = obj->iova + c->submit_offset,
          .size = c->size,
@@ -1498,6 +1683,30 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
                  nd > 2 ? ib[2] : 0, nd > 3 ? ib[3] : 0,
                  nd > 3 ? ib[nd - 4] : 0, nd > 2 ? ib[nd - 3] : 0,
                  nd > 1 ? ib[nd - 2] : 0, nd > 0 ? ib[nd - 1] : 0);
+
+         /* System Settings reproducibly faults after consuming 0x100 dwords
+          * from its 0x7ffc-byte IB, and after 0x13a0 dwords from its
+          * 0x85e4-byte IB.  Capture the host-visible command words around both
+          * CP positions without turning every submit into a full IB dump. */
+         uint32_t window_dw = 0;
+         if (c->size == 0x7ffc)
+            window_dw = 0xf0;
+         else if (c->size == 0x85e4)
+            window_dw = 0x1390;
+
+         if (window_dw && window_dw + 8 <= nd) {
+            for (uint32_t w = window_dw; w < window_dw + 0x28; w += 8) {
+               drm_log("IB-WINDOW iova=0x%" PRIx64 "+0x%x "
+                       "%08x %08x %08x %08x %08x %08x %08x %08x",
+                       obj->iova + c->submit_offset, w * 4,
+                       ib[w], ib[w + 1], ib[w + 2], ib[w + 3],
+                       ib[w + 4], ib[w + 5], ib[w + 6], ib[w + 7]);
+            }
+         }
+         /* Do not leave host cache aliases behind after the diagnostic read.
+          * The guest updates these shared BOs through a WC mapping; a later
+          * GPU access must not snoop a stale line populated by this probe. */
+         kgsl_cache_clean_inv((void *)ib, c->size);
       }
 
       /* NCTX_IB_SCAN: walk the IB1 for CP_INDIRECT_BUFFER (type7, opcode
@@ -1523,13 +1732,39 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
                }
             }
             uint32_t thead = 0;
-            if (tobj && !kgsl_map_object(kctx, tobj))
-               thead = *(uint32_t *)(tobj->map + (tgt - tobj->iova));
+            if (tobj && !kgsl_map_object(kctx, tobj)) {
+               uint64_t target_offset = tgt - tobj->iova;
+               uint64_t available_dwords =
+                  (tobj->blob_size - target_offset) / sizeof(uint32_t);
+               uint32_t target_dwords =
+                  MIN2((uint64_t)tsz, available_dwords);
+               const uint32_t *target_ib =
+                  (const uint32_t *)(tobj->map + target_offset);
+               if (target_dwords)
+                  thead = target_ib[0];
+               kgsl_scan_fault_addresses(dctx, tgt, target_ib,
+                                         target_dwords);
+               kgsl_scan_reg_to_mem_addresses(dctx, tgt, target_ib,
+                                              target_dwords);
+               kgsl_cache_clean_inv((void *)target_ib,
+                                    target_dwords * sizeof(uint32_t));
+            }
             drm_log("IB-SCAN ib1=0x%" PRIx64 "+0x%x -> ib2=0x%" PRIx64 " sz=0x%x %s head=%08x",
                     obj->iova + c->submit_offset, w * 4, tgt, tsz,
                     tobj ? "BOUND" : "UNBOUND!", thead);
             w += 3;
          }
+
+         /* Also inspect every adjacent dword pair as a possible 64-bit GPU
+          * address.  Only emit a line when its low dword matches the fault
+          * under investigation and the reconstructed address is not covered
+          * by a currently bound BO.  This catches a torn/overwritten high
+          * dword without flooding the log with ordinary command payload. */
+         kgsl_scan_fault_addresses(dctx, obj->iova + c->submit_offset,
+                                   ib, nd);
+         kgsl_scan_reg_to_mem_addresses(dctx,
+                                        obj->iova + c->submit_offset, ib, nd);
+         kgsl_cache_clean_inv((void *)ib, c->size);
       }
    }
 

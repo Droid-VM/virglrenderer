@@ -157,6 +157,7 @@ static struct {
  * to only 8 contexts and starving the desktop. */
 #define KGSL_VA_MAX_SLICES 32
 #define KGSL_VA_SLICE_MIN  (2ull << 30)
+static pthread_mutex_t g_va_slices_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_va_slices_used; /* bitmask; bit i = slice i in use */
 static uint64_t g_va_slice_size;  /* per-context slice size (set at init) */
 static unsigned g_va_nslices;     /* number of slices carved (<= 32) */
@@ -249,6 +250,36 @@ kgsl_ioctl(int fd, unsigned long request, void *arg)
       ret = ioctl(fd, request, arg);
    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
    return ret;
+}
+
+static int
+kgsl_va_slice_claim(void)
+{
+   int idx = -1;
+
+   pthread_mutex_lock(&g_va_slices_lock);
+   for (unsigned i = 0; i < g_va_nslices; i++) {
+      if (!(g_va_slices_used & (1u << i))) {
+         idx = i;
+         g_va_slices_used |= 1u << i;
+         break;
+      }
+   }
+   pthread_mutex_unlock(&g_va_slices_lock);
+
+   return idx;
+}
+
+static void
+kgsl_va_slice_release(struct kgsl_context *kctx)
+{
+   if (kctx->va_slice_idx < 0)
+      return;
+
+   pthread_mutex_lock(&g_va_slices_lock);
+   g_va_slices_used &= ~(1u << kctx->va_slice_idx);
+   pthread_mutex_unlock(&g_va_slices_lock);
+   kctx->va_slice_idx = -1;
 }
 
 static int
@@ -1948,7 +1979,7 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
 
    /* The VBO is global (shared by all contexts) -- do not free it here. */
-   g_va_slices_used &= ~(1u << kctx->va_slice_idx);
+   kgsl_va_slice_release(kctx);
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
 
@@ -2013,6 +2044,11 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    if (!kctx)
       return NULL;
 
+   /* Sentinel: no VA slice claimed yet.  fail_early / destroy only return a
+    * slice when this is >= 0, so a failure before the claim below (or a double
+    * free) never clears a bit that belongs to another live context. */
+   kctx->va_slice_idx = -1;
+
    kctx->dma_heap_fd = open(dma_heap_path, O_RDONLY | O_CLOEXEC);
    if (kctx->dma_heap_fd < 0) {
       drm_err("open %s failed: %s", dma_heap_path, strerror(errno));
@@ -2030,18 +2066,11 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
 
    /* Claim a disjoint VA slice for this context (geometry set at init). */
    {
-      int idx = -1;
-      for (unsigned i = 0; i < g_va_nslices; i++) {
-         if (!(g_va_slices_used & (1u << i))) {
-            idx = i;
-            break;
-         }
-      }
+      int idx = kgsl_va_slice_claim();
       if (idx < 0) {
          drm_err("out of VA slices (%u contexts)", g_va_nslices);
          goto fail_early;
       }
-      g_va_slices_used |= 1u << idx;
       kctx->va_slice_idx = idx;
       kctx->va_slice_base = g_va_start + (uint64_t)idx * g_va_slice_size;
       kctx->va_slice_size = g_va_slice_size;
@@ -2078,6 +2107,10 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    return &kctx->base.base;
 
 fail_early:
+   /* Return the VA slice if we already claimed one.  Without this, every
+    * failed create (e.g. drm_context_init OOM) permanently leaks a slice;
+    * after 32 leaks all CtxCreate return ENOMEM until crosvm restarts. */
+   kgsl_va_slice_release(kctx);
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
    close(fd);

@@ -95,6 +95,7 @@
 static const uint64_t vbo_size_ladder[] = {
    0x10000000000ull, /* 1 TiB   */
    0x04000000000ull, /* 256 GiB */
+   0x02000000000ull, /* 128 GiB */
    0x01000000000ull, /* 64 GiB  */
    0x00400000000ull, /* 16 GiB  */
    0x00100000000ull, /* 4 GiB   */
@@ -151,18 +152,20 @@ static struct {
  * (MSM_PARAM_VA_START/VA_SIZE), which the patched guest prefers over the
  * (global) capset values. */
 /* Slice geometry is derived once at init from the *actual* VBO size KGSL
- * granted (g_va_size), not hardcoded: the used-bitmask is 32 bits wide, so we
- * aim to carve the VBO into the full 32 disjoint per-context slices, but never
- * shrink a slice below KGSL_VA_SLICE_MIN (turnip treats va_size as this
- * context's entire GPU VA budget).  A 256GB VBO therefore yields 8GB slices; a
- * 64GB VBO auto-drops to 2GB slices (still 32 contexts) instead of collapsing
- * to only 8 contexts and starving the desktop. */
-#define KGSL_VA_MAX_SLICES 32
+ * granted (g_va_size), not hardcoded: the slice *count* scales with the VBO so
+ * a larger VA range yields more concurrent contexts rather than a fixed 32.
+ * We carve as many slices as fit at KGSL_VA_SLICE_MIN (turnip treats va_size as
+ * this context's entire GPU VA budget, so a slice must not shrink below it),
+ * capped by the used-bitmask width (KGSL_VA_MAX_SLICES), then spread the whole
+ * VBO evenly across them.  A 64GB VBO -> 32 x 2GB; a 128GB VBO -> 64 x 2GB; a
+ * 256GB VBO -> 64 x 4GB (bitmask-capped); a 16GB VBO auto-drops to 8 x 2GB
+ * instead of starving each context. */
+#define KGSL_VA_MAX_SLICES 64
 #define KGSL_VA_SLICE_MIN  (2ull << 30)
 static pthread_mutex_t g_va_slices_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t g_va_slices_used; /* bitmask; bit i = slice i in use */
+static uint64_t g_va_slices_used; /* bitmask; bit i = slice i in use */
 static uint64_t g_va_slice_size;  /* per-context slice size (set at init) */
-static unsigned g_va_nslices;     /* number of slices carved (<= 32) */
+static unsigned g_va_nslices;     /* number of slices carved (<= KGSL_VA_MAX_SLICES) */
 
 static const char dma_heap_path[] = "/dev/dma_heap/system";
 
@@ -303,9 +306,9 @@ kgsl_va_slice_claim(void)
 
    pthread_mutex_lock(&g_va_slices_lock);
    for (unsigned i = 0; i < g_va_nslices; i++) {
-      if (!(g_va_slices_used & (1u << i))) {
+      if (!(g_va_slices_used & (1ull << i))) {
          idx = i;
-         g_va_slices_used |= 1u << i;
+         g_va_slices_used |= 1ull << i;
          break;
       }
    }
@@ -321,7 +324,7 @@ kgsl_va_slice_release(struct kgsl_context *kctx)
       return;
 
    pthread_mutex_lock(&g_va_slices_lock);
-   g_va_slices_used &= ~(1u << kctx->va_slice_idx);
+   g_va_slices_used &= ~(1ull << kctx->va_slice_idx);
    pthread_mutex_unlock(&g_va_slices_lock);
    kctx->va_slice_idx = -1;
 }
@@ -2510,9 +2513,10 @@ kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    }
 
    /* Derive slice geometry from the VBO KGSL actually granted.  Aim for the
-    * full 32-slice bitmask width, but keep each slice >= KGSL_VA_SLICE_MIN so a
-    * small VBO trades context count for a usable per-context VA budget rather
-    * than handing turnip a slice too small to allocate into. */
+    * full KGSL_VA_MAX_SLICES bitmask width, but keep each slice >=
+    * KGSL_VA_SLICE_MIN so a small VBO trades context count for a usable
+    * per-context VA budget rather than handing turnip a slice too small to
+    * allocate into. */
    {
       unsigned want = KGSL_VA_MAX_SLICES;
       uint64_t slice = g_va_size / want;

@@ -241,12 +241,15 @@ enum virgl_log_level_flags {
    VIRGL_LOG_LEVEL_INFO,
    VIRGL_LOG_LEVEL_WARNING,
    VIRGL_LOG_LEVEL_ERROR,
+   VIRGL_LOG_LEVEL_SILENT,
 };
 
 typedef void (*virgl_free_data_callback_type)(void* user_data);
 typedef void (*virgl_log_callback_type) (enum virgl_log_level_flags log_level,
                                          const char *message,
                                          void* user_data);
+
+VIRGL_EXPORT void virgl_set_log_level(enum virgl_log_level_flags log_level);
 
 VIRGL_EXPORT int virgl_renderer_resource_create(struct virgl_renderer_resource_create_args *args, struct iovec *iov, uint32_t num_iovs);
 VIRGL_EXPORT int virgl_renderer_resource_import_eglimage(struct virgl_renderer_resource_create_args *args, void *image);

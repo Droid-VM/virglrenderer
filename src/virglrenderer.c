@@ -981,6 +981,10 @@ virgl_debug_callback_type virgl_set_debug_callback(virgl_debug_callback_type cb)
 {
    virgl_debug_callback_type previous_cb = legacy_logger.logger;
    legacy_logger.logger = cb;
+   /* The deprecated callback has no level argument and historically received
+    * every renderer diagnostic.  Keep that contract; the leveled API used by
+    * crosvm controls filtering explicitly through virgl_set_log_level(). */
+   virgl_set_log_level(VIRGL_LOG_LEVEL_DEBUG);
    virgl_log_set_handler(virgl_legacy_logger, &legacy_logger, NULL);
    return previous_cb;
 }

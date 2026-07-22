@@ -72,6 +72,7 @@ void virgl_log_set_handler(virgl_log_callback_type log_cb,
                            virgl_free_data_callback_type free_data_cb);
 
 void virgl_logv(const char *fmt, va_list va);
+void virgl_logv_level(enum virgl_log_level_flags level, const char *fmt, va_list va);
 
 static inline void PRINTFLIKE(1, 2) virgl_log(const char *fmt, ...)
 {
@@ -131,31 +132,28 @@ void trace_end(const char **scope);
 #define TRACE_SCOPE_END(VAR) ((void)(VAR))
 #endif /* ENABLE_TRACING */
 
-/* --- DRM-native-context back-port compat ---------------------------------
- * The upstream src/drm framework and virgl_fence.c expect the newer leveled
- * virgl logging API; this vendored core only has the level-less virgl_log().
- * Map the leveled entry points onto it so the framework builds unchanged. */
-/* enum virgl_log_level_flags comes from virglrenderer.h (included above). */
+/* --- Leveled logging helpers ----------------------------------------------
+ * enum virgl_log_level_flags comes from virglrenderer.h (included above). */
 #ifndef VIRGL_LOG_LEVEL_FLAGS_DEFINED
 #define VIRGL_LOG_LEVEL_FLAGS_DEFINED
 static inline void PRINTFLIKE(1, 2) virgl_info(const char *fmt, ...)
 {
-   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+   va_list va; va_start(va, fmt); virgl_logv_level(VIRGL_LOG_LEVEL_INFO, fmt, va); va_end(va);
 }
 static inline void PRINTFLIKE(1, 2) virgl_error(const char *fmt, ...)
 {
-   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+   va_list va; va_start(va, fmt); virgl_logv_level(VIRGL_LOG_LEVEL_ERROR, fmt, va); va_end(va);
 }
 static inline void PRINTFLIKE(1, 2) virgl_warn(const char *fmt, ...)
 {
-   va_list va; va_start(va, fmt); virgl_logv(fmt, va); va_end(va);
+   va_list va; va_start(va, fmt); virgl_logv_level(VIRGL_LOG_LEVEL_WARNING, fmt, va); va_end(va);
 }
 static inline void
 virgl_prefixed_logv(const char *domain, enum virgl_log_level_flags level,
                     const char *fmt, va_list va)
 {
-   (void)domain; (void)level;
-   virgl_logv(fmt, va);
+   (void)domain;
+   virgl_logv_level(level, fmt, va);
 }
 #endif /* VIRGL_LOG_LEVEL_FLAGS_DEFINED */
 

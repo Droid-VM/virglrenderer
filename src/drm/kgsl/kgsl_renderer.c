@@ -114,6 +114,19 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
+/* WAITTIMESTAMP_CTXTID is slower than the sync_file path on Adreno 830.
+ * Keep the optimization enabled for other GPUs, while allowing explicit A/B
+ * overrides without changing the default behavior for existing devices. */
+static bool
+kgsl_use_wait_timestamp(void)
+{
+   if (getenv("NCTX_NO_WAITTS"))
+      return false;
+   if (getenv("NCTX_WAITTS"))
+      return true;
+   return g_gpu_id != 830;
+}
+
 /* The single VBO shared by every context (see kgsl_renderer_create).  Allocated
  * once at probe and kept alive for the renderer's lifetime by g_keeper_fd (the
  * probe fd is closed by drm_renderer_init; KGSL memory is freed when the last fd
@@ -207,6 +220,10 @@ DEFINE_CAST(drm_object, kgsl_object)
 
 struct kgsl_context {
    struct drm_context base;
+
+   /* Chosen once at context creation so submissions cannot change mode if the
+    * process environment is modified later. */
+   bool use_wait_timestamp;
 
    struct msm_shmem *shmem;
 
@@ -1801,17 +1818,13 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 
 
    /* Feed the ring timeline so the vdrm ring fence signals when the GPU passes
-    * the seqno.  Default: stash (ctx, timestamp) and let the per-context sync
-    * thread block in IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID -- no extra
-    * TIMESTAMP_EVENT ioctl, no sync_file fd lifecycle (saves 1 ioctl/frame +
-    * fd churn on the completion path).
-    * NCTX_NO_WAITTS: fall back to the TIMESTAMP_EVENT(FENCE) sync_file out-fence
-    *                 (A/B against the WAITTIMESTAMP path).
-    * NCTX_NO_FENCE:  skip the out-fence entirely (submit_fence retires the ring
-    *                 immediately) -- diagnostic A/B for the crosvm exit(1).
-    */
+    * the seqno.  Adreno 830 defaults to TIMESTAMP_EVENT(FENCE)+poll because
+    * its WAITTIMESTAMP_CTXTID path is substantially slower.  Other GPUs use
+    * the timestamp path unless NCTX_NO_WAITTS is set.  NCTX_WAITTS forces the
+    * timestamp path for an explicit A/B, and NCTX_NO_FENCE skips the out-fence
+    * entirely for diagnostic use. */
    if (!getenv("NCTX_NO_FENCE")) {
-      if (!getenv("NCTX_NO_WAITTS")) {
+      if (kctx->use_wait_timestamp) {
          drm_timeline_set_last_timestamp(&kctx->timelines[ring_idx - 1],
                                          req->queue_id, req->fence);
       } else {
@@ -2345,6 +2358,8 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    if (!kctx)
       return NULL;
 
+   kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+
    /* Sentinel: no VA slice claimed yet.  fail_early / destroy only return a
     * slice when this is >= 0, so a failure before the claim below (or a double
     * free) never clears a bit that belongs to another live context. */
@@ -2387,9 +2402,9 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    for (unsigned i = 0; i < g_nr_timelines; i++) {
       drm_timeline_init(&kctx->timelines[i], &kctx->base.base, "kgsl-sync",
                         i + 1, kgsl_renderer_fence_retire);
-      /* Default: sync thread blocks in WAITTIMESTAMP_CTXTID (no sync_file).
-       * NCTX_NO_WAITTS keeps the legacy TIMESTAMP_EVENT(FENCE)+poll path. */
-      if (!getenv("NCTX_NO_WAITTS"))
+      /* Timestamp mode avoids sync_file allocation; legacy mode uses the
+       * TIMESTAMP_EVENT(FENCE)+poll path. */
+      if (kctx->use_wait_timestamp)
          drm_timeline_set_wait_timestamp_fn(&kctx->timelines[i],
                                             kgsl_timeline_wait_timestamp,
                                             (void *)(intptr_t)fd);

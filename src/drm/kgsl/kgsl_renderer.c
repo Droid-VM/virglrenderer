@@ -45,7 +45,9 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -58,6 +60,10 @@
 #include <linux/dma-heap.h>
 #include <linux/memfd.h>
 #include <linux/udmabuf.h>
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 /* The vendored KGSL/msm uapi headers carry the kernel's __user annotation,
  * which is not defined in a pure userspace build; neutralise it.
@@ -114,6 +120,67 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
+/* Aggregate tracing for the host-side arena and fence paths.  It is enabled by
+ * default; set CROSVM_KGSL_DIAG=0 to disable it.  Counters are process-wide
+ * because the arena is shared by all KGSL contexts in the renderer process. */
+struct kgsl_diag_stats {
+   uint64_t attach_calls;
+   uint64_t arena_imports;
+   uint64_t dmabuf_imports;
+   uint64_t opaque_exports;
+   uint64_t arena_opaque_exports;
+   uint64_t shmem_blob_exports;
+   uint64_t paged_blob_exports;
+   uint64_t arena_blob_exports;
+   uint64_t dmabuf_blob_exports;
+   uint64_t immediate_fences;
+   uint64_t queued_fences;
+   uint64_t wait_calls;
+   uint64_t wait_timeouts;
+   uint64_t wait_errors;
+   uint64_t wait_ns;
+};
+
+static struct {
+   pthread_once_t once;
+   bool enabled;
+   struct kgsl_diag_stats stats;
+} g_kgsl_diag = {
+   .once = PTHREAD_ONCE_INIT,
+};
+
+static void
+kgsl_diag_log(const char *fmt, ...)
+{
+   va_list va;
+
+   va_start(va, fmt);
+#ifdef __ANDROID__
+   __android_log_vprint(ANDROID_LOG_ERROR, "crosvm", fmt, va);
+#else
+   vfprintf(stderr, fmt, va);
+   fputc('\n', stderr);
+   fflush(stderr);
+#endif
+   va_end(va);
+}
+
+static void
+kgsl_diag_init_once(void)
+{
+   const char *env = getenv("CROSVM_KGSL_DIAG");
+   g_kgsl_diag.enabled = !env || strcmp(env, "0") != 0;
+   if (g_kgsl_diag.enabled)
+      kgsl_diag_log("KGSL_DIAG enabled");
+}
+
+static bool
+kgsl_diag_enabled(void)
+{
+   pthread_once(&g_kgsl_diag.once, kgsl_diag_init_once);
+   return g_kgsl_diag.enabled;
+}
+
 /* WAITTIMESTAMP_CTXTID is slower than the sync_file path on Adreno 830.
  * Keep the optimization enabled for other GPUs, while allowing explicit A/B
  * overrides without changing the default behavior for existing devices. */
@@ -125,6 +192,40 @@ kgsl_use_wait_timestamp(void)
    if (getenv("NCTX_WAITTS"))
       return true;
    return g_gpu_id != 830;
+}
+
+static void
+kgsl_diag_report(const char *where)
+{
+   const struct kgsl_diag_stats *s = &g_kgsl_diag.stats;
+
+   if (!kgsl_diag_enabled())
+      return;
+
+   kgsl_diag_log("KGSL_DIAG where=%s attach=%" PRIu64
+           " arena_import=%" PRIu64 " dmabuf_import=%" PRIu64
+           " opaque_export=%" PRIu64 " arena_opaque_export=%" PRIu64
+           " shmem_blob=%" PRIu64 " paged_blob=%" PRIu64
+           " arena_blob=%" PRIu64 " dmabuf_blob=%" PRIu64
+           " fence_immediate=%" PRIu64 " fence_queued=%" PRIu64
+           " wait=%" PRIu64 " timeout=%" PRIu64 " error=%" PRIu64
+           " wait_ms=%" PRIu64,
+           where,
+           p_atomic_read(&s->attach_calls),
+           p_atomic_read(&s->arena_imports),
+           p_atomic_read(&s->dmabuf_imports),
+           p_atomic_read(&s->opaque_exports),
+           p_atomic_read(&s->arena_opaque_exports),
+           p_atomic_read(&s->shmem_blob_exports),
+           p_atomic_read(&s->paged_blob_exports),
+           p_atomic_read(&s->arena_blob_exports),
+           p_atomic_read(&s->dmabuf_blob_exports),
+           p_atomic_read(&s->immediate_fences),
+           p_atomic_read(&s->queued_fences),
+           p_atomic_read(&s->wait_calls),
+           p_atomic_read(&s->wait_timeouts),
+           p_atomic_read(&s->wait_errors),
+           p_atomic_read(&s->wait_ns) / 1000000);
 }
 
 /* The single VBO shared by every context (see kgsl_renderer_create).  Allocated
@@ -1933,6 +2034,9 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
    if (obj)
       return;
 
+   if (kgsl_diag_enabled())
+      p_atomic_inc(&g_kgsl_diag.stats.attach_calls);
+
    drm_dbg("attach res_id=%u map_ptr=%p map_size=0x%" PRIx64 " map_info=0x%x",
            res->res_id, res->map_ptr, res->map_size, res->map_info);
 
@@ -1972,6 +2076,9 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
          return;
       }
 
+      if (kgsl_diag_enabled())
+         p_atomic_inc(&g_kgsl_diag.stats.arena_imports);
+
       uint32_t flags = res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED
          ? MSM_BO_CACHED : 0;
       struct kgsl_object *nobj = kgsl_object_create(mem_id, -1, flags, size, size);
@@ -2006,6 +2113,9 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
       close(fd);
       return;
    }
+
+   if (kgsl_diag_enabled())
+      p_atomic_inc(&g_kgsl_diag.stats.dmabuf_imports);
 
    off_t size = lseek(fd, 0, SEEK_END);
    if (size < 0) {
@@ -2046,6 +2156,12 @@ kgsl_renderer_export_opaque_handle(struct virgl_context *vctx,
    if (fd < 0) {
       drm_err("dup failed: %s", strerror(errno));
       return VIRGL_RESOURCE_FD_INVALID;
+   }
+
+   if (kgsl_diag_enabled()) {
+      p_atomic_inc(&g_kgsl_diag.stats.opaque_exports);
+      if (obj->arena_backed)
+         p_atomic_inc(&g_kgsl_diag.stats.arena_opaque_exports);
    }
 
    *out_fd = fd;
@@ -2131,6 +2247,8 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
                                       blob_size, blob_flags, blob);
       if (ret)
          return ret;
+      if (kgsl_diag_enabled())
+         p_atomic_inc(&g_kgsl_diag.stats.shmem_blob_exports);
       kctx->shmem = to_msm_shmem(dctx->shmem);
       return 0;
    }
@@ -2174,6 +2292,8 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
       blob->map_info = VIRGL_RENDERER_MAP_CACHE_WC;
       obj->exported = true;
       obj->exportable = false;
+      if (kgsl_diag_enabled())
+         p_atomic_inc(&g_kgsl_diag.stats.paged_blob_exports);
       return 0;
    }
 
@@ -2191,6 +2311,8 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
          : VIRGL_RENDERER_MAP_CACHE_WC;
       obj->exported = true;
       obj->exportable = !!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE);
+      if (kgsl_diag_enabled())
+         p_atomic_inc(&g_kgsl_diag.stats.arena_blob_exports);
       return 0;
    }
 
@@ -2213,6 +2335,8 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
 
    obj->exported = true;
    obj->exportable = !!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE);
+   if (kgsl_diag_enabled())
+      p_atomic_inc(&g_kgsl_diag.stats.dmabuf_blob_exports);
 
    return 0;
 }
@@ -2226,15 +2350,40 @@ static int
 kgsl_timeline_wait_timestamp(void *arg, uint32_t ctx_id, uint32_t timestamp)
 {
    int fd = (int)(intptr_t)arg;
+   bool diag = kgsl_diag_enabled();
+   struct timespec start = { 0 };
+   struct timespec end = { 0 };
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = ctx_id,
       .timestamp = timestamp,
       .timeout = 3000, /* ms */
    };
 
-   if (kgsl_ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait) == 0)
+   if (diag) {
+      p_atomic_inc(&g_kgsl_diag.stats.wait_calls);
+      clock_gettime(CLOCK_MONOTONIC, &start);
+   }
+
+   int ret = kgsl_ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+   int saved_errno = errno;
+
+   if (diag) {
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      uint64_t start_ns = (uint64_t)start.tv_sec * NSEC_PER_SEC + start.tv_nsec;
+      uint64_t end_ns = (uint64_t)end.tv_sec * NSEC_PER_SEC + end.tv_nsec;
+      if (end_ns >= start_ns)
+         p_atomic_add(&g_kgsl_diag.stats.wait_ns, end_ns - start_ns);
+      if (ret == -1) {
+         if (saved_errno == ETIMEDOUT)
+            p_atomic_inc(&g_kgsl_diag.stats.wait_timeouts);
+         else
+            p_atomic_inc(&g_kgsl_diag.stats.wait_errors);
+      }
+   }
+
+   if (ret == 0)
       return 0; /* retired */
-   return errno == ETIMEDOUT ? ETIMEDOUT : (errno ? errno : -1);
+   return saved_errno == ETIMEDOUT ? ETIMEDOUT : (saved_errno ? saved_errno : -1);
 }
 
 static int
@@ -2253,11 +2402,16 @@ kgsl_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags,
     * called.  Likewise if the queue produced no out-fence, signal immediately.
     */
    if (ring_idx == 0 || !drm_timeline_has_pending(&kctx->timelines[ring_idx - 1])) {
+      if (kgsl_diag_enabled())
+         p_atomic_inc(&g_kgsl_diag.stats.immediate_fences);
       vctx->fence_retire(vctx, ring_idx, fence_id);
       return 0;
    }
 
-   return drm_timeline_submit_fence(&kctx->timelines[ring_idx - 1], flags, fence_id);
+   int ret = drm_timeline_submit_fence(&kctx->timelines[ring_idx - 1], flags, fence_id);
+   if (ret == 0 && kgsl_diag_enabled())
+      p_atomic_inc(&g_kgsl_diag.stats.queued_fences);
+   return ret;
 }
 
 static void
@@ -2272,6 +2426,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 {
    struct drm_context *dctx = to_drm_context(vctx);
    struct kgsl_context *kctx = to_kgsl_context(dctx);
+
+   kgsl_diag_report("context-destroy");
 
    for (unsigned i = 0; i < g_nr_timelines; i++)
       drm_timeline_fini(&kctx->timelines[i]);
@@ -2351,6 +2507,9 @@ kgsl_alloc_vbo(int fd, uint32_t *out_id, uint64_t *out_base, uint64_t *out_size)
 struct virgl_context *
 kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
 {
+   if (kgsl_diag_enabled())
+      kgsl_diag_log("KGSL_DIAG context-create pid=%d", getpid());
+
    drm_log("");
 
    struct kgsl_context *kctx =
@@ -2359,6 +2518,10 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
       return NULL;
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+   if (kgsl_diag_enabled())
+      kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u mode=%s",
+                    g_gpu_id,
+                    kctx->use_wait_timestamp ? "timestamp-wait" : "legacy-sync-file");
 
    /* Sentinel: no VA slice claimed yet.  fail_early / destroy only return a
     * slice when this is >= 0, so a failure before the claim below (or a double
@@ -2443,6 +2606,9 @@ fail_early:
 int
 kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
 {
+   if (kgsl_diag_enabled())
+      kgsl_diag_log("KGSL_DIAG probe pid=%d", getpid());
+
    drm_log("");
 
    struct kgsl_devinfo devinfo = { 0 };

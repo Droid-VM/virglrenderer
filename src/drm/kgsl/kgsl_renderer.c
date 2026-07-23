@@ -120,6 +120,11 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
+/* KGSL reports Adreno 830 as the canonical FD chip id below.  The fuse byte
+ * is stripped during probe, so this also covers revisions such as 0x44050001.
+ */
+#define KGSL_A830_CHIP_ID UINT64_C(0x44050000)
+
 /* Aggregate tracing for the host-side arena and fence paths.  It is enabled by
  * default; set CROSVM_KGSL_DIAG=0 to disable it.  Counters are process-wide
  * because the arena is shared by all KGSL contexts in the renderer process. */
@@ -191,7 +196,7 @@ kgsl_use_wait_timestamp(void)
       return false;
    if (getenv("NCTX_WAITTS"))
       return true;
-   return g_gpu_id != 830;
+   return g_chip_id != KGSL_A830_CHIP_ID;
 }
 
 static void
@@ -2519,8 +2524,10 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
    if (kgsl_diag_enabled())
-      kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u mode=%s",
+      kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
+                    " mode=%s",
                     g_gpu_id,
+                    g_chip_id,
                     kctx->use_wait_timestamp ? "timestamp-wait" : "legacy-sync-file");
 
    /* Sentinel: no VA slice claimed yet.  fail_early / destroy only return a
@@ -2624,9 +2631,14 @@ kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
     * canonical entry; otherwise the guest enumerates zero devices.
     */
    g_chip_id = devinfo.chip_id & ~UINT64_C(0xff);
-   g_gpu_id = ((devinfo.chip_id >> 24) & 0xff) * 100 +
-              ((devinfo.chip_id >> 16) & 0xff) * 10 +
-              ((devinfo.chip_id >>  8) & 0xff);
+   /* Some vendor KGSL builds leave devinfo.gpu_id at zero.  Keep the
+    * chip-id-derived value exposed through the guest capset for compatibility;
+    * the A830 fence policy below matches the canonical chip id directly. */
+   g_gpu_id = devinfo.gpu_id;
+   if (!g_gpu_id)
+      g_gpu_id = ((devinfo.chip_id >> 24) & 0xff) * 100 +
+                 ((devinfo.chip_id >> 16) & 0xff) * 10 +
+                 ((devinfo.chip_id >>  8) & 0xff);
    drm_log("KGSL chip_id=0x%" PRIx64 " -> reported 0x%" PRIx64 " gpu_id=%u",
            (uint64_t)devinfo.chip_id, g_chip_id, g_gpu_id);
    g_gmem_size = devinfo.gmem_sizebytes;

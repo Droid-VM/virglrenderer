@@ -2311,6 +2311,7 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
       blob->type = VIRGL_RESOURCE_FD_SHM;
       blob->u.fd = fd;
       blob->map_ptr = g_blob_arena.host_va + obj->arena_offset;
+      blob->fd_offset = obj->arena_offset;
       blob->map_info = (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT))
          ? VIRGL_RENDERER_MAP_CACHE_CACHED
          : VIRGL_RENDERER_MAP_CACHE_WC;
@@ -2332,6 +2333,7 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
 
    blob->type = obj->is_shm ? VIRGL_RESOURCE_FD_SHM : VIRGL_RESOURCE_FD_DMABUF;
    blob->u.fd = fd;
+   blob->fd_offset = 0;
 
    if (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT))
       blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;

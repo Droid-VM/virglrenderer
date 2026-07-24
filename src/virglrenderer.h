@@ -384,6 +384,11 @@ VIRGL_EXPORT int virgl_renderer_resource_get_map_info(uint32_t res_handle, uint3
 VIRGL_EXPORT int
 virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd);
 
+/* Export a display-only dma-buf view. Arena-backed SHM resources remain SHM
+ * through the regular export_blob API used for guest mappings. */
+VIRGL_EXPORT int
+virgl_renderer_resource_export_display_blob(uint32_t res_id, uint32_t *fd_type, int *fd);
+
 /*
  * These are unstable APIs for development only. Use these for development/testing purposes
  * only, not in production

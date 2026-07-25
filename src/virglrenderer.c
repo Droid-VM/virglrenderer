@@ -1300,9 +1300,6 @@ virgl_renderer_resource_export_display_blob(uint32_t res_id, uint32_t *fd_type, 
    int source_fd = -1;
    enum virgl_resource_fd_type source_type = virgl_resource_export_fd(res, &source_fd);
    if (source_type == VIRGL_RESOURCE_FD_DMABUF) {
-      virgl_info("CROSVM_DISPLAY_EXPORT res=%u direct_dmabuf fd_offset=0x%" PRIx64
-                 " map_size=0x%" PRIx64 "\n",
-                 res_id, res->fd_offset, res->map_size);
       *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF;
       *fd = source_fd;
       return 0;
@@ -1337,9 +1334,6 @@ virgl_renderer_resource_export_display_blob(uint32_t res_id, uint32_t *fd_type, 
    if (display_fd < 0)
       return saved_errno;
 
-   virgl_info("CROSVM_DISPLAY_EXPORT res=%u udmabuf_fd=%d source_offset=0x%" PRIx64
-              " size=0x%" PRIx64 " output_offset=0\n",
-              res_id, display_fd, res->fd_offset, res->map_size);
    *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF;
    *fd = display_fd;
    return 0;

@@ -369,6 +369,10 @@ VIRGL_EXPORT int virgl_renderer_resource_map(uint32_t res_handle, void **map, ui
 
 VIRGL_EXPORT int virgl_renderer_resource_unmap(uint32_t res_handle);
 
+/* Query a resource's host mapping without taking it; -EINVAL when it has none. */
+VIRGL_EXPORT int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, void **out_map,
+                                                    uint64_t *out_size);
+
 #define VIRGL_RENDERER_MAP_CACHE_MASK      0x0f
 #define VIRGL_RENDERER_MAP_CACHE_NONE      0x00
 #define VIRGL_RENDERER_MAP_CACHE_CACHED    0x01

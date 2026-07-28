@@ -323,8 +323,13 @@ virgl_resource_transfer_blob(struct virgl_resource *res,
       return EINVAL;
 
    if (!map) {
+      /* Map at fd_offset, not 0. A resource's fd is not necessarily a dedicated object: the
+       * KGSL arena hands out dups of one big memfd (a crosvm KgslPool is a slice of the guest
+       * RAM memfd) and expresses the resource's position with fd_offset. Mapping from 0 reads
+       * whatever happens to live at the start of that fd, and SIGBUSes outright once
+       * fd_offset + map_size passes the end of it. */
       map = mmap(NULL, res->map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                 res->fd, 0);
+                 res->fd, res->fd_offset);
       if (map == MAP_FAILED)
          return EINVAL;
       tmp_map = true;
@@ -1211,6 +1216,25 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
    *out_map = map;
    *out_size = map_size;
    return ret;
+}
+
+/* Read a resource's host mapping WITHOUT taking it.
+ *
+ * virgl_renderer_resource_map() is not a query: it refuses a resource that is already mapped,
+ * it records res->mapped, and for a dmabuf without a map_ptr it mmaps -- so its partner unmap
+ * munmaps. Using that pair to ask "where does this resource live" mutates renderer state and,
+ * on a resource the renderer is still using, pulls the mapping out from under it (SIGBUS in
+ * vrend_write_to_iovec). Resources that carry a map_ptr -- the KGSL arena BOs -- can answer the
+ * question for free, so answer only those and leave everything else to say "I do not know".
+ */
+int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, void **out_map, uint64_t *out_size)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->map_ptr)
+      return -EINVAL;
+   *out_map = res->map_ptr;
+   *out_size = res->map_size;
+   return 0;
 }
 
 int virgl_renderer_resource_unmap(uint32_t res_handle)

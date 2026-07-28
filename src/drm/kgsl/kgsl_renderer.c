@@ -253,6 +253,10 @@ static struct {
    bool initialized;
    bool enabled;
    int fd;
+   /* Byte offset of the arena inside `fd`.  crosvm's KgslPool is a slice of the
+    * one guest_mem memfd, not an fd of its own, so every udmabuf window over the
+    * arena has to be biased by this.  Zero for a whole-fd arena. */
+   uint64_t fd_offset;
    uint8_t *host_va;
    uint64_t size;
    struct kgsl_arena_extent *free_list;
@@ -523,21 +527,46 @@ kgsl_blob_arena_init(void)
       return false;
    }
 
+   /* Optional: absent means the arena owns the whole fd. */
+   uint64_t fd_offset = 0;
+   kgsl_parse_u64_env("CROSVM_KGSL_ARENA_FD_OFFSET", &fd_offset);
+   if (fd_offset & (getpagesize() - 1)) {
+      drm_err("arena fd_offset 0x%" PRIx64 " is not page aligned", fd_offset);
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return false;
+   }
+
+   /* Never hand out the first 2 MiB.  The Gunyah RM rejects a memparcel whose
+    * base is the base of the SHARE window it lives in, so a BO landing at arena
+    * offset 0 fails to share -- the same defect the gfxstream HostVisiblePool
+    * reserves kBaseGuardBytes for, and the same one the virtio-gpu BAR guard
+    * exists for. Two MiB is cheap next to a pool measured in GiB. */
+   const uint64_t base_guard = 2ull << 20;
+   if (size <= base_guard) {
+      drm_err("arena size 0x%" PRIx64 " is not larger than the base guard", size);
+      pthread_mutex_unlock(&g_blob_arena.lock);
+      return false;
+   }
+
    struct kgsl_arena_extent *extent = calloc(1, sizeof(*extent));
    if (!extent) {
       pthread_mutex_unlock(&g_blob_arena.lock);
       return false;
    }
-   extent->size = size;
+   extent->offset = base_guard;
+   extent->size = size - base_guard;
    g_blob_arena.fd = (int)fd_value;
+   g_blob_arena.fd_offset = fd_offset;
    g_blob_arena.host_va = (uint8_t *)(uintptr_t)host_va;
    g_blob_arena.size = size;
    g_blob_arena.free_list = extent;
    g_blob_arena.enabled = true;
    pthread_mutex_unlock(&g_blob_arena.lock);
 
-   drm_log("pre-shared blob arena: fd=%d host_va=%p size=0x%" PRIx64,
-           g_blob_arena.fd, g_blob_arena.host_va, g_blob_arena.size);
+   drm_log("pre-shared blob arena: fd=%d fd_offset=0x%" PRIx64 " host_va=%p "
+           "size=0x%" PRIx64 " (first 0x%" PRIx64 " reserved)",
+           g_blob_arena.fd, g_blob_arena.fd_offset, g_blob_arena.host_va,
+           g_blob_arena.size, base_guard);
    return true;
 }
 
@@ -817,6 +846,35 @@ kgsl_alloc_thp_bo(int fd, uint64_t size, uint32_t kgsl_flags, int *out_dmabuf)
    return mem_id;
 }
 
+/* A udmabuf covering exactly [offset, offset+size) of the arena.  Every arena
+ * consumer goes through this so the fd_offset bias is applied in one place: on a
+ * crosvm KgslPool the arena is a slice of the guest_mem memfd, so a window built
+ * at the raw arena offset would land somewhere in guest RAM. */
+static int
+kgsl_arena_window(uint64_t offset, uint64_t size)
+{
+   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   if (udev < 0) {
+      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
+      return -1;
+   }
+   struct udmabuf_create uc = {
+      .memfd = g_blob_arena.fd,
+      .flags = UDMABUF_FLAGS_CLOEXEC,
+      .offset = g_blob_arena.fd_offset + offset,
+      .size = size,
+   };
+   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
+   close(udev);
+   if (udmabuf < 0) {
+      drm_err("UDMABUF_CREATE(arena off=0x%" PRIx64 " fd_off=0x%" PRIx64
+              " size=0x%" PRIx64 ") failed: %s",
+              offset, g_blob_arena.fd_offset, size, strerror(errno));
+      return -1;
+   }
+   return udmabuf;
+}
+
 static uint32_t
 kgsl_alloc_arena_bo(int fd, uint64_t size, uint32_t kgsl_flags,
                     uint64_t *out_offset)
@@ -831,23 +889,8 @@ kgsl_alloc_arena_bo(int fd, uint64_t size, uint32_t kgsl_flags,
    memset(host_ptr, 0, size);
    kgsl_cache_clean_inv(host_ptr, size);
 
-   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
-   if (udev < 0) {
-      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
-      kgsl_blob_arena_free(offset, size);
-      return 0;
-   }
-   struct udmabuf_create uc = {
-      .memfd = g_blob_arena.fd,
-      .flags = UDMABUF_FLAGS_CLOEXEC,
-      .offset = offset,
-      .size = size,
-   };
-   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
-   close(udev);
+   int udmabuf = kgsl_arena_window(offset, size);
    if (udmabuf < 0) {
-      drm_err("UDMABUF_CREATE(arena off=0x%" PRIx64 ") failed: %s",
-              offset, strerror(errno));
       kgsl_blob_arena_free(offset, size);
       return 0;
    }
@@ -885,24 +928,9 @@ static uint32_t
 kgsl_import_arena_region(int fd, uint64_t offset, uint64_t size,
                          uint32_t kgsl_flags)
 {
-   int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
-   if (udev < 0) {
-      drm_err("open /dev/udmabuf failed: %s", strerror(errno));
+   int udmabuf = kgsl_arena_window(offset, size);
+   if (udmabuf < 0)
       return 0;
-   }
-   struct udmabuf_create uc = {
-      .memfd = g_blob_arena.fd,
-      .flags = UDMABUF_FLAGS_CLOEXEC,
-      .offset = offset,
-      .size = size,
-   };
-   int udmabuf = ioctl(udev, UDMABUF_CREATE, &uc);
-   close(udev);
-   if (udmabuf < 0) {
-      drm_err("UDMABUF_CREATE(arena import off=0x%" PRIx64 ") failed: %s",
-              offset, strerror(errno));
-      return 0;
-   }
 
    uint32_t mem_id = kgsl_import_dmabuf(fd, udmabuf, kgsl_flags);
    close(udmabuf);
@@ -2157,10 +2185,21 @@ kgsl_renderer_export_opaque_handle(struct virgl_context *vctx,
    if (!obj->exportable)
       return VIRGL_RESOURCE_FD_INVALID;
 
-   int fd = os_dupfd_cloexec(obj->arena_backed ? g_blob_arena.fd : obj->dmabuf_fd);
-   if (fd < 0) {
-      drm_err("dup failed: %s", strerror(errno));
-      return VIRGL_RESOURCE_FD_INVALID;
+   /* An arena-backed BO must NOT export the arena fd itself.  On a crosvm
+    * KgslPool that fd is the whole guest_mem memfd, so handing it out would give
+    * the importer every page of guest RAM rather than this BO.  Build a udmabuf
+    * bounded to the BO instead; byte zero of it is byte zero of the resource. */
+   int fd;
+   if (obj->arena_backed) {
+      fd = kgsl_arena_window(obj->arena_offset, obj->blob_size);
+      if (fd < 0)
+         return VIRGL_RESOURCE_FD_INVALID;
+   } else {
+      fd = os_dupfd_cloexec(obj->dmabuf_fd);
+      if (fd < 0) {
+         drm_err("dup failed: %s", strerror(errno));
+         return VIRGL_RESOURCE_FD_INVALID;
+      }
    }
 
    if (kgsl_diag_enabled()) {
@@ -2170,14 +2209,14 @@ kgsl_renderer_export_opaque_handle(struct virgl_context *vctx,
    }
 
    *out_fd = fd;
-   return obj->arena_backed ? VIRGL_RESOURCE_FD_SHM : VIRGL_RESOURCE_FD_DMABUF;
+   return VIRGL_RESOURCE_FD_DMABUF;
 }
 
 /* Arena-mode variant of drm_context_get_shmem_blob(): the generic helper backs
  * the shmem control buffer with its own memfd, whose host mapping lies outside
- * the pre-shared arena — crosvm's arena mode (sentinel offsets only) rejects
- * such blobs.  Sub-allocate from the arena instead and hand back map_ptr so
- * the resource maps inside it.  Host and guest both map this range cacheable,
+ * the pre-shared arena, so it would take the runtime-SHARE path while every
+ * other BO of the context is already in the guest's stage-2.  Sub-allocate from
+ * the arena instead and hand back map_ptr so the resource maps inside it.  Host and guest both map this range cacheable,
  * so no explicit maintenance is needed (unlike the WC-mapped BOs). */
 static int
 kgsl_get_arena_shmem_blob(struct kgsl_context *kctx, uint64_t blob_size,
@@ -2311,7 +2350,11 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
       blob->type = VIRGL_RESOURCE_FD_SHM;
       blob->u.fd = fd;
       blob->map_ptr = g_blob_arena.host_va + obj->arena_offset;
-      blob->fd_offset = obj->arena_offset;
+      /* Bias by where the arena starts inside the fd: on a crosvm KgslPool the
+       * arena is a slice of the guest_mem memfd, so the raw arena offset would
+       * point somewhere in guest RAM. The (offset, size) pair is what bounds
+       * what the importer can reach, not the fd. */
+      blob->fd_offset = g_blob_arena.fd_offset + obj->arena_offset;
       blob->map_info = (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT))
          ? VIRGL_RENDERER_MAP_CACHE_CACHED
          : VIRGL_RENDERER_MAP_CACHE_WC;

@@ -1331,179 +1331,40 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       goto out_error;
    }
 
-   /* Arena v2 (see ARENA_V2_PLAN.md and msm_proto.h):
-    *  - iova == 0                  -> arena blessing (allocate the page pool)
-    *  - trailing run list present  -> paged arena BO (stitch runs, bookkeeping)
-    *  - otherwise                  -> full legacy per-BO path
-    */
-   const bool is_arena = req->iova == 0;
-
-   uint32_t nr_runs = 0;
-   const struct msm_gem_new_run *runs = NULL;
-   if (hdr->len > sizeof(*req)) {
-      if (hdr->len < sizeof(*req) + 2 * sizeof(uint32_t)) {
-         drm_err("malformed gem_new run list");
-         ret = -EINVAL;
-         goto out_error;
-      }
-      const uint32_t *tail = (const uint32_t *)((const uint8_t *)req + sizeof(*req));
-      nr_runs = tail[0];
-      runs = (const struct msm_gem_new_run *)(tail + 2);
-      if (hdr->len <
-          sizeof(*req) + 2 * sizeof(uint32_t) + (uint64_t)nr_runs * sizeof(*runs)) {
-         drm_err("gem_new run list overflows ccmd (nr_runs=%u)", nr_runs);
-         ret = -EINVAL;
-         goto out_error;
-      }
-   }
-
-   /* Paged arena BO: validate the runs, stitch them to the contiguous guest
-    * iova with one multi-entry BIND_RANGES against the arena child, and keep
-    * only bookkeeping.  No memfd, no import, no GuestAccept share.
-    */
-   if (nr_runs && !is_arena) {
-      if (!kctx->arena) {
-         drm_err("run-list gem_new before arena blessing");
-         ret = -EINVAL;
-         goto out_error;
-      }
-      uint64_t total = 0;
-      for (uint32_t i = 0; i < nr_runs; i++) {
-         if (!runs[i].len || (runs[i].arena_off | runs[i].len) & (getpagesize() - 1) ||
-             runs[i].arena_off + runs[i].len > kctx->arena->blob_size) {
-            drm_err("bad arena run %u: off=0x%" PRIx64 " len=0x%" PRIx64,
-                    i, runs[i].arena_off, runs[i].len);
-            ret = -EINVAL;
-            goto out_error;
-         }
-         total += runs[i].len;
-      }
-      if (total < blob_size) {
-         drm_err("runs cover 0x%" PRIx64 " < blob 0x%" PRIx64, total, blob_size);
-         ret = -EINVAL;
-         goto out_error;
-      }
-
-      struct kgsl_object *obj =
-         kgsl_object_create(0 /* no own kgsl object */, -1, req->flags,
-                            req->size, blob_size);
-      if (!obj) {
-         ret = -ENOMEM;
-         goto out_error;
-      }
-      obj->runs = malloc(nr_runs * sizeof(*obj->runs));
-      if (!obj->runs) {
-         free(obj);
-         ret = -ENOMEM;
-         goto out_error;
-      }
-      memcpy(obj->runs, runs, nr_runs * sizeof(*obj->runs));
-      obj->nr_runs = nr_runs;
-      obj->is_shm = true;
-
-      ret = kgsl_vbo_bind_runs(kctx, obj, req->iova);
-      if (ret) {
-         free(obj->runs);
-         free(obj);
-         goto out_error;
-      }
-      obj->iova = req->iova;
-      drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
-      return 0;
-   }
-
-   /* Map msm cache flags to KGSL import flags.
-    *
-    * Every BO is imported IO-coherent regardless of the guest's cache mode:
-    * the guest CPU writes BOs through its own stage-1 mapping (often cached)
-    * and nobody on this path issues KGSL cache-maintenance ops (real turnip's
-    * tu_knl_kgsl does its own GPUOBJ_SYNC; the vdrm guest cannot).  A
-    * non-snooping GPU read then sees stale DRAM — deterministic smashed
-    * geometry on the desktop.  Adreno 830 supports full IO coherency, so let
-    * the GPU snoop the (shared) CPU caches instead.
-    */
-   uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT;
-   if (req->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED))
-      kgsl_flags |= KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT;
-   else
-      kgsl_flags |= KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT;
-
    /*
-    * GUEST-ALLOC: the guest allocated the pages from its own pool and the VMM will hand us a
-    * dma-buf over them when the blob is created.  There is nothing to allocate here, and
-    * nothing to bind yet either -- kgsl_vbo_bind() needs a mem_id, which only exists once the
-    * dma-buf has been imported.  Record what the guest chose and finish in get_blob().
+    * Every BO is guest-allocated. The guest owns the pages -- it took them from its own
+    * drm_buddy pool before sending this -- so there is nothing to allocate here and nothing to
+    * bind yet either: kgsl_vbo_bind() needs a mem_id, which does not exist until the pages
+    * arrive as the dma-buf the VMM builds for the matching RESOURCE_CREATE_BLOB. Record what
+    * the guest chose; get_blob() finishes the object.
+    *
+    * A request without MSM_BO_GUEST_ALLOC comes from a guest mesa predating guest-alloc, and
+    * there is no longer a host allocator to serve it. Say exactly that: the alternative is an
+    * object with no backing, which surfaces much later as a GPU fault at an address nothing
+    * ever mapped.
     */
-   if (req->flags & MSM_BO_GUEST_ALLOC) {
-      if (is_arena) {
-         drm_err("guest-alloc BO cannot also bless an arena");
-         ret = -EINVAL;
-         goto out_error;
-      }
-      struct kgsl_object *gobj =
-         kgsl_object_create(0 /* no mem_id until import */, -1,
-                            req->flags & ~MSM_BO_GUEST_ALLOC, req->size, blob_size);
-      if (!gobj) {
-         ret = -ENOMEM;
-         goto out_error;
-      }
-      gobj->guest_alloc = true;
-      gobj->iova = req->iova;   /* bound in get_blob(), once there is something to bind */
-      drm_context_object_set_blob_id(dctx, &gobj->base, req->blob_id);
-      drm_dbg("guest-alloc obj=%p blob_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64,
-              (void *)gobj, req->blob_id, req->iova, blob_size);
-      return 0;
-   }
-
-   /* Prefer the boot-time pre-shared memfd. When configured, exhaustion is a hard failure: mixing
-    * arena and per-blob backing would require a second guest allocation protocol. */
-   int dmabuf_fd = -1;  /* actually the memfd backing the SHM blob */
-   uint64_t arena_offset = 0;
-   bool arena_enabled = kgsl_blob_arena_init();
-   uint32_t mem_id = arena_enabled
-      ? kgsl_alloc_arena_bo(dctx->fd, blob_size, kgsl_flags, &arena_offset)
-      : kgsl_alloc_thp_bo(dctx->fd, blob_size, kgsl_flags, &dmabuf_fd);
-   if (!mem_id) {
-      ret = -ENOMEM;
+   if (!(req->flags & MSM_BO_GUEST_ALLOC)) {
+      drm_err("gem_new blob_id=%u without MSM_BO_GUEST_ALLOC: this host allocates no BO "
+              "backing. The guest mesa is older than the guest-alloc protocol, or the VMM "
+              "did not offer VIRTIO_GPU_F_CREATE_GUEST_HANDLE (needs --gpu udmabuf=true and "
+              "--pre-alloc drm-guest-mb).", req->blob_id);
+      ret = -ENOTSUP;
       goto out_error;
    }
 
    struct kgsl_object *obj =
-      kgsl_object_create(mem_id, dmabuf_fd, req->flags, req->size, blob_size);
+      kgsl_object_create(0 /* no mem_id until import */, -1,
+                         req->flags & ~MSM_BO_GUEST_ALLOC, req->size, blob_size);
    if (!obj) {
-      kgsl_free_gpuobj(dctx->fd, mem_id);
-      if (arena_enabled)
-         kgsl_blob_arena_free(arena_offset, blob_size);
-      else
-         close(dmabuf_fd);
       ret = -ENOMEM;
       goto out_error;
    }
-   obj->is_shm = true;  /* backing fd is a memfd, shared to the guest as SHM */
-   obj->arena_backed = arena_enabled;
-   obj->arena_offset = arena_offset;
-
-   /* The arena is a pure page pool: it has no GPU VA of its own; its pages
-    * reach the GPU through per-BO run stitching. */
-   if (!is_arena) {
-      ret = kgsl_vbo_bind(kctx, obj, req->iova);
-      if (ret) {
-         kgsl_renderer_free_object(dctx, &obj->base);
-         goto out_error;
-      }
-   }
-
+   obj->guest_alloc = true;
+   obj->iova = req->iova;   /* bound in get_blob(), once there is something to bind */
    drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
 
-   if (is_arena) {
-      kctx->arena = obj;
-      drm_log("ARENA blessed: pool=0x%" PRIx64 " bytes mem_id=%u", blob_size,
-              mem_id);
-   }
-
-   drm_dbg("obj=%p blob_id=%u mem_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64,
-           (void *)obj, req->blob_id, mem_id, req->iova, blob_size);
-
+   drm_dbg("guest-alloc obj=%p blob_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64,
+           (void *)obj, req->blob_id, req->iova, blob_size);
    return 0;
 
 out_error:

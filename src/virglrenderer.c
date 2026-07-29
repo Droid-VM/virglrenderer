@@ -1237,6 +1237,26 @@ int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, void **out_map, uin
    return 0;
 }
 
+/* Hand a context a dma-buf the GUEST allocated, for the blob it is about to be asked to
+ * produce.  Takes ownership of fd on success; on failure the caller still owns it.
+ *
+ * Guest-allocated blob memory has an ordering problem no existing entry point solves: only the
+ * VMM can turn the blob's guest iovecs into a dma-buf, and the context needs that dma-buf inside
+ * get_blob(), whose signature carries no room for it. So the VMM parks it here first.
+ */
+int virgl_renderer_resource_set_guest_blob_fd(uint32_t ctx_id, uint64_t blob_id, int fd)
+{
+   TRACE_FUNC();
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+
+   if (!ctx)
+      return -EINVAL;
+   if (!ctx->set_guest_blob_fd)
+      return -ENOTSUP;
+
+   return ctx->set_guest_blob_fd(ctx, blob_id, fd);
+}
+
 int virgl_renderer_resource_unmap(uint32_t res_handle)
 {
    TRACE_FUNC();

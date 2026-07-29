@@ -318,6 +318,11 @@ struct kgsl_object {
    bool exportable : 1;
    bool is_shm     : 1; /* backing is a memfd (SHM blob) vs an imported dmabuf */
    bool arena_backed : 1;
+   /* GUEST-ALLOC: the guest owns the pages.  GEM_NEW only records iova/size/flags; the object
+    * has no mem_id and no backing until get_blob() receives the VMM's dma-buf over those same
+    * guest pages.  This inverts the host-allocating path, where the object is complete before
+    * the blob exists -- so anything reading mem_id between the two has to tolerate 0. */
+   bool guest_alloc : 1;
    uint64_t arena_offset;
    /* Paged arena BO (mem_id == 0): scattered arena backing, stitched to the
     * contiguous iova via multi-entry BIND_RANGES; map is a MAP_FIXED stitch of
@@ -360,6 +365,13 @@ struct kgsl_context {
     * detached before drm_context_deinit() (see kgsl_renderer_destroy). */
    bool shmem_arena_backed;
    uint64_t shmem_arena_offset;
+
+   /* GUEST-ALLOC: the dma-buf the VMM built over the guest's pages for the blob it is about to
+    * create, parked here between virgl_renderer_resource_set_guest_blob_fd() and the get_blob()
+    * that consumes it.  One slot is enough because those two calls are consecutive on the same
+    * (single) command thread; a second set before the first is consumed is a bug, not a queue,
+    * and is reported rather than silently dropping an fd. */
+   int pending_guest_fd;
 
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
@@ -1416,6 +1428,33 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    else
       kgsl_flags |= KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT;
 
+   /*
+    * GUEST-ALLOC: the guest allocated the pages from its own pool and the VMM will hand us a
+    * dma-buf over them when the blob is created.  There is nothing to allocate here, and
+    * nothing to bind yet either -- kgsl_vbo_bind() needs a mem_id, which only exists once the
+    * dma-buf has been imported.  Record what the guest chose and finish in get_blob().
+    */
+   if (req->flags & MSM_BO_GUEST_ALLOC) {
+      if (is_arena) {
+         drm_err("guest-alloc BO cannot also bless an arena");
+         ret = -EINVAL;
+         goto out_error;
+      }
+      struct kgsl_object *gobj =
+         kgsl_object_create(0 /* no mem_id until import */, -1,
+                            req->flags & ~MSM_BO_GUEST_ALLOC, req->size, blob_size);
+      if (!gobj) {
+         ret = -ENOMEM;
+         goto out_error;
+      }
+      gobj->guest_alloc = true;
+      gobj->iova = req->iova;   /* bound in get_blob(), once there is something to bind */
+      drm_context_object_set_blob_id(dctx, &gobj->base, req->blob_id);
+      drm_dbg("guest-alloc obj=%p blob_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64,
+              (void *)gobj, req->blob_id, req->iova, blob_size);
+      return 0;
+   }
+
    /* Prefer the boot-time pre-shared memfd. When configured, exhaustion is a hard failure: mixing
     * arena and per-blob backing would require a second guest allocation protocol. */
    int dmabuf_fd = -1;  /* actually the memfd backing the SHM blob */
@@ -2270,6 +2309,23 @@ kgsl_get_arena_shmem_blob(struct kgsl_context *kctx, uint64_t blob_size,
    return 0;
 }
 
+/* Park the VMM's dma-buf for the guest-allocated blob whose get_blob() comes next. */
+static int
+kgsl_renderer_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, int fd)
+{
+   struct kgsl_context *kctx = to_kgsl_context(to_drm_context(vctx));
+
+   if (kctx->pending_guest_fd >= 0) {
+      /* Two sets without an intervening get_blob means the pairing assumption is wrong, and
+       * dropping the older fd would leak it silently. */
+      drm_err("guest blob fd already pending (blob_id=%" PRIu64 "); dropping the stale one",
+              blob_id);
+      close(kctx->pending_guest_fd);
+   }
+   kctx->pending_guest_fd = fd;
+   return 0;
+}
+
 static int
 kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
                        uint64_t blob_size, uint32_t blob_flags,
@@ -2316,6 +2372,47 @@ kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blo
    if (obj->blob_size != blob_size) {
       drm_err("Invalid blob size 0x%" PRIx64 " != 0x%" PRIx64, obj->blob_size, blob_size);
       return -EINVAL;
+   }
+
+   /*
+    * GUEST-ALLOC completion.  GEM_NEW left this object empty on purpose; the pages are the
+    * guest's, and they reach us as the dma-buf the VMM built from the blob's iovecs and handed
+    * over with virgl_renderer_resource_set_guest_blob_fd().  Import it, bind it at the iova the
+    * guest already picked, and the object is whole.
+    *
+    * Failing here is worth being loud about: the guest has committed to this iova and cannot
+    * retry with different pages, so a silent -ENOENT would surface much later as a GPU fault.
+    */
+   if (obj->guest_alloc) {
+      if (kctx->pending_guest_fd < 0) {
+         drm_err("guest-alloc blob_id=%" PRIu64 " has no dma-buf from the VMM; "
+                 "is udmabuf enabled and CREATE_GUEST_HANDLE set?", blob_id);
+         return -ENOENT;
+      }
+      int gfd = kctx->pending_guest_fd;
+      kctx->pending_guest_fd = -1;
+
+      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
+         ((obj->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED))
+             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
+             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+
+      uint32_t mem_id = kgsl_import_dmabuf(dctx->fd, gfd, kgsl_flags);
+      if (!mem_id) {
+         close(gfd);
+         return -ENOMEM;
+      }
+      obj->mem_id = mem_id;
+      obj->dmabuf_fd = gfd;   /* handed to the resource below; KGSL keeps its own reference */
+
+      int bret = kgsl_vbo_bind(kctx, obj, obj->iova);
+      if (bret) {
+         drm_err("guest-alloc bind failed blob_id=%" PRIu64 " iova=0x%" PRIx64,
+                 blob_id, obj->iova);
+         return bret;
+      }
+      drm_dbg("guest-alloc completed blob_id=%" PRIu64 " mem_id=%u iova=0x%" PRIx64,
+              blob_id, mem_id, obj->iova);
    }
 
    drm_context_object_set_res_id(dctx, &obj->base, res_id);
@@ -2568,6 +2665,7 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
       return NULL;
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+   kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
                     " mode=%s",
@@ -2629,6 +2727,7 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    kctx->base.base.attach_resource = kgsl_renderer_attach_resource;
    kctx->base.base.export_opaque_handle = kgsl_renderer_export_opaque_handle;
    kctx->base.base.get_blob = kgsl_renderer_get_blob;
+   kctx->base.base.set_guest_blob_fd = kgsl_renderer_set_guest_blob_fd;
    kctx->base.base.submit_fence = kgsl_renderer_submit_fence;
    kctx->base.free_object = kgsl_renderer_free_object;
 

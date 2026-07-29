@@ -152,6 +152,20 @@ struct msm_gem_new_run {
 } DRM_ALIGN_4;
 
 /*
+ * GUEST-ALLOC (DroidVM): the guest already owns this BO's pages.
+ *
+ * Set in msm_ccmd_gem_new_req::flags to say "do not allocate anything -- the pages arrive
+ * separately, as the dma-buf the VMM builds from the blob's guest iovecs".  The host records
+ * the iova and flags when this ccmd runs, and completes the object when the matching
+ * RESOURCE_CREATE_BLOB hands it that dma-buf, which is the reverse of the host-allocating path
+ * where the object exists in full by the time the blob is created.
+ *
+ * The bit is deliberately high: msm's own GEM flags are the low DRM_MSM_BO_* bits and the host
+ * masks this one off before anything sees it as a KGSL flag.
+ */
+#define MSM_BO_GUEST_ALLOC 0x80000000
+
+/*
  * MSM_CCMD_GEM_SET_IOVA
  *
  * Set the buffer iova (for imported BOs).  Also used to release the iova

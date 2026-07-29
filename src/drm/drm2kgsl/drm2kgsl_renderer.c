@@ -89,8 +89,8 @@
 
 #include "drm-uapi/msm_drm.h" /* msm wire structs: drm_msm_param, submit_bo/cmd */
 #include "msm/msm_proto.h"
-#include "kgsl/msm_kgsl.h"
-#include "kgsl/kgsl_renderer.h"
+#include "drm2kgsl/msm_kgsl.h"
+#include "drm2kgsl/drm2kgsl_renderer.h"
 
 /*
  * The VBO reserves the guest's entire GPU VA range.  It is virtual-only
@@ -233,7 +233,7 @@ kgsl_diag_report(const char *where)
            p_atomic_read(&s->wait_ns) / 1000000);
 }
 
-/* The single VBO shared by every context (see kgsl_renderer_create).  Allocated
+/* The single VBO shared by every context (see drm2kgsl_renderer_create).  Allocated
  * once at probe and kept alive for the renderer's lifetime by g_keeper_fd (the
  * probe fd is closed by drm_renderer_init; KGSL memory is freed when the last fd
  * of the process closes, so we hold one open).
@@ -1976,7 +1976,7 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
    /* Cross-context import of an arena-backed BO.  Every BO on this path lives in
     * the single pre-shared arena, so when one context shares a BO to another
     * (e.g. vkcube's presented swapchain buffer imported by the weston-zink
-    * compositor) the exporter (kgsl_renderer_get_blob) hands crosvm a dup of the
+    * compositor) the exporter (drm2kgsl_renderer_get_blob) hands crosvm a dup of the
     * whole arena memfd (VIRGL_RESOURCE_FD_SHM) plus map_ptr = arena base + the
     * BO's offset.  virgl_resource_export_fd() would report SHM and the DMABUF-only
     * path below would silently skip it -> res_id never registered -> the guest's
@@ -2172,7 +2172,7 @@ kgsl_get_arena_shmem_blob(struct kgsl_context *kctx, uint64_t blob_size,
 
 /* Park the VMM's dma-buf for the guest-allocated blob whose get_blob() comes next. */
 static int
-kgsl_renderer_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, int fd)
+drm2kgsl_renderer_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, int fd)
 {
    struct kgsl_context *kctx = to_kgsl_context(to_drm_context(vctx));
 
@@ -2188,7 +2188,7 @@ kgsl_renderer_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, in
 }
 
 static int
-kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
+drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
                        uint64_t blob_size, uint32_t blob_flags,
                        struct virgl_context_blob *blob)
 {
@@ -2513,7 +2513,7 @@ kgsl_alloc_vbo(int fd, uint32_t *out_id, uint64_t *out_base, uint64_t *out_size)
 }
 
 struct virgl_context *
-kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
+drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
 {
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG context-create pid=%d", getpid());
@@ -2587,8 +2587,8 @@ kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_n
    kctx->base.base.destroy = kgsl_renderer_destroy;
    kctx->base.base.attach_resource = kgsl_renderer_attach_resource;
    kctx->base.base.export_opaque_handle = kgsl_renderer_export_opaque_handle;
-   kctx->base.base.get_blob = kgsl_renderer_get_blob;
-   kctx->base.base.set_guest_blob_fd = kgsl_renderer_set_guest_blob_fd;
+   kctx->base.base.get_blob = drm2kgsl_renderer_get_blob;
+   kctx->base.base.set_guest_blob_fd = drm2kgsl_renderer_set_guest_blob_fd;
    kctx->base.base.submit_fence = kgsl_renderer_submit_fence;
    kctx->base.free_object = kgsl_renderer_free_object;
 
@@ -2616,7 +2616,7 @@ fail_early:
  */
 
 int
-kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
+drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
 {
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG probe pid=%d", getpid());

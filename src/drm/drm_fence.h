@@ -34,7 +34,7 @@ struct drm_timeline {
 
    /* Optional blocking-wait hook.  When set, thread_sync waits by
     * (ctx_id, timestamp) via this callback instead of poll()ing a sync_file
-    * fd -- lets a backend (KGSL) skip the extra out-fence ioctl + fd lifecycle.
+    * fd -- lets a backend (drm2kgsl) skip the extra out-fence ioctl + fd lifecycle.
     * Returns 0 when the timestamp has retired, ETIMEDOUT to be re-waited, any
     * other value to retire (GPU fault/recovery). */
    int (*wait_timestamp)(void *arg, uint32_t ctx_id, uint32_t timestamp);

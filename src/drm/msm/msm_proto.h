@@ -131,7 +131,7 @@ struct msm_ccmd_gem_new_req {
 DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_new_req)
 
 /*
- * Arena v2 extension (DroidVM KGSL native-context):
+ * Arena v2 extension (DroidVM drm2kgsl native-context):
  *
  *  - GEM_NEW with iova == 0 "blesses" the arena: the host allocates the
  *    physical page pool (req->size bytes) once; the guest then creates and

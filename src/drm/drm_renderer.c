@@ -19,8 +19,8 @@
 #include "drm_renderer.h"
 #include "drm_util.h"
 
-#ifdef ENABLE_DRM_KGSL
-#  include "kgsl/kgsl_renderer.h"
+#ifdef ENABLE_DRM2KGSL
+#  include "drm2kgsl/drm2kgsl_renderer.h"
 #endif
 
 #ifdef ENABLE_DRM_MSM
@@ -56,15 +56,15 @@ static const struct backend {
    int (*probe)(int fd, struct virgl_renderer_capset_drm *capset);
    struct virgl_context *(*create)(int fd, size_t debug_len, const char *debug_name);
 } backends[] = {
-#ifdef ENABLE_DRM_KGSL
+#ifdef ENABLE_DRM2KGSL
    {
       /* Guest speaks the msm protocol; host bridges it to KGSL. */
       .context_type = VIRTGPU_DRM_CONTEXT_MSM,
-      .name = "kgsl",
+      .name = "drm2kgsl",
       .char_device = true,
       .node = KGSL_DEVICE_NODE,
-      .probe = kgsl_renderer_probe,
-      .create = kgsl_renderer_create,
+      .probe = drm2kgsl_renderer_probe,
+      .create = drm2kgsl_renderer_create,
    },
 #endif
 #ifdef ENABLE_DRM_MSM
@@ -116,7 +116,7 @@ drm_renderer_init(int drm_fd)
       const struct backend *b = &backends[i];
       int fd;
 
-      /* Character-device backends (KGSL) have no DRM version node; open by
+      /* Character-device backends (drm2kgsl) have no DRM version node; open by
        * path and let the backend fill the capset from its own properties.
        */
       if (b->char_device) {

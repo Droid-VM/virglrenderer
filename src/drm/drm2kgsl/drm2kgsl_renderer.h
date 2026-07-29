@@ -30,9 +30,9 @@ struct virgl_context;
  */
 #define KGSL_DEVICE_NODE "/dev/kgsl-3d0"
 
-int kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
+int drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
 
-struct virgl_context *kgsl_renderer_create(int fd, size_t debug_len,
+struct virgl_context *drm2kgsl_renderer_create(int fd, size_t debug_len,
                                            const char *debug_name);
 
 #endif /* KGSL_RENDERER_H_ */

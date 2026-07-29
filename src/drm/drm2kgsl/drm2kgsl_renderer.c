@@ -3,6 +3,10 @@
  * Copyright 2026 DroidVM
  * SPDX-License-Identifier: MIT
  *
+ * Deliberately MIT, not the GPL this project defaults to: this file began as the KGSL
+ * analogue of virglrenderer's msm_renderer.c and carries Google's copyright above, and
+ * MIT is what virglrenderer requires of contributions -- which is what this file is for.
+ *
  * KGSL native-context backend.
  *
  * This is the KGSL analogue of msm_renderer.c.  The guest runs stock

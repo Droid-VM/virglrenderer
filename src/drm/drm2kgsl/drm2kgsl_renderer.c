@@ -130,7 +130,7 @@ static unsigned g_nr_timelines;
 #define KGSL_A830_CHIP_ID UINT64_C(0x44050000)
 
 /* Aggregate tracing for the host-side arena and fence paths.  It is enabled by
- * default; set CROSVM_KGSL_DIAG=0 to disable it.  Counters are process-wide
+ * default; set CROSVM_DRM2KGSL_DIAG=0 to disable it.  Counters are process-wide
  * because the arena is shared by all KGSL contexts in the renderer process. */
 struct kgsl_diag_stats {
    uint64_t attach_calls;
@@ -177,7 +177,7 @@ kgsl_diag_log(const char *fmt, ...)
 static void
 kgsl_diag_init_once(void)
 {
-   const char *env = getenv("CROSVM_KGSL_DIAG");
+   const char *env = getenv("CROSVM_DRM2KGSL_DIAG");
    g_kgsl_diag.enabled = !env || strcmp(env, "0") != 0;
    if (g_kgsl_diag.enabled)
       kgsl_diag_log("KGSL_DIAG enabled");
@@ -533,9 +533,9 @@ kgsl_blob_arena_init(void)
 
    g_blob_arena.initialized = true;
    uint64_t fd_value, host_va, size;
-   if (!kgsl_parse_u64_env("CROSVM_KGSL_ARENA_FD", &fd_value) ||
-       !kgsl_parse_u64_env("CROSVM_KGSL_ARENA_HOST_VA", &host_va) ||
-       !kgsl_parse_u64_env("CROSVM_KGSL_ARENA_SIZE", &size) ||
+   if (!kgsl_parse_u64_env("CROSVM_DRM2KGSL_ARENA_FD", &fd_value) ||
+       !kgsl_parse_u64_env("CROSVM_DRM2KGSL_ARENA_HOST_VA", &host_va) ||
+       !kgsl_parse_u64_env("CROSVM_DRM2KGSL_ARENA_SIZE", &size) ||
        fd_value > INT32_MAX || !host_va || !size ||
        (host_va | size) & (getpagesize() - 1) ||
        fcntl((int)fd_value, F_GETFD) < 0) {
@@ -545,7 +545,7 @@ kgsl_blob_arena_init(void)
 
    /* Optional: absent means the arena owns the whole fd. */
    uint64_t fd_offset = 0;
-   kgsl_parse_u64_env("CROSVM_KGSL_ARENA_FD_OFFSET", &fd_offset);
+   kgsl_parse_u64_env("CROSVM_DRM2KGSL_ARENA_FD_OFFSET", &fd_offset);
    if (fd_offset & (getpagesize() - 1)) {
       drm_err("arena fd_offset 0x%" PRIx64 " is not page aligned", fd_offset);
       pthread_mutex_unlock(&g_blob_arena.lock);

@@ -330,10 +330,19 @@ vkr_shm_pool_init_locked(void)
    if (fd < 0 || !size)
       return;
 
-   void *base =
-      mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, fd_offset);
-   if (base == MAP_FAILED) {
-      vkr_log("venus_host pool: mmap failed (fd %d size %" PRIu64 ")", fd, size);
+   /* Use the VMM's own mapping of the window (same process), NOT a private
+    * mmap: the VMM recognises pool residency by checking blob.map_ptr against
+    * VENUS_POOL_HOST_VA..+SIZE, so the pointers we publish must come from
+    * that exact mapping.  A second mapping of the same pages has a different
+    * VA and every probe misses -- the first deployment did exactly that, the
+    * guest never got MAP_INFO_POOL and every ring came up unusable.
+    */
+   void *base = NULL;
+   const char *va_str = getenv("VENUS_POOL_HOST_VA");
+   if (va_str)
+      base = (void *)(uintptr_t)strtoull(va_str, NULL, 0);
+   if (!base) {
+      vkr_log("venus_host pool: VENUS_POOL_HOST_VA missing, pool disabled");
       return;
    }
 

@@ -339,8 +339,6 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
    }
 
-   mtx_destroy(&dev->object_mutex);
-
    if (!list_is_empty(&dev->objects)) {
       list_for_each_entry_safe (struct vkr_object, obj, &dev->objects, track_head)
          vkr_device_object_destroy(ctx, dev, obj);
@@ -348,6 +346,14 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
 
    list_for_each_entry_safe (struct vkr_queue, queue, &dev->queues, base.track_head)
       vkr_queue_destroy(ctx, queue);
+
+   /* DroidVM: destroyed AFTER the object/queue cleanup above --
+    * vkr_device_object_destroy ends in vkr_device_remove_object, which locks
+    * this mutex.  Upstream destroys it first, which glibc silently tolerates
+    * but bionic FORTIFY turns into an abort that took the whole VMM down on
+    * every kwin session exit.
+    */
+   mtx_destroy(&dev->object_mutex);
 
    list_for_each_entry_safe (struct vkr_queue_sync, sync, &dev->free_syncs, head) {
       vk->DestroyFence(dev->base.handle.device, sync->fence, NULL);

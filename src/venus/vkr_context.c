@@ -618,6 +618,17 @@ vkr_context_destroy(struct vkr_context *ctx)
    /* TODO Move the entire teardown process to a separate thread so that the main thread
     * cannot get blocked by the vkDeviceWaitIdle upon device destruction.
     */
+
+   /* DroidVM: the monitor thread walks ctx->rings under ring_mutex on every
+    * tick, so it must be joined BEFORE the rings and that mutex are torn
+    * down.  Upstream only destroys contexts inside a dying render-server
+    * worker where a late monitor tick aborting is invisible; in-process the
+    * VMM lives on, and the late tick locks a destroyed mutex (FORTIFY abort
+    * took the whole VM down when a kwin session exited).
+    */
+   if (ctx->ring_monitor.started)
+      vkr_context_ring_monitor_fini(ctx);
+
    list_for_each_entry_safe (struct vkr_ring, ring, &ctx->rings, head) {
       vkr_ring_stop(ring);
       vkr_ring_destroy(ring);
@@ -625,9 +636,6 @@ vkr_context_destroy(struct vkr_context *ctx)
    mtx_destroy(&ctx->ring_mutex);
 
    vkr_context_wait_ring_fini(ctx);
-
-   if (ctx->ring_monitor.started)
-      vkr_context_ring_monitor_fini(ctx);
 
    if (ctx->instance) {
       vkr_log("destroying context %d (%s) with a valid instance", ctx->ctx_id,

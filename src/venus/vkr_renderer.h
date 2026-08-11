@@ -62,7 +62,11 @@ vkr_renderer_create_resource(uint32_t ctx_id,
                              enum virgl_resource_fd_type *out_fd_type,
                              int *out_res_fd,
                              uint32_t *out_map_info,
-                             struct virgl_resource_vulkan_info *out_vulkan_info);
+                             struct virgl_resource_vulkan_info *out_vulkan_info,
+                             /* DroidVM: pool-resident shmems (venus_host) carry a
+                              * persistent host mapping + fd offset for the VMM */
+                             void **out_map_ptr,
+                             uint64_t *out_fd_offset);
 
 bool
 vkr_renderer_import_resource(uint32_t ctx_id,

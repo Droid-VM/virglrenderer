@@ -20,6 +20,7 @@
 #include "vkr_virgl_adapter.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -173,8 +174,8 @@ vkr_adapter_attach_resource(struct virgl_context *vctx, struct virgl_resource *r
       /* iovec-only guest memory: unusable by venus (host process isolation);
        * loud because a venus guest is not supposed to produce these.
        */
-      virgl_error("venus adapter: ctx %u attach of res %u without an fd, ignored\n",
-                  vctx->ctx_id, res->res_id);
+      fprintf(stderr, "VENUS-DIAG: ctx %u attach res=%u NO-FD, ignored\n", vctx->ctx_id,
+              res->res_id);
       return;
    }
 
@@ -192,8 +193,8 @@ vkr_adapter_attach_resource(struct virgl_context *vctx, struct virgl_resource *r
    }
 
    if (!vkr_renderer_import_resource(vctx->ctx_id, res->res_id, fd_type, fd, size)) {
-      virgl_error("venus adapter: ctx %u import of res %u failed\n", vctx->ctx_id,
-                  res->res_id);
+      fprintf(stderr, "VENUS-DIAG: ctx %u attach import FAILED res=%u fd_type=%d size=%llu\n",
+              vctx->ctx_id, res->res_id, (int)fd_type, (unsigned long long)size);
       close(fd);
       return;
    }
@@ -232,6 +233,11 @@ vkr_adapter_get_blob(struct virgl_context *vctx,
 {
    struct vkr_adapter_ctx *actx = to_adapter(vctx);
 
+   fprintf(stderr,
+           "VENUS-DIAG: ctx %u get_blob res=%u blob_id=%llu size=%llu flags=0x%x pending_fd=%d\n",
+           vctx->ctx_id, res_id, (unsigned long long)blob_id,
+           (unsigned long long)blob_size, blob_flags, actx->pending_guest_fd);
+
    /* guest-allocated blob: the parked udmabuf IS the memory */
    if (actx->pending_guest_fd >= 0) {
       const int fd = actx->pending_guest_fd;
@@ -241,9 +247,9 @@ vkr_adapter_get_blob(struct virgl_context *vctx,
       if (vkr_fd < 0 ||
           !vkr_renderer_import_resource(vctx->ctx_id, res_id, VIRGL_RESOURCE_FD_DMABUF,
                                         vkr_fd, blob_size)) {
-         virgl_error("venus adapter: ctx %u guest blob import failed (res %u blob %" PRIu64
-                     ")\n",
-                     vctx->ctx_id, res_id, blob_id);
+         fprintf(stderr,
+                 "VENUS-DIAG: ctx %u guest blob import FAILED res=%u blob=%llu vkr_fd=%d\n",
+                 vctx->ctx_id, res_id, (unsigned long long)blob_id, vkr_fd);
          if (vkr_fd >= 0)
             close(vkr_fd);
          close(fd);
@@ -263,12 +269,17 @@ vkr_adapter_get_blob(struct virgl_context *vctx,
    int res_fd = -1;
    uint32_t map_info = 0;
    struct virgl_resource_vulkan_info vulkan_info;
+   void *map_ptr = NULL;
+   uint64_t fd_offset = 0;
    memset(&vulkan_info, 0, sizeof(vulkan_info));
 
    if (!vkr_renderer_create_resource(vctx->ctx_id, res_id, blob_id, blob_size,
                                      blob_flags, &fd_type, &res_fd, &map_info,
-                                     &vulkan_info))
+                                     &vulkan_info, &map_ptr, &fd_offset)) {
+      fprintf(stderr, "VENUS-DIAG: ctx %u create_resource FAILED res=%u blob_id=%llu\n",
+              vctx->ctx_id, res_id, (unsigned long long)blob_id);
       return -EINVAL;
+   }
 
    vkr_adapter_known_add(actx, res_id);
 
@@ -277,6 +288,9 @@ vkr_adapter_get_blob(struct virgl_context *vctx,
    blob->u.fd = res_fd;
    blob->map_info = map_info;
    blob->vulkan_info = vulkan_info;
+   /* venus_host pool residency: the VMM turns this into MAP_INFO_POOL */
+   blob->map_ptr = map_ptr;
+   blob->fd_offset = fd_offset;
    if (fd_type == VIRGL_RESOURCE_FD_OPAQUE) {
       /* same metadata under this fork's original name */
       memcpy(blob->opaque_fd_metadata.driver_uuid, vulkan_info.driver_uuid, 16);
@@ -302,6 +316,8 @@ vkr_adapter_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, int 
       close(actx->pending_guest_fd);
    }
    actx->pending_guest_fd = fd;
+   fprintf(stderr, "VENUS-DIAG: ctx %u park guest fd=%d blob_id=%llu\n", vctx->ctx_id, fd,
+           (unsigned long long)blob_id);
    return 0;
 }
 

@@ -5,6 +5,7 @@
 
 #include "vkr_context.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -185,12 +186,21 @@ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size)
    return true;
 }
 
+/* DroidVM venus_host pool (definitions below the resource helpers) */
+static void *
+vkr_shm_pool_alloc(uint64_t size, uint64_t *out_off);
+static bool
+vkr_shm_pool_free(void *ptr, uint64_t size);
+
 static inline void
 vkr_context_free_resource(struct hash_entry *entry)
 {
    struct vkr_resource *res = entry->data;
-   if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
-      munmap(res->u.data, res->size);
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM) {
+      /* pool slices go back to the free list; the pool mapping stays */
+      if (!vkr_shm_pool_free(res->u.data, res->size))
+         munmap(res->u.data, res->size);
+   }
    else if (res->u.fd >= 0)
       close(res->u.fd);
    free(res);
@@ -274,6 +284,162 @@ vkr_context_import_resource_from_shm(struct vkr_context *ctx,
    return true;
 }
 
+/* DroidVM venus_host pool: serve blob_id==0 transport shmems (rings, CS and
+ * reply buffers) out of the boot-blessed venus_host region instead of fresh
+ * memfds.  The VMM hands the region over via env (VENUS_POOL_FD/_FD_OFFSET/
+ * _SIZE, exported before the GPU device starts); vkr keeps one process-
+ * lifetime mapping and sub-allocates with a tiny first-fit free list.  The
+ * host picks every offset -- the guest maps pool_base+offset from the
+ * RESOURCE_MAP_BLOB response (MAP_INFO_POOL) and never chooses a location,
+ * and no blob needs a runtime SHARE/accept round trip.  Exhaustion or a
+ * missing env falls back to the original memfd path.
+ */
+struct vkr_shm_pool_hole {
+   struct list_head head;
+   uint64_t off;
+   uint64_t size;
+};
+
+static struct {
+   mtx_t mutex;
+   uint8_t *base;
+   uint64_t size;
+   int fd;
+   uint64_t fd_offset;
+   bool init_done;
+   struct list_head holes;
+} vkr_shm_pool = { .fd = -1 };
+
+static void
+vkr_shm_pool_init_locked(void)
+{
+   if (vkr_shm_pool.init_done)
+      return;
+   vkr_shm_pool.init_done = true;
+   list_inithead(&vkr_shm_pool.holes);
+
+   const char *fd_str = getenv("VENUS_POOL_FD");
+   const char *off_str = getenv("VENUS_POOL_FD_OFFSET");
+   const char *size_str = getenv("VENUS_POOL_SIZE");
+   if (!fd_str || !size_str)
+      return;
+
+   const int fd = atoi(fd_str);
+   const uint64_t fd_offset = off_str ? strtoull(off_str, NULL, 0) : 0;
+   const uint64_t size = strtoull(size_str, NULL, 0);
+   if (fd < 0 || !size)
+      return;
+
+   void *base =
+      mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, fd_offset);
+   if (base == MAP_FAILED) {
+      vkr_log("venus_host pool: mmap failed (fd %d size %" PRIu64 ")", fd, size);
+      return;
+   }
+
+   struct vkr_shm_pool_hole *hole = malloc(sizeof(*hole));
+   if (!hole) {
+      munmap(base, size);
+      return;
+   }
+   hole->off = 0;
+   hole->size = size;
+   list_addtail(&hole->head, &vkr_shm_pool.holes);
+
+   vkr_shm_pool.base = base;
+   vkr_shm_pool.size = size;
+   vkr_shm_pool.fd = fd;
+   vkr_shm_pool.fd_offset = fd_offset;
+   vkr_log("venus_host pool: %" PRIu64 " MiB at %p (fd %d off 0x%" PRIx64 ")",
+           size >> 20, base, fd, fd_offset);
+}
+
+static once_flag vkr_shm_pool_once = ONCE_FLAG_INIT;
+
+static void
+vkr_shm_pool_once_init(void)
+{
+   mtx_init(&vkr_shm_pool.mutex, mtx_plain);
+}
+
+static void *
+vkr_shm_pool_alloc(uint64_t size, uint64_t *out_off)
+{
+   call_once(&vkr_shm_pool_once, vkr_shm_pool_once_init);
+   void *ptr = NULL;
+
+   mtx_lock(&vkr_shm_pool.mutex);
+   vkr_shm_pool_init_locked();
+   if (vkr_shm_pool.base) {
+      list_for_each_entry (struct vkr_shm_pool_hole, hole, &vkr_shm_pool.holes,
+                           head) {
+         if (hole->size < size)
+            continue;
+         *out_off = hole->off;
+         ptr = vkr_shm_pool.base + hole->off;
+         hole->off += size;
+         hole->size -= size;
+         if (!hole->size) {
+            list_del(&hole->head);
+            free(hole);
+         }
+         break;
+      }
+      if (!ptr)
+         vkr_log("venus_host pool: exhausted (%" PRIu64 " wanted), memfd fallback",
+                 size);
+   }
+   mtx_unlock(&vkr_shm_pool.mutex);
+   return ptr;
+}
+
+/* returns false if ptr is not pool memory */
+static bool
+vkr_shm_pool_free(void *ptr, uint64_t size)
+{
+   if (!vkr_shm_pool.base || (uint8_t *)ptr < vkr_shm_pool.base ||
+       (uint8_t *)ptr >= vkr_shm_pool.base + vkr_shm_pool.size)
+      return false;
+
+   const uint64_t off = (uint8_t *)ptr - vkr_shm_pool.base;
+
+   mtx_lock(&vkr_shm_pool.mutex);
+   /* insert sorted, coalescing with neighbours */
+   struct vkr_shm_pool_hole *next = NULL;
+   list_for_each_entry (struct vkr_shm_pool_hole, hole, &vkr_shm_pool.holes,
+                        head) {
+      if (hole->off > off) {
+         next = hole;
+         break;
+      }
+   }
+   struct list_head *insert_before = next ? &next->head : &vkr_shm_pool.holes;
+   struct vkr_shm_pool_hole *prev = NULL;
+   if (insert_before->prev != &vkr_shm_pool.holes)
+      prev = list_container_of(insert_before->prev, prev, head);
+
+   if (prev && prev->off + prev->size == off) {
+      prev->size += size;
+      if (next && prev->off + prev->size == next->off) {
+         prev->size += next->size;
+         list_del(&next->head);
+         free(next);
+      }
+   } else if (next && off + size == next->off) {
+      next->off = off;
+      next->size += size;
+   } else {
+      struct vkr_shm_pool_hole *hole = malloc(sizeof(*hole));
+      if (hole) {
+         hole->off = off;
+         hole->size = size;
+         list_add(&hole->head, insert_before->prev);
+      }
+   }
+   mtx_unlock(&vkr_shm_pool.mutex);
+   return true;
+}
+
 static bool
 vkr_context_create_resource_from_shm(struct vkr_context *ctx,
                                      uint32_t res_id,
@@ -287,6 +453,28 @@ vkr_context_create_resource_from_shm(struct vkr_context *ctx,
     */
    const size_t page_size = getpagesize();
    const uint64_t alloc_size = (blob_size + page_size - 1) & ~(page_size - 1);
+
+   uint64_t pool_off;
+   void *pool_ptr = vkr_shm_pool_alloc(alloc_size, &pool_off);
+   if (pool_ptr) {
+      if (!vkr_context_import_resource_internal(ctx, res_id, alloc_size,
+                                                VIRGL_RESOURCE_FD_SHM, -1,
+                                                pool_ptr)) {
+         vkr_shm_pool_free(pool_ptr, alloc_size);
+         return false;
+      }
+      const int pool_fd = fcntl(vkr_shm_pool.fd, F_DUPFD_CLOEXEC, 0);
+      *out_blob = (struct virgl_context_blob){
+         .type = VIRGL_RESOURCE_FD_SHM,
+         .u.fd = pool_fd,
+         .map_info = VIRGL_RENDERER_MAP_CACHE_CACHED,
+         /* the VMM recognises pool residency from this host VA and answers
+          * the guest's map with MAP_INFO_POOL + offset instead of a SHARE */
+         .map_ptr = pool_ptr,
+         .fd_offset = vkr_shm_pool.fd_offset + pool_off,
+      };
+      return true;
+   }
 
    int fd = os_create_anonymous_file(alloc_size, "vkr-shmem");
    if (fd < 0)

@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -104,7 +107,7 @@ vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkDescriptorPoolInlineUniformBlockCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(dec);
+            ((VkDescriptorPoolInlineUniformBlockCreateInfo *)pnext)->pNext = vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(dec);
             vn_decode_VkDescriptorPoolInlineUniformBlockCreateInfo_self_temp(dec, (VkDescriptorPoolInlineUniformBlockCreateInfo *)pnext);
         }
         break;
@@ -112,7 +115,7 @@ vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMutableDescriptorTypeCreateInfoEXT));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(dec);
+            ((VkMutableDescriptorTypeCreateInfoEXT *)pnext)->pNext = vn_decode_VkDescriptorPoolCreateInfo_pnext_temp(dec);
             vn_decode_VkMutableDescriptorTypeCreateInfoEXT_self_temp(dec, (VkMutableDescriptorTypeCreateInfoEXT *)pnext);
         }
         break;
@@ -135,7 +138,7 @@ vn_decode_VkDescriptorPoolCreateInfo_self_temp(struct vn_cs_decoder *dec, VkDesc
     vn_decode_uint32_t(dec, &val->poolSizeCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->poolSizeCount);
-        val->pPoolSizes = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pPoolSizes) * iter_count);
+        val->pPoolSizes = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pPoolSizes), iter_count);
         if (!val->pPoolSizes) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkDescriptorPoolSize_temp(dec, &((VkDescriptorPoolSize *)val->pPoolSizes)[i]);
@@ -317,8 +320,12 @@ static inline void vn_dispatch_vkCreateDescriptorPool(struct vn_dispatch_context
         vn_dispatch_debug_log(ctx, "vkCreateDescriptorPool returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateDescriptorPool_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateDescriptorPool_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -341,9 +348,12 @@ static inline void vn_dispatch_vkDestroyDescriptorPool(struct vn_dispatch_contex
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyDescriptorPool(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyDescriptorPool_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyDescriptorPool_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -371,8 +381,12 @@ static inline void vn_dispatch_vkResetDescriptorPool(struct vn_dispatch_context 
         vn_dispatch_debug_log(ctx, "vkResetDescriptorPool returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkResetDescriptorPool_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkResetDescriptorPool_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

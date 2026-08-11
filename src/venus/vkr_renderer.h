@@ -11,65 +11,67 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "util/os_misc.h"
-#include "virgl_util.h"
+#include "virgl_resource.h"
+#include "virglrenderer.h"
 
 #define VKR_RENDERER_THREAD_SYNC (1u << 0)
 #define VKR_RENDERER_ASYNC_FENCE_CB (1u << 1)
-#define VKR_RENDERER_RENDER_SERVER (1u << 2)
 
-struct virgl_context;
+typedef void (*vkr_renderer_retire_fence_callback_type)(uint32_t ctx_id,
+                                                        uint32_t ring_idx,
+                                                        uint64_t fence_id);
 
-#ifdef ENABLE_VENUS
+struct vkr_renderer_callbacks {
+   virgl_log_callback_type debug_logger;
+   vkr_renderer_retire_fence_callback_type retire_fence;
+};
 
-int
-vkr_renderer_init(uint32_t flags);
+size_t
+vkr_get_capset(void *capset, uint32_t flags);
+
+bool
+vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs);
 
 void
 vkr_renderer_fini(void);
 
+bool
+vkr_renderer_create_context(uint32_t ctx_id,
+                            uint32_t ctx_flags,
+                            uint32_t nlen,
+                            const char *name);
+
 void
-vkr_renderer_reset(void);
+vkr_renderer_destroy_context(uint32_t ctx_id);
 
-size_t
-vkr_get_capset(void *capset);
+bool
+vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
 
-struct virgl_context *
-vkr_context_create(size_t debug_len, const char *debug_name);
+bool
+vkr_renderer_submit_fence(uint32_t ctx_id,
+                          uint32_t flags,
+                          uint64_t ring_idx,
+                          uint64_t fence_id);
 
-#else /* ENABLE_VENUS */
+bool
+vkr_renderer_create_resource(uint32_t ctx_id,
+                             uint32_t res_id,
+                             uint64_t blob_id,
+                             uint64_t blob_size,
+                             uint32_t blob_flags,
+                             enum virgl_resource_fd_type *out_fd_type,
+                             int *out_res_fd,
+                             uint32_t *out_map_info,
+                             struct virgl_resource_vulkan_info *out_vulkan_info);
 
-#include <stdio.h>
+bool
+vkr_renderer_import_resource(uint32_t ctx_id,
+                             uint32_t res_id,
+                             enum virgl_resource_fd_type fd_type,
+                             int fd,
+                             uint64_t size);
 
-static inline int
-vkr_renderer_init(UNUSED uint32_t flags)
-{
-   virgl_log("Vulkan support was not enabled in virglrenderer\n");
-   return -1;
-}
-
-static inline void
-vkr_renderer_fini(void)
-{
-}
-
-static inline void
-vkr_renderer_reset(void)
-{
-}
-
-static inline size_t
-vkr_get_capset(UNUSED void *capset)
-{
-   return 0;
-}
-
-static inline struct virgl_context *
-vkr_context_create(UNUSED size_t debug_len, UNUSED const char *debug_name)
-{
-   return NULL;
-}
-
-#endif /* ENABLE_VENUS */
+void
+vkr_renderer_destroy_resource(uint32_t ctx_id, uint32_t res_id);
 
 #endif /* VKR_RENDERER_H */

@@ -872,6 +872,68 @@ vn_replace_VkSamplerYcbcrConversion_handle(VkSamplerYcbcrConversion *val)
     *val = (VkSamplerYcbcrConversion)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION);
 }
 
+/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkAccelerationStructureKHR) */
+
+static inline void
+vn_encode_VkAccelerationStructureKHR(struct vn_cs_encoder *enc, const VkAccelerationStructureKHR *val)
+{
+    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR);
+    vn_encode_uint64_t(enc, &id);
+}
+
+static inline void
+vn_decode_VkAccelerationStructureKHR(struct vn_cs_decoder *dec, VkAccelerationStructureKHR *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR);
+}
+
+static inline void
+vn_decode_VkAccelerationStructureKHR_lookup(struct vn_cs_decoder *dec, VkAccelerationStructureKHR *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    *val = (VkAccelerationStructureKHR)(uintptr_t)vn_cs_decoder_lookup_object(dec, id, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR);
+}
+
+static inline void
+vn_replace_VkAccelerationStructureKHR_handle(VkAccelerationStructureKHR *val)
+{
+    *val = (VkAccelerationStructureKHR)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR);
+}
+
+/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkDeferredOperationKHR) */
+
+static inline void
+vn_encode_VkDeferredOperationKHR(struct vn_cs_encoder *enc, const VkDeferredOperationKHR *val)
+{
+    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_DEFERRED_OPERATION_KHR);
+    vn_encode_uint64_t(enc, &id);
+}
+
+static inline void
+vn_decode_VkDeferredOperationKHR(struct vn_cs_decoder *dec, VkDeferredOperationKHR *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_DEFERRED_OPERATION_KHR);
+}
+
+static inline void
+vn_decode_VkDeferredOperationKHR_lookup(struct vn_cs_decoder *dec, VkDeferredOperationKHR *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    *val = (VkDeferredOperationKHR)(uintptr_t)vn_cs_decoder_lookup_object(dec, id, VK_OBJECT_TYPE_DEFERRED_OPERATION_KHR);
+}
+
+static inline void
+vn_replace_VkDeferredOperationKHR_handle(VkDeferredOperationKHR *val)
+{
+    *val = (VkDeferredOperationKHR)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_DEFERRED_OPERATION_KHR);
+}
+
 /* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkPrivateDataSlot) */
 
 static inline void
@@ -901,6 +963,37 @@ static inline void
 vn_replace_VkPrivateDataSlot_handle(VkPrivateDataSlot *val)
 {
     *val = (VkPrivateDataSlot)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_PRIVATE_DATA_SLOT);
+}
+
+/* VK_DEFINE_NON_DISPATCHABLE_HANDLE(VkTensorARM) */
+
+static inline void
+vn_encode_VkTensorARM(struct vn_cs_encoder *enc, const VkTensorARM *val)
+{
+    const uint64_t id = vn_cs_handle_load_id((const void **)val, VK_OBJECT_TYPE_TENSOR_ARM);
+    vn_encode_uint64_t(enc, &id);
+}
+
+static inline void
+vn_decode_VkTensorARM(struct vn_cs_decoder *dec, VkTensorARM *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    vn_cs_handle_store_id((void **)val, id, VK_OBJECT_TYPE_TENSOR_ARM);
+}
+
+static inline void
+vn_decode_VkTensorARM_lookup(struct vn_cs_decoder *dec, VkTensorARM *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    *val = (VkTensorARM)(uintptr_t)vn_cs_decoder_lookup_object(dec, id, VK_OBJECT_TYPE_TENSOR_ARM);
+}
+
+static inline void
+vn_replace_VkTensorARM_handle(VkTensorARM *val)
+{
+    *val = (VkTensorARM)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_TENSOR_ARM);
 }
 
 #endif /* VN_PROTOCOL_RENDERER_HANDLES_H */

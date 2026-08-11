@@ -6,45 +6,96 @@
 #include "vkr_physical_device.h"
 
 #include "venus-protocol/vn_protocol_renderer_device.h"
-#include "vrend_winsys_gbm.h"
 
 #include "vkr_context.h"
 #include "vkr_device.h"
 #include "vkr_instance.h"
 
-/* TODO open render node and create gbm_device per vkr_physical_device */
+#ifdef HAVE_LINUX_UDMABUF_H
+#include <fcntl.h>
+
+static int udmabuf_dev_fd = -1;
+
+static void
+vkr_udmabuf_init_once(void)
+{
+   udmabuf_dev_fd = open("/dev/udmabuf", O_RDWR);
+   if (udmabuf_dev_fd < 0) {
+      vkr_log("failed to open udmabuf device: %s", strerror(errno));
+   }
+}
+
+static inline int
+vkr_physical_device_get_udmabuf_dev_fd(void)
+{
+   static once_flag udmabuf_once_flag = ONCE_FLAG_INIT;
+   call_once(&udmabuf_once_flag, vkr_udmabuf_init_once);
+   return udmabuf_dev_fd;
+}
+
+#else /* HAVE_LINUX_UDMABUF_H */
+
+static inline int
+vkr_physical_device_get_udmabuf_dev_fd(void)
+{
+   return -1;
+}
+
+#endif /* HAVE_LINUX_UDMABUF_H */
+
+#ifdef ENABLE_GBM_ALLOCATION
+#include <gbm.h>
+#ifdef MINIGBM
+#include <minigbm/minigbm_helpers.h>
+#else
+#include "../vrend/vrend_winsys_gbm.h"
+#endif /* MINIGBM */
+
 static struct gbm_device *vkr_gbm_dev;
 
 static void
 vkr_gbm_device_init_once(void)
 {
-   struct virgl_gbm *vkr_gbm = virgl_gbm_init(-1);
-   if (!vkr_gbm) {
-      vkr_log("virgl_gbm_init failed");
+#ifdef MINIGBM
+   UNUSED int gbm_fd;
+   vkr_gbm_dev = minigbm_create_default_device(&gbm_fd);
+#else
+   struct virgl_gbm *gbm = virgl_gbm_init(-1);
+   vkr_gbm_dev = gbm->device;
+#endif /* MINIGBM */
+   if (!vkr_gbm_dev) {
+      vkr_log("vkr_gbm_device_init_once failed");
       exit(-1);
    }
-
-   vkr_gbm_dev = vkr_gbm->device;
 }
 
-static struct gbm_device *
-vkr_physical_device_get_gbm_device(UNUSED struct vkr_physical_device *physical_dev)
+static inline void *
+vkr_physical_device_get_gbm_device(void)
 {
    static once_flag gbm_once_flag = ONCE_FLAG_INIT;
    call_once(&gbm_once_flag, vkr_gbm_device_init_once);
-
-   return vkr_gbm_dev;
+   return (void *)vkr_gbm_dev;
 }
+
+#else
+
+static inline void *
+vkr_physical_device_get_gbm_device(void)
+{
+   return NULL;
+}
+
+#endif /* ENABLE_GBM_ALLOCATION */
 
 void
 vkr_physical_device_destroy(struct vkr_context *ctx,
                             struct vkr_physical_device *physical_dev)
 {
-   struct vkr_device *dev, *tmp;
-   LIST_FOR_EACH_ENTRY_SAFE (dev, tmp, &physical_dev->devices, base.track_head)
-      vkr_device_destroy(ctx, dev);
+   list_for_each_entry_safe (struct vkr_device, dev, &physical_dev->devices, base.track_head)
+      vkr_device_destroy(ctx, dev, false);
 
    free(physical_dev->extensions);
+   free(physical_dev->queue_family_properties);
 
    vkr_context_remove_object(ctx, &physical_dev->base);
 }
@@ -55,9 +106,10 @@ vkr_instance_enumerate_physical_devices(struct vkr_instance *instance)
    if (instance->physical_device_count)
       return VK_SUCCESS;
 
+   struct vn_instance_proc_table *vk = &instance->proc_table;
    uint32_t count;
    VkResult result =
-      vkEnumeratePhysicalDevices(instance->base.handle.instance, &count, NULL);
+      vk->EnumeratePhysicalDevices(instance->base.handle.instance, &count, NULL);
    if (result != VK_SUCCESS)
       return result;
 
@@ -69,7 +121,7 @@ vkr_instance_enumerate_physical_devices(struct vkr_instance *instance)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
-   result = vkEnumeratePhysicalDevices(instance->base.handle.instance, &count, handles);
+   result = vk->EnumeratePhysicalDevices(instance->base.handle.instance, &count, handles);
    if (result != VK_SUCCESS) {
       free(physical_devs);
       free(handles);
@@ -88,7 +140,11 @@ vkr_instance_lookup_physical_device(struct vkr_instance *instance,
                                     VkPhysicalDevice handle)
 {
    for (uint32_t i = 0; i < instance->physical_device_count; i++) {
-      /* XXX this assumes VkPhysicalDevice handles are unique */
+      /* VkPhysicalDevice handles are fine to contain duplicates. Client side always
+       * returns unique handles upon the first enumeration call (either physical deivces
+       * or groups). The other enumeration call later can return duplicate handles based
+       * on this lookup, which is fine since still matching the Vulkan driver.
+       */
       if (instance->physical_device_handles[i] == handle)
          return instance->physical_devices[i];
    }
@@ -98,20 +154,24 @@ vkr_instance_lookup_physical_device(struct vkr_instance *instance,
 static void
 vkr_physical_device_init_id_properties(struct vkr_physical_device *physical_dev)
 {
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    physical_dev->id_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
    VkPhysicalDeviceProperties2 props2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
       .pNext = &physical_dev->id_properties
    };
-   vkGetPhysicalDeviceProperties2(handle, &props2);
+   vk->GetPhysicalDeviceProperties2(handle, &props2);
 }
 
 static void
 vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_dev)
 {
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
-   vkGetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+   vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
 
    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
     * assume any VkDeviceMemory with the memory type can be made external and
@@ -151,7 +211,7 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
 
    if (physical_dev->EXT_external_memory_dma_buf) {
       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      vkGetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
+      vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
       physical_dev->is_dma_buf_fd_export_supported =
          (props.externalMemoryProperties.externalMemoryFeatures &
           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
@@ -161,7 +221,7 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
 
    if (physical_dev->KHR_external_memory_fd) {
       info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
-      vkGetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
+      vk->GetPhysicalDeviceExternalBufferProperties(handle, &info, &props);
       physical_dev->is_opaque_fd_export_supported =
          (props.externalMemoryProperties.externalMemoryFeatures &
           VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
@@ -169,20 +229,36 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
    }
 
+   /* fallback to gbm allocation with dma-buf import */
    if (!physical_dev->is_dma_buf_fd_export_supported &&
-       !physical_dev->is_opaque_fd_export_supported)
-      physical_dev->gbm_device = vkr_physical_device_get_gbm_device(physical_dev);
+       !physical_dev->is_opaque_fd_export_supported &&
+       physical_dev->EXT_external_memory_dma_buf)
+      physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
+
+   physical_dev->udmabuf_dev_fd = -1;
+   if (VKR_DEBUG(UDMABUF)) {
+      if (physical_dev->EXT_external_memory_dma_buf)
+         physical_dev->udmabuf_dev_fd = vkr_physical_device_get_udmabuf_dev_fd();
+      else
+         vkr_log("missing VK_EXT_external_memory_dma_buf for udmabuf import!");
+   } else if (VKR_DEBUG(GBM)) {
+      if (physical_dev->EXT_external_memory_dma_buf)
+         physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
+      else
+         vkr_log("missing VK_EXT_external_memory_dma_buf for gbm import!");
+   }
 }
 
 static void
-vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
-                                    struct vkr_instance *instance)
+vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
 {
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
 
    VkExtensionProperties *exts;
    uint32_t count;
-   VkResult result = vkEnumerateDeviceExtensionProperties(handle, NULL, &count, NULL);
+   VkResult result = vk->EnumerateDeviceExtensionProperties(handle, NULL, &count, NULL);
    if (result != VK_SUCCESS)
       return;
 
@@ -190,7 +266,7 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
    if (!exts)
       return;
 
-   result = vkEnumerateDeviceExtensionProperties(handle, NULL, &count, exts);
+   result = vk->EnumerateDeviceExtensionProperties(handle, NULL, &count, exts);
    if (result != VK_SUCCESS) {
       free(exts);
       return;
@@ -206,6 +282,12 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
          physical_dev->EXT_external_memory_dma_buf = true;
       else if (!strcmp(props->extensionName, "VK_KHR_external_fence_fd"))
          physical_dev->KHR_external_fence_fd = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_external_memory_metal"))
+         physical_dev->EXT_external_memory_metal = true;
+      else if (!strcmp(props->extensionName, "VK_EXT_metal_objects"))
+         physical_dev->EXT_metal_objects = true;
+      else if (!strcmp(props->extensionName, "VK_KHR_portability_subset"))
+         physical_dev->KHR_portability_subset = true;
 
       const uint32_t spec_ver = vkr_extension_get_spec_version(props->extensionName);
       if (spec_ver) {
@@ -223,35 +305,84 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev,
       VkExternalFenceProperties fence_props = {
          .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
       };
-      PFN_vkGetPhysicalDeviceExternalFenceProperties get_fence_props =
-         (PFN_vkGetPhysicalDeviceExternalFenceProperties)vkGetInstanceProcAddr(
-            instance->base.handle.instance, "vkGetPhysicalDeviceExternalFenceProperties");
-      get_fence_props(handle, &fence_info, &fence_props);
+      vk->GetPhysicalDeviceExternalFenceProperties(handle, &fence_info, &fence_props);
 
       if (!(fence_props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT))
          physical_dev->KHR_external_fence_fd = false;
    }
 
-   physical_dev->extensions = exts;
+   /* On macOS, VK_KHR_external_memory_fd is emulated via Metal shared memory.
+    * MoltenVK doesn't natively support it, but virglrenderer implements
+    * fd-based memory export using Metal buffers backed by POSIX SHM.
+    *
+    * Inject it into the advertised list so the guest Venus driver accepts
+    * the physical device (it's a hard requirement in vn_physical_device.c).
+    * The guest never enables it in vkCreateDevice — Mesa's Venus driver
+    * uses the advertised flag for capability detection only.
+    *
+    * Do NOT mark physical_dev->KHR_external_memory_fd = true here — that
+    * flag tracks native MoltenVK support and gates the host-side
+    * vkCreateDevice extension list (MoltenVK rejects it with -7).
+    *
+    * TODO: Remove after mesa!40478 has had sufficient distro uptake.
+    */
+   if (physical_dev->EXT_external_memory_metal && !physical_dev->KHR_external_memory_fd) {
+      VkExtensionProperties *new_exts =
+         realloc(exts, sizeof(*exts) * (advertised_count + 1));
+      if (new_exts) {
+         exts = new_exts;
+         strcpy(new_exts[advertised_count].extensionName,
+                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+         new_exts[advertised_count].specVersion = 0;
+         advertised_count++;
+      } else {
+         vkr_log("failed to inject VK_KHR_external_memory_fd");
+      }
+   }
+
+   physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
    physical_dev->extension_count = advertised_count;
 }
 
 static void
 vkr_physical_device_init_properties(struct vkr_physical_device *physical_dev)
 {
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
-   vkGetPhysicalDeviceProperties(handle, &physical_dev->properties);
+   vk->GetPhysicalDeviceProperties(handle, &physical_dev->properties);
 
    VkPhysicalDeviceProperties *props = &physical_dev->properties;
    props->apiVersion = vkr_api_version_cap_minor(props->apiVersion, VKR_MAX_API_VERSION);
 }
 
-static void
+static inline void
 vkr_physical_device_init_proc_table(struct vkr_physical_device *physical_dev,
                                     struct vkr_instance *instance)
 {
-   vn_util_init_physical_device_proc_table(instance->base.handle.instance,
-                                           &physical_dev->proc_table);
+   vn_util_init_physical_device_proc_table(
+      instance->base.handle.instance, instance->get_proc_addr, &physical_dev->proc_table);
+}
+
+static void
+vkr_physical_device_init_queue_family_properties(struct vkr_physical_device *physical_dev)
+{
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
+
+   VkQueueFamilyProperties *props;
+   uint32_t count;
+   vk->GetPhysicalDeviceQueueFamilyProperties(handle, &count, NULL);
+
+   props = malloc(sizeof(*props) * count);
+   if (!props)
+      return;
+
+   vk->GetPhysicalDeviceQueueFamilyProperties(handle, &count, props);
+
+   physical_dev->queue_family_property_count = count;
+   physical_dev->queue_family_properties = props;
 }
 
 static void
@@ -262,7 +393,7 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
 
    struct vkr_instance *instance = vkr_instance_from_handle(args->instance);
    if (instance != ctx->instance) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -293,7 +424,7 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
 
       if (physical_dev) {
          if (physical_dev->base.id != id) {
-            vkr_cs_decoder_set_fatal(&ctx->decoder);
+            vkr_context_set_fatal(ctx);
             break;
          }
          continue;
@@ -315,9 +446,10 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
       vkr_physical_device_init_properties(physical_dev);
       physical_dev->api_version =
          MIN2(physical_dev->properties.apiVersion, instance->api_version);
-      vkr_physical_device_init_extensions(physical_dev, instance);
+      vkr_physical_device_init_extensions(physical_dev);
       vkr_physical_device_init_memory_properties(physical_dev);
       vkr_physical_device_init_id_properties(physical_dev);
+      vkr_physical_device_init_queue_family_properties(physical_dev);
 
       list_inithead(&physical_dev->devices);
 
@@ -332,6 +464,7 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
          if (!physical_dev)
             break;
          free(physical_dev->extensions);
+         free(physical_dev->queue_family_properties);
          vkr_context_remove_object(ctx, &physical_dev->base);
          instance->physical_devices[i] = NULL;
       }
@@ -347,7 +480,7 @@ vkr_dispatch_vkEnumeratePhysicalDeviceGroups(
 
    struct vkr_instance *instance = vkr_instance_from_handle(args->instance);
    if (instance != ctx->instance) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -370,17 +503,18 @@ vkr_dispatch_vkEnumeratePhysicalDeviceGroups(
       }
    }
 
+   struct vn_instance_proc_table *vk = &instance->proc_table;
    vn_replace_vkEnumeratePhysicalDeviceGroups_args_handle(args);
    args->ret =
-      vkEnumeratePhysicalDeviceGroups(args->instance, args->pPhysicalDeviceGroupCount,
-                                      args->pPhysicalDeviceGroupProperties);
+      vk->EnumeratePhysicalDeviceGroups(args->instance, args->pPhysicalDeviceGroupCount,
+                                        args->pPhysicalDeviceGroupProperties);
    if (args->ret != VK_SUCCESS)
       return;
 
    if (!orig_props)
       return;
 
-   /* XXX this assumes vkEnumeratePhysicalDevices is called first */
+   /* TODO avoid requiring venus driver to call vkEnumeratePhysicalDevices first */
    /* replace VkPhysicalDevice handles by object ids */
    for (uint32_t i = 0; i < *args->pPhysicalDeviceGroupCount; i++) {
       const VkPhysicalDeviceGroupProperties *props =
@@ -392,6 +526,14 @@ vkr_dispatch_vkEnumeratePhysicalDeviceGroups(
       for (uint32_t j = 0; j < props->physicalDeviceCount; j++) {
          const struct vkr_physical_device *physical_dev =
             vkr_instance_lookup_physical_device(instance, props->physicalDevices[j]);
+         if (!physical_dev) {
+            vkr_log("venus driver is required to call vkEnumeratePhysicalDevices first");
+            args->ret = VK_ERROR_INITIALIZATION_FAILED;
+            if (orig_props)
+               free(args->pPhysicalDeviceGroupProperties);
+            return;
+         }
+
          vkr_cs_handle_store_id((void **)&out->physicalDevices[j], physical_dev->base.id,
                                 VK_OBJECT_TYPE_PHYSICAL_DEVICE);
       }
@@ -411,7 +553,7 @@ vkr_dispatch_vkEnumerateDeviceExtensionProperties(
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    if (args->pLayerName) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -439,8 +581,12 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceFeatures *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceFeatures_args_handle(args);
-   vkGetPhysicalDeviceFeatures(args->physicalDevice, args->pFeatures);
+   vk->GetPhysicalDeviceFeatures(args->physicalDevice, args->pFeatures);
 }
 
 static void
@@ -459,10 +605,14 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceQueueFamilyProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceQueueFamilyProperties_args_handle(args);
-   vkGetPhysicalDeviceQueueFamilyProperties(args->physicalDevice,
-                                            args->pQueueFamilyPropertyCount,
-                                            args->pQueueFamilyProperties);
+   vk->GetPhysicalDeviceQueueFamilyProperties(args->physicalDevice,
+                                              args->pQueueFamilyPropertyCount,
+                                              args->pQueueFamilyProperties);
 }
 
 static void
@@ -480,9 +630,13 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceFormatProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceFormatProperties_args_handle(args);
-   vkGetPhysicalDeviceFormatProperties(args->physicalDevice, args->format,
-                                       args->pFormatProperties);
+   vk->GetPhysicalDeviceFormatProperties(args->physicalDevice, args->format,
+                                         args->pFormatProperties);
 }
 
 static void
@@ -490,8 +644,12 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceImageFormatProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceImageFormatProperties_args_handle(args);
-   args->ret = vkGetPhysicalDeviceImageFormatProperties(
+   args->ret = vk->GetPhysicalDeviceImageFormatProperties(
       args->physicalDevice, args->format, args->type, args->tiling, args->usage,
       args->flags, args->pImageFormatProperties);
 }
@@ -501,8 +659,12 @@ vkr_dispatch_vkGetPhysicalDeviceSparseImageFormatProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceSparseImageFormatProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceSparseImageFormatProperties_args_handle(args);
-   vkGetPhysicalDeviceSparseImageFormatProperties(
+   vk->GetPhysicalDeviceSparseImageFormatProperties(
       args->physicalDevice, args->format, args->type, args->samples, args->usage,
       args->tiling, args->pPropertyCount, args->pProperties);
 }
@@ -512,8 +674,12 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceFeatures2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
-   vkGetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
+   vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
 }
 
 static void
@@ -521,8 +687,12 @@ vkr_dispatch_vkGetPhysicalDeviceProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceProperties2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceProperties2_args_handle(args);
-   vkGetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
+   vk->GetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
 }
 
 static void
@@ -530,10 +700,14 @@ vkr_dispatch_vkGetPhysicalDeviceQueueFamilyProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceQueueFamilyProperties2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceQueueFamilyProperties2_args_handle(args);
-   vkGetPhysicalDeviceQueueFamilyProperties2(args->physicalDevice,
-                                             args->pQueueFamilyPropertyCount,
-                                             args->pQueueFamilyProperties);
+   vk->GetPhysicalDeviceQueueFamilyProperties2(args->physicalDevice,
+                                               args->pQueueFamilyPropertyCount,
+                                               args->pQueueFamilyProperties);
 }
 
 static void
@@ -543,7 +717,18 @@ vkr_dispatch_vkGetPhysicalDeviceMemoryProperties2(
 {
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
-   args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   if (args->pMemoryProperties->pNext == NULL) {
+      /* The client is querying only VkPhysicalDeviceMemoryProperties, which is
+       * invariant. Return the cached properties.
+       */
+      args->pMemoryProperties->memoryProperties = physical_dev->memory_properties;
+   } else {
+      vn_replace_vkGetPhysicalDeviceMemoryProperties2_args_handle(args);
+      vk->GetPhysicalDeviceMemoryProperties2(args->physicalDevice,
+                                             args->pMemoryProperties);
+   }
 }
 
 static void
@@ -551,9 +736,13 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceFormatProperties2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
-   vkGetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
-                                        args->pFormatProperties);
+   vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
+                                          args->pFormatProperties);
 }
 
 static void
@@ -561,8 +750,12 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceImageFormatProperties2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
-   args->ret = vkGetPhysicalDeviceImageFormatProperties2(
+   args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
 }
 
@@ -571,8 +764,12 @@ vkr_dispatch_vkGetPhysicalDeviceSparseImageFormatProperties2(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceSparseImageFormatProperties2 *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceSparseImageFormatProperties2_args_handle(args);
-   vkGetPhysicalDeviceSparseImageFormatProperties2(
+   vk->GetPhysicalDeviceSparseImageFormatProperties2(
       args->physicalDevice, args->pFormatInfo, args->pPropertyCount, args->pProperties);
 }
 
@@ -581,8 +778,12 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceExternalBufferProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
-   vkGetPhysicalDeviceExternalBufferProperties(
+   vk->GetPhysicalDeviceExternalBufferProperties(
       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
 }
 
@@ -591,10 +792,14 @@ vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceExternalSemaphoreProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceExternalSemaphoreProperties_args_handle(args);
-   vkGetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
-                                                  args->pExternalSemaphoreInfo,
-                                                  args->pExternalSemaphoreProperties);
+   vk->GetPhysicalDeviceExternalSemaphoreProperties(args->physicalDevice,
+                                                    args->pExternalSemaphoreInfo,
+                                                    args->pExternalSemaphoreProperties);
 }
 
 static void
@@ -602,23 +807,83 @@ vkr_dispatch_vkGetPhysicalDeviceExternalFenceProperties(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetPhysicalDeviceExternalFenceProperties *args)
 {
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
    vn_replace_vkGetPhysicalDeviceExternalFenceProperties_args_handle(args);
-   vkGetPhysicalDeviceExternalFenceProperties(
+   vk->GetPhysicalDeviceExternalFenceProperties(
       args->physicalDevice, args->pExternalFenceInfo, args->pExternalFenceProperties);
 }
 
 static void
-vkr_dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(
+vkr_dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(
    UNUSED struct vn_dispatch_context *ctx,
-   struct vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT *args)
+   struct vn_command_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR *args)
 {
    struct vkr_physical_device *physical_dev =
       vkr_physical_device_from_handle(args->physicalDevice);
    struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
 
-   vn_replace_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT_args_handle(args);
-   args->ret = vk->GetPhysicalDeviceCalibrateableTimeDomainsEXT(
+   vn_replace_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR_args_handle(args);
+   args->ret = vk->GetPhysicalDeviceCalibrateableTimeDomainsKHR(
       args->physicalDevice, args->pTimeDomainCount, args->pTimeDomains);
+}
+
+static void
+vkr_dispatch_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+   UNUSED struct vn_dispatch_context *ctx,
+   struct vn_command_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR *args)
+{
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   vn_replace_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_args_handle(args);
+   args->ret = vk->GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+      args->physicalDevice, args->pPropertyCount, args->pProperties);
+}
+
+static void
+vkr_dispatch_vkGetPhysicalDeviceFragmentShadingRatesKHR(
+   UNUSED struct vn_dispatch_context *ctx,
+   struct vn_command_vkGetPhysicalDeviceFragmentShadingRatesKHR *args)
+{
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   vn_replace_vkGetPhysicalDeviceFragmentShadingRatesKHR_args_handle(args);
+   args->ret = vk->GetPhysicalDeviceFragmentShadingRatesKHR(
+      args->physicalDevice, args->pFragmentShadingRateCount, args->pFragmentShadingRates);
+}
+
+static void
+vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT(
+   UNUSED struct vn_dispatch_context *ctx,
+   struct vn_command_vkGetPhysicalDeviceMultisamplePropertiesEXT *args)
+{
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   vn_replace_vkGetPhysicalDeviceMultisamplePropertiesEXT_args_handle(args);
+   vk->GetPhysicalDeviceMultisamplePropertiesEXT(args->physicalDevice, args->samples,
+                                                 args->pMultisampleProperties);
+}
+
+static void
+vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT(
+   UNUSED struct vn_dispatch_context *ctx,
+   struct vn_command_vkGetPhysicalDeviceDescriptorSizeEXT *args)
+{
+   struct vkr_physical_device *physical_dev =
+      vkr_physical_device_from_handle(args->physicalDevice);
+   struct vn_physical_device_proc_table *vk = &physical_dev->proc_table;
+
+   vn_replace_vkGetPhysicalDeviceDescriptorSizeEXT_args_handle(args);
+   args->ret =
+      vk->GetPhysicalDeviceDescriptorSizeEXT(args->physicalDevice, args->descriptorType);
 }
 
 void
@@ -670,6 +935,22 @@ vkr_context_init_physical_device_dispatch(struct vkr_context *ctx)
       vkr_dispatch_vkGetPhysicalDeviceExternalSemaphoreProperties;
    dispatch->dispatch_vkGetPhysicalDeviceExternalFenceProperties =
       vkr_dispatch_vkGetPhysicalDeviceExternalFenceProperties;
-   dispatch->dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT =
-      vkr_dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+   dispatch->dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR =
+      vkr_dispatch_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR;
+
+   /* VK_KHR_cooperative_matrix */
+   dispatch->dispatch_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
+      vkr_dispatch_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+
+   /* VK_KHR_fragment_shading_rate */
+   dispatch->dispatch_vkGetPhysicalDeviceFragmentShadingRatesKHR =
+      vkr_dispatch_vkGetPhysicalDeviceFragmentShadingRatesKHR;
+
+   /* VK_EXT_sample_locations */
+   dispatch->dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT =
+      vkr_dispatch_vkGetPhysicalDeviceMultisamplePropertiesEXT;
+
+   /* VK_EXT_descriptor_heap */
+   dispatch->dispatch_vkGetPhysicalDeviceDescriptorSizeEXT =
+      vkr_dispatch_vkGetPhysicalDeviceDescriptorSizeEXT;
 }

@@ -117,6 +117,12 @@ struct virgl_renderer_callbacks {
 /* Enable venus renderer.
  */
 #define VIRGL_RENDERER_VENUS         (1 << 6)
+/* Upstream 1.3 flag value: venus capset advertises use_guest_vram, telling the
+ * guest that host memory cannot be injected and every host-visible or
+ * exportable VkDeviceMemory must be guest-allocated and imported (the only
+ * workable arrangement in a Gunyah protected VM).
+ */
+#define VIRGL_RENDERER_USE_GUEST_VRAM (1 << 14)
 
 /* Disable virgl renderer.
  */

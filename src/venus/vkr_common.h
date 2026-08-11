@@ -19,23 +19,25 @@
 #include <string.h>
 
 #include "c11/threads.h"
-#include "pipe/p_compiler.h"
 #include "util/hash_table.h"
+#include "util/list.h"
+#include "util/macros.h"
+#include "util/os_file.h"
 #include "util/os_misc.h"
-#include "util/u_double_list.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_pointer.h"
 #include "util/u_thread.h"
 #include "venus-protocol/vulkan.h"
+#include "venus-protocol/vulkan_metal.h"
+#include "virgl_context.h"
 #include "virgl_util.h"
 #include "virglrenderer.h"
-#include "vrend_debug.h"
 
 #include "vkr_renderer.h"
 
 /* cap instance and device api versions to this */
-#define VKR_MAX_API_VERSION VK_API_VERSION_1_3
+#define VKR_MAX_API_VERSION VK_API_VERSION_1_4
 
 #define VKR_DEBUG(category) (unlikely(vkr_debug_flags & VKR_DEBUG_##category))
 
@@ -59,8 +61,28 @@
       .begin = (offset), .end = (offset) + (size)                                        \
    }
 
+/* below STACK_ARRAY* utils came from mesa/src/vulkan/util/vk_util.h */
+#define STACK_ARRAY_SIZE 8
+
+/* Sometimes gcc may claim -Wmaybe-uninitialized for the stack array in some
+ * places it can't verify that when size is 0 nobody down the call chain reads
+ * the array. Please don't try to fix it by zero-initializing the array here
+ * since it's used in a lot of different places. An "if (size == 0) return;"
+ * may work for you.
+ */
+#define STACK_ARRAY(type, name, size)                                                    \
+   type _stack_##name[STACK_ARRAY_SIZE];                                                 \
+   type *const name =                                                                    \
+      ((size) <= STACK_ARRAY_SIZE ? _stack_##name                                        \
+                                  : (type *)malloc((size) * sizeof(type)))
+
+#define STACK_ARRAY_FINISH(name)                                                         \
+   if (name != _stack_##name)                                                            \
+   free(name)
+
 struct vn_info_extension_table;
 struct vkr_context;
+struct vkr_ring;
 struct vkr_instance;
 struct vkr_physical_device;
 struct vkr_device;
@@ -88,11 +110,14 @@ struct vkr_pipeline_cache;
 struct vkr_pipeline;
 struct vkr_command_pool;
 struct vkr_command_buffer;
+struct vkr_acceleration_structure;
 
 typedef uint64_t vkr_object_id;
 
 enum vkr_debug_flags {
    VKR_DEBUG_VALIDATE = 1 << 0,
+   VKR_DEBUG_UDMABUF = 1 << 1,
+   VKR_DEBUG_GBM = 1 << 2,
 };
 
 /* base class for all objects */
@@ -131,6 +156,8 @@ struct vkr_object {
       VkCommandPool command_pool;
       VkSamplerYcbcrConversion sampler_ycbcr_conversion;
       VkDescriptorUpdateTemplate descriptor_update_template;
+
+      VkAccelerationStructureKHR acceleration_structure;
    } handle;
 
    struct list_head track_head;
@@ -152,8 +179,10 @@ struct vkr_region {
    size_t end;
 };
 
-extern uint32_t vkr_renderer_flags;
 extern uint32_t vkr_debug_flags;
+
+void
+vkr_debug_init(void);
 
 void
 vkr_log(const char *fmt, ...);
@@ -247,8 +276,11 @@ vkr_is_recognized_object_type(VkObjectType type)
    /* VK_VERSION_1_1 */
    case VK_OBJECT_TYPE_SAMPLER_YCBCR_CONVERSION:
    case VK_OBJECT_TYPE_DESCRIPTOR_UPDATE_TEMPLATE:
+   /* VK_KHR_acceleration_structure */
+   case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR:
       return true;
    default:
+      vkr_log("unrecognized object type %u", type);
       return false;
    }
 }
@@ -310,6 +342,13 @@ vkr_region_make_relative(const struct vkr_region *region)
    return (struct vkr_region){
       .end = region->end - region->begin,
    };
+}
+
+static inline bool
+vkr_seqno_ge(uint32_t a, uint32_t b)
+{
+   /* a >= b, but deal with wrapping as well */
+   return (a - b) <= INT32_MAX;
 }
 
 #endif /* VKR_COMMON_H */

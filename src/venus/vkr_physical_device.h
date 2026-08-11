@@ -10,8 +10,6 @@
 
 #include "venus-protocol/vn_protocol_renderer_util.h"
 
-struct gbm_device;
-
 struct vkr_physical_device {
    struct vkr_object base;
 
@@ -25,15 +23,23 @@ struct vkr_physical_device {
 
    bool KHR_external_memory_fd;
    bool EXT_external_memory_dma_buf;
+   bool KHR_portability_subset;
 
    bool KHR_external_fence_fd;
    bool KHR_external_semaphore_fd;
+
+   bool EXT_external_memory_metal;
+   bool EXT_metal_objects;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
    bool is_dma_buf_fd_export_supported;
    bool is_opaque_fd_export_supported;
-   struct gbm_device *gbm_device;
+   void *gbm_device;
+   int udmabuf_dev_fd;
+
+   VkQueueFamilyProperties *queue_family_properties;
+   uint32_t queue_family_property_count;
 
    struct list_head devices;
 };

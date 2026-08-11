@@ -54,6 +54,11 @@ struct virgl_context_blob {
    uint64_t fd_offset;
 
    struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
+
+   /* Filled by the vendored venus renderer (vkr) for OPAQUE fds; the same
+    * metadata as opaque_fd_metadata under upstream 1.3's name/layout.
+    */
+   struct virgl_resource_vulkan_info vulkan_info;
 };
 
 struct virgl_context;

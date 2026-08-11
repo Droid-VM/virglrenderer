@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -19,10 +22,30 @@
 static inline void *
 vn_decode_VkBufferViewCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
 {
-    /* no known/supported struct */
-    if (vn_decode_simple_pointer(dec))
+    VkBaseOutStructure *pnext;
+    VkStructureType stype;
+
+    if (!vn_decode_simple_pointer(dec))
+        return NULL;
+
+    vn_decode_VkStructureType(dec, &stype);
+    switch ((int32_t)stype) {
+    case VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferUsageFlags2CreateInfo));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkBufferUsageFlags2CreateInfo *)pnext)->pNext = vn_decode_VkBufferViewCreateInfo_pnext_temp(dec);
+            vn_decode_VkBufferUsageFlags2CreateInfo_self_temp(dec, (VkBufferUsageFlags2CreateInfo *)pnext);
+        }
+        break;
+    default:
+        /* unexpected struct */
+        pnext = NULL;
         vn_cs_decoder_set_fatal(dec);
-    return NULL;
+        break;
+    }
+
+    return pnext;
 }
 
 static inline void
@@ -70,6 +93,9 @@ vn_replace_VkBufferViewCreateInfo_handle(VkBufferViewCreateInfo *val)
         switch ((int32_t)pnext->sType) {
         case VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO:
             vn_replace_VkBufferViewCreateInfo_handle_self((VkBufferViewCreateInfo *)pnext);
+            break;
+        case VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO:
+            vn_replace_VkBufferUsageFlags2CreateInfo_handle_self((VkBufferUsageFlags2CreateInfo *)pnext);
             break;
         default:
             /* ignore unknown/unsupported struct */
@@ -176,8 +202,12 @@ static inline void vn_dispatch_vkCreateBufferView(struct vn_dispatch_context *ct
         vn_dispatch_debug_log(ctx, "vkCreateBufferView returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateBufferView_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateBufferView_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -200,9 +230,12 @@ static inline void vn_dispatch_vkDestroyBufferView(struct vn_dispatch_context *c
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyBufferView(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyBufferView_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyBufferView_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

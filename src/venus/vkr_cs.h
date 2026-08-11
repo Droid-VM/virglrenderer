@@ -15,24 +15,19 @@
  */
 #define VKR_CS_DECODER_TEMP_POOL_MAX_SIZE (1u * 1024 * 1024 * 1024)
 
-struct iovec;
-
 struct vkr_cs_encoder {
    bool *fatal_error;
 
+   /* protect stream resource */
+   mtx_t mutex;
+
    struct {
-      const struct vkr_resource_attachment *attachment;
-      const struct iovec *iov;
-      int iov_count;
+      const struct vkr_resource *resource;
       size_t offset;
       size_t size;
-
-      int cached_index;
-      size_t cached_offset;
+      bool busy;
    } stream;
 
-   size_t remaining_size;
-   int next_iov;
    uint8_t *cur;
    const uint8_t *end;
 };
@@ -67,22 +62,39 @@ struct vkr_cs_decoder_temp_pool {
 
 struct vkr_cs_decoder {
    const struct hash_table *object_table;
+   mtx_t *object_mutex;
 
-   bool fatal_error;
+   bool *fatal_error;
    struct vkr_cs_decoder_temp_pool temp_pool;
 
-   struct vkr_cs_decoder_saved_state saved_states[1];
-   uint32_t saved_state_count;
+   /* Support vkExecuteCommandStreamsMESA for command buffer recording and indirect
+    * submission. Only a single level nested decoder state is needed. Base level is
+    * always from context or ring submit buffer, and no resource tracking is needed.
+    */
+   struct vkr_cs_decoder_saved_state saved_state;
+   bool saved_state_valid;
+
+   /* protect against resource destroy */
+   mtx_t resource_mutex;
+   const struct vkr_resource *resource;
 
    const uint8_t *cur;
    const uint8_t *end;
 };
 
-static inline void
+static inline int
 vkr_cs_encoder_init(struct vkr_cs_encoder *enc, bool *fatal_error)
 {
    memset(enc, 0, sizeof(*enc));
    enc->fatal_error = fatal_error;
+
+   return mtx_init(&enc->mutex, mtx_plain);
+}
+
+static inline void
+vkr_cs_encoder_fini(struct vkr_cs_encoder *enc)
+{
+   mtx_destroy(&enc->mutex);
 }
 
 static inline void
@@ -92,19 +104,78 @@ vkr_cs_encoder_set_fatal(const struct vkr_cs_encoder *enc)
 }
 
 void
+vkr_cs_encoder_set_stream_locked(struct vkr_cs_encoder *enc,
+                                 const struct vkr_resource *res,
+                                 size_t offset,
+                                 size_t size);
+
+void
+vkr_cs_encoder_seek_stream_locked(struct vkr_cs_encoder *enc, size_t pos);
+
+static inline void
 vkr_cs_encoder_set_stream(struct vkr_cs_encoder *enc,
-                          const struct vkr_resource_attachment *att,
+                          const struct vkr_resource *res,
                           size_t offset,
-                          size_t size);
+                          size_t size)
+{
 
-void
-vkr_cs_encoder_seek_stream(struct vkr_cs_encoder *enc, size_t pos);
+   mtx_lock(&enc->mutex);
+   vkr_cs_encoder_set_stream_locked(enc, res, offset, size);
+   mtx_unlock(&enc->mutex);
+}
 
-void
-vkr_cs_encoder_write_internal(struct vkr_cs_encoder *enc,
-                              size_t size,
-                              const void *val,
-                              size_t val_size);
+static inline void
+vkr_cs_encoder_seek_stream(struct vkr_cs_encoder *enc, size_t pos)
+{
+   mtx_lock(&enc->mutex);
+   vkr_cs_encoder_seek_stream_locked(enc, pos);
+   mtx_unlock(&enc->mutex);
+}
+
+static inline bool
+vkr_cs_encoder_check_stream(struct vkr_cs_encoder *enc, const struct vkr_resource *res)
+{
+   mtx_lock(&enc->mutex);
+   if (enc->stream.resource && enc->stream.resource == res) {
+      if (enc->stream.busy) {
+         mtx_unlock(&enc->mutex);
+         return false;
+      }
+      /* TODO vkSetReplyCommandStreamMESA should support res_id 0 to unset. Until then,
+       * and until we can ignore older guests, treat this as non-fatal. This can happen
+       * when the driver side reply shmem has lost its last ref for being used as reply
+       * shmem (it can still live in the driver side shmem cache but will be used for
+       * other purposes the next time being allocated out).
+       */
+      vkr_cs_encoder_set_stream_locked(enc, NULL, 0, 0);
+   }
+   mtx_unlock(&enc->mutex);
+
+   return true;
+}
+
+static inline bool
+vkr_cs_encoder_acquire(struct vkr_cs_encoder *enc)
+{
+   mtx_lock(&enc->mutex);
+   if (unlikely(!enc->stream.resource)) {
+      vkr_cs_encoder_set_fatal(enc);
+      mtx_unlock(&enc->mutex);
+      return false;
+   }
+   enc->stream.busy = true;
+   mtx_unlock(&enc->mutex);
+   return true;
+}
+
+static inline void
+vkr_cs_encoder_release(struct vkr_cs_encoder *enc)
+{
+   mtx_lock(&enc->mutex);
+   assert(enc->stream.resource);
+   enc->stream.busy = false;
+   mtx_unlock(&enc->mutex);
+}
 
 static inline void
 vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
@@ -115,17 +186,19 @@ vkr_cs_encoder_write(struct vkr_cs_encoder *enc,
    assert(val_size <= size);
 
    if (unlikely(size > (size_t)(enc->end - enc->cur))) {
-      vkr_cs_encoder_write_internal(enc, size, val, val_size);
+      vkr_log("failed to write the reply stream");
+      vkr_cs_encoder_set_fatal(enc);
       return;
    }
 
    /* we should not rely on the compiler to optimize away memcpy... */
-   memcpy(enc->cur, val, val_size);
+   if (enc->cur != val)
+      memcpy(enc->cur, val, val_size);
    enc->cur += size;
 }
 
-void
-vkr_cs_decoder_init(struct vkr_cs_decoder *dec, const struct hash_table *object_table);
+int
+vkr_cs_decoder_init(struct vkr_cs_decoder *dec, struct vkr_context *ctx);
 
 void
 vkr_cs_decoder_fini(struct vkr_cs_decoder *dec);
@@ -136,20 +209,38 @@ vkr_cs_decoder_reset(struct vkr_cs_decoder *dec);
 static inline void
 vkr_cs_decoder_set_fatal(const struct vkr_cs_decoder *dec)
 {
-   ((struct vkr_cs_decoder *)dec)->fatal_error = true;
+   *((struct vkr_cs_decoder *)dec)->fatal_error = true;
 }
 
 static inline bool
 vkr_cs_decoder_get_fatal(const struct vkr_cs_decoder *dec)
 {
-   return dec->fatal_error;
+   return *dec->fatal_error;
 }
 
 static inline void
-vkr_cs_decoder_set_stream(struct vkr_cs_decoder *dec, const void *data, size_t size)
+vkr_cs_decoder_set_buffer_stream(struct vkr_cs_decoder *dec,
+                                 const void *data,
+                                 size_t size)
 {
    dec->cur = data;
    dec->end = dec->cur + size;
+}
+
+bool
+vkr_cs_decoder_set_resource_stream(struct vkr_cs_decoder *dec,
+                                   struct vkr_context *ctx,
+                                   uint32_t res_id,
+                                   size_t offset,
+                                   size_t size);
+
+static inline bool
+vkr_cs_decoder_check_stream(struct vkr_cs_decoder *dec, const struct vkr_resource *res)
+{
+   mtx_lock(&dec->resource_mutex);
+   const bool ok = dec->resource != res;
+   mtx_unlock(&dec->resource_mutex);
+   return ok;
 }
 
 static inline bool
@@ -158,11 +249,17 @@ vkr_cs_decoder_has_command(const struct vkr_cs_decoder *dec)
    return dec->cur < dec->end;
 }
 
-bool
-vkr_cs_decoder_push_state(struct vkr_cs_decoder *dec);
+static inline bool
+vkr_cs_decoder_has_saved_state(struct vkr_cs_decoder *dec)
+{
+   return dec->saved_state_valid;
+}
 
 void
-vkr_cs_decoder_pop_state(struct vkr_cs_decoder *dec);
+vkr_cs_decoder_save_state(struct vkr_cs_decoder *dec);
+
+void
+vkr_cs_decoder_restore_state(struct vkr_cs_decoder *dec);
 
 static inline bool
 vkr_cs_decoder_peek_internal(const struct vkr_cs_decoder *dec,
@@ -180,7 +277,8 @@ vkr_cs_decoder_peek_internal(const struct vkr_cs_decoder *dec,
    }
 
    /* we should not rely on the compiler to optimize away memcpy... */
-   memcpy(val, dec->cur, val_size);
+   if (dec->cur != val)
+      memcpy(val, dec->cur, val_size);
    return true;
 }
 
@@ -210,14 +308,16 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
    if (!id)
       return NULL;
 
+   mtx_lock(dec->object_mutex);
    const struct hash_entry *entry =
       _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
    obj = likely(entry) ? entry->data : NULL;
+   mtx_unlock(dec->object_mutex);
    if (unlikely(!obj || obj->type != type)) {
       if (obj)
          vkr_log("object %" PRIu64 " has type %d, not %d", id, obj->type, type);
       else
-         vkr_log("failed to look up object %" PRIu64, id);
+         vkr_log("failed to look up object %" PRIu64 " of type %d", id, type);
       vkr_cs_decoder_set_fatal(dec);
    }
 
@@ -256,6 +356,33 @@ vkr_cs_decoder_alloc_temp(struct vkr_cs_decoder *dec, size_t size)
    void *ptr = pool->cur;
    pool->cur += size;
    return ptr;
+}
+
+static inline void *
+vkr_cs_decoder_alloc_temp_array(struct vkr_cs_decoder *dec, size_t size, size_t count)
+{
+   size_t alloc_size;
+   if (unlikely(__builtin_mul_overflow(size, count, &alloc_size))) {
+      vkr_log("overflow in array allocation of %zu * %zu bytes", size, count);
+      vkr_cs_decoder_set_fatal(dec);
+      return NULL;
+   }
+
+   return vkr_cs_decoder_alloc_temp(dec, alloc_size);
+}
+
+static inline void *
+vkr_cs_decoder_get_blob_storage(struct vkr_cs_decoder *dec, size_t size)
+{
+   return unlikely(size > (size_t)(dec->end - dec->cur)) ? NULL : (void *)dec->cur;
+}
+
+static inline void *
+vkr_cs_encoder_get_blob_storage(struct vkr_cs_encoder *enc, size_t offset, size_t size)
+{
+   return unlikely(offset + size > (size_t)(enc->end - enc->cur))
+             ? NULL
+             : (void *)(enc->cur + offset);
 }
 
 static inline bool

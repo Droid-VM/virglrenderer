@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -128,6 +131,63 @@ vn_replace_VkBufferOpaqueCaptureAddressCreateInfo_handle(VkBufferOpaqueCaptureAd
     } while (pnext);
 }
 
+/* struct VkBufferDeviceAddressCreateInfoEXT chain */
+
+static inline void *
+vn_decode_VkBufferDeviceAddressCreateInfoEXT_pnext_temp(struct vn_cs_decoder *dec)
+{
+    /* no known/supported struct */
+    if (vn_decode_simple_pointer(dec))
+        vn_cs_decoder_set_fatal(dec);
+    return NULL;
+}
+
+static inline void
+vn_decode_VkBufferDeviceAddressCreateInfoEXT_self_temp(struct vn_cs_decoder *dec, VkBufferDeviceAddressCreateInfoEXT *val)
+{
+    /* skip val->{sType,pNext} */
+    vn_decode_VkDeviceAddress(dec, &val->deviceAddress);
+}
+
+static inline void
+vn_decode_VkBufferDeviceAddressCreateInfoEXT_temp(struct vn_cs_decoder *dec, VkBufferDeviceAddressCreateInfoEXT *val)
+{
+    VkStructureType stype;
+    vn_decode_VkStructureType(dec, &stype);
+    if (stype != VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT)
+        vn_cs_decoder_set_fatal(dec);
+
+    val->sType = stype;
+    val->pNext = vn_decode_VkBufferDeviceAddressCreateInfoEXT_pnext_temp(dec);
+    vn_decode_VkBufferDeviceAddressCreateInfoEXT_self_temp(dec, val);
+}
+
+static inline void
+vn_replace_VkBufferDeviceAddressCreateInfoEXT_handle_self(VkBufferDeviceAddressCreateInfoEXT *val)
+{
+    /* skip val->sType */
+    /* skip val->pNext */
+    /* skip val->deviceAddress */
+}
+
+static inline void
+vn_replace_VkBufferDeviceAddressCreateInfoEXT_handle(VkBufferDeviceAddressCreateInfoEXT *val)
+{
+    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
+
+    do {
+        switch ((int32_t)pnext->sType) {
+        case VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT:
+            vn_replace_VkBufferDeviceAddressCreateInfoEXT_handle_self((VkBufferDeviceAddressCreateInfoEXT *)pnext);
+            break;
+        default:
+            /* ignore unknown/unsupported struct */
+            break;
+        }
+        pnext = pnext->pNext;
+    } while (pnext);
+}
+
 /* struct VkBufferCreateInfo chain */
 
 static inline void *
@@ -141,11 +201,19 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
 
     vn_decode_VkStructureType(dec, &stype);
     switch ((int32_t)stype) {
+    case VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferUsageFlags2CreateInfo));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkBufferUsageFlags2CreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            vn_decode_VkBufferUsageFlags2CreateInfo_self_temp(dec, (VkBufferUsageFlags2CreateInfo *)pnext);
+        }
+        break;
     case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExternalMemoryBufferCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkExternalMemoryBufferCreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkExternalMemoryBufferCreateInfo_self_temp(dec, (VkExternalMemoryBufferCreateInfo *)pnext);
         }
         break;
@@ -153,8 +221,16 @@ vn_decode_VkBufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferOpaqueCaptureAddressCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            ((VkBufferOpaqueCaptureAddressCreateInfo *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
             vn_decode_VkBufferOpaqueCaptureAddressCreateInfo_self_temp(dec, (VkBufferOpaqueCaptureAddressCreateInfo *)pnext);
+        }
+        break;
+    case VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBufferDeviceAddressCreateInfoEXT));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkBufferDeviceAddressCreateInfoEXT *)pnext)->pNext = vn_decode_VkBufferCreateInfo_pnext_temp(dec);
+            vn_decode_VkBufferDeviceAddressCreateInfoEXT_self_temp(dec, (VkBufferDeviceAddressCreateInfoEXT *)pnext);
         }
         break;
     default:
@@ -178,7 +254,7 @@ vn_decode_VkBufferCreateInfo_self_temp(struct vn_cs_decoder *dec, VkBufferCreate
     vn_decode_uint32_t(dec, &val->queueFamilyIndexCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->queueFamilyIndexCount);
-        val->pQueueFamilyIndices = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pQueueFamilyIndices) * array_size);
+        val->pQueueFamilyIndices = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pQueueFamilyIndices), array_size);
         if (!val->pQueueFamilyIndices) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pQueueFamilyIndices, array_size);
     } else {
@@ -223,11 +299,17 @@ vn_replace_VkBufferCreateInfo_handle(VkBufferCreateInfo *val)
         case VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO:
             vn_replace_VkBufferCreateInfo_handle_self((VkBufferCreateInfo *)pnext);
             break;
+        case VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO:
+            vn_replace_VkBufferUsageFlags2CreateInfo_handle_self((VkBufferUsageFlags2CreateInfo *)pnext);
+            break;
         case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
             vn_replace_VkExternalMemoryBufferCreateInfo_handle_self((VkExternalMemoryBufferCreateInfo *)pnext);
             break;
         case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO:
             vn_replace_VkBufferOpaqueCaptureAddressCreateInfo_handle_self((VkBufferOpaqueCaptureAddressCreateInfo *)pnext);
+            break;
+        case VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_CREATE_INFO_EXT:
+            vn_replace_VkBufferDeviceAddressCreateInfoEXT_handle_self((VkBufferDeviceAddressCreateInfoEXT *)pnext);
             break;
         default:
             /* ignore unknown/unsupported struct */
@@ -255,7 +337,7 @@ vn_decode_VkBindBufferMemoryDeviceGroupInfo_self_temp(struct vn_cs_decoder *dec,
     vn_decode_uint32_t(dec, &val->deviceIndexCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->deviceIndexCount);
-        val->pDeviceIndices = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pDeviceIndices) * array_size);
+        val->pDeviceIndices = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pDeviceIndices), array_size);
         if (!val->pDeviceIndices) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pDeviceIndices, array_size);
     } else {
@@ -321,8 +403,16 @@ vn_decode_VkBindBufferMemoryInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBindBufferMemoryDeviceGroupInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
+            ((VkBindBufferMemoryDeviceGroupInfo *)pnext)->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
             vn_decode_VkBindBufferMemoryDeviceGroupInfo_self_temp(dec, (VkBindBufferMemoryDeviceGroupInfo *)pnext);
+        }
+        break;
+    case VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkBindMemoryStatus));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkBindMemoryStatus *)pnext)->pNext = vn_decode_VkBindBufferMemoryInfo_pnext_temp(dec);
+            vn_decode_VkBindMemoryStatus_self_temp(dec, (VkBindMemoryStatus *)pnext);
         }
         break;
     default:
@@ -379,6 +469,9 @@ vn_replace_VkBindBufferMemoryInfo_handle(VkBindBufferMemoryInfo *val)
             break;
         case VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_DEVICE_GROUP_INFO:
             vn_replace_VkBindBufferMemoryDeviceGroupInfo_handle_self((VkBindBufferMemoryDeviceGroupInfo *)pnext);
+            break;
+        case VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS:
+            vn_replace_VkBindMemoryStatus_handle_self((VkBindMemoryStatus *)pnext);
             break;
         default:
             /* ignore unknown/unsupported struct */
@@ -705,7 +798,7 @@ static inline void vn_decode_vkBindBufferMemory2_args_temp(struct vn_cs_decoder 
     vn_decode_uint32_t(dec, &args->bindInfoCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, args->bindInfoCount);
-        args->pBindInfos = vn_cs_decoder_alloc_temp(dec, sizeof(*args->pBindInfos) * iter_count);
+        args->pBindInfos = vn_cs_decoder_alloc_temp_array(dec, sizeof(*args->pBindInfos), iter_count);
         if (!args->pBindInfos) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkBindBufferMemoryInfo_temp(dec, &((VkBindBufferMemoryInfo *)args->pBindInfos)[i]);
@@ -889,9 +982,12 @@ static inline void vn_dispatch_vkGetBufferMemoryRequirements(struct vn_dispatch_
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetBufferMemoryRequirements(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetBufferMemoryRequirements_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetBufferMemoryRequirements_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -919,8 +1015,12 @@ static inline void vn_dispatch_vkBindBufferMemory(struct vn_dispatch_context *ct
         vn_dispatch_debug_log(ctx, "vkBindBufferMemory returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkBindBufferMemory_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkBindBufferMemory_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -948,8 +1048,12 @@ static inline void vn_dispatch_vkCreateBuffer(struct vn_dispatch_context *ctx, V
         vn_dispatch_debug_log(ctx, "vkCreateBuffer returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateBuffer_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateBuffer_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -972,9 +1076,12 @@ static inline void vn_dispatch_vkDestroyBuffer(struct vn_dispatch_context *ctx, 
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyBuffer(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyBuffer_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyBuffer_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1002,8 +1109,12 @@ static inline void vn_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *c
         vn_dispatch_debug_log(ctx, "vkBindBufferMemory2 returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkBindBufferMemory2_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkBindBufferMemory2_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1026,9 +1137,12 @@ static inline void vn_dispatch_vkGetBufferMemoryRequirements2(struct vn_dispatch
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetBufferMemoryRequirements2(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetBufferMemoryRequirements2_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetBufferMemoryRequirements2_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1051,9 +1165,12 @@ static inline void vn_dispatch_vkGetDeviceBufferMemoryRequirements(struct vn_dis
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetDeviceBufferMemoryRequirements(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetDeviceBufferMemoryRequirements_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetDeviceBufferMemoryRequirements_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1076,9 +1193,12 @@ static inline void vn_dispatch_vkGetBufferOpaqueCaptureAddress(struct vn_dispatc
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetBufferOpaqueCaptureAddress(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetBufferOpaqueCaptureAddress_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetBufferOpaqueCaptureAddress_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1101,9 +1221,12 @@ static inline void vn_dispatch_vkGetBufferDeviceAddress(struct vn_dispatch_conte
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetBufferDeviceAddress(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetBufferDeviceAddress_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetBufferDeviceAddress_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

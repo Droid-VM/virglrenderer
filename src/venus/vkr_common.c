@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+#include "util/u_debug.h"
 #include "venus-protocol/vn_protocol_renderer_info.h"
 
 #include "vkr_context.h"
@@ -69,7 +70,7 @@ static const struct vn_info_extension_table vkr_extension_table = {
    /* promoted to VK_VERSION_1_3 */
    .KHR_copy_commands2 = true,
    .KHR_dynamic_rendering = true,
-   .KHR_format_feature_flags2 = false,
+   .KHR_format_feature_flags2 = true,
    .KHR_maintenance4 = true,
    .KHR_shader_integer_dot_product = true,
    .KHR_shader_non_semantic_info = true,
@@ -91,72 +92,152 @@ static const struct vn_info_extension_table vkr_extension_table = {
    .EXT_texture_compression_astc_hdr = true,
    .EXT_tooling_info = false, /* implementation in driver */
    .EXT_ycbcr_2plane_444_formats = true,
+   /* promoted to VK_VERSION_1_4 */
+   .KHR_dynamic_rendering_local_read = true,
+   .KHR_global_priority = true,
+   .KHR_index_type_uint8 = true,
+   .KHR_line_rasterization = true,
+   .KHR_load_store_op_none = true,
+   .KHR_maintenance5 = true,
+   .KHR_maintenance6 = true,
+   .KHR_map_memory2 = false, /* implementation in driver */
+   .KHR_push_descriptor = true,
+   .KHR_shader_expect_assume = true,
+   .KHR_shader_float_controls2 = true,
+   .KHR_shader_subgroup_rotate = true,
+   .KHR_vertex_attribute_divisor = true,
+   .EXT_host_image_copy = true,
+   .EXT_pipeline_protected_access = true,
+   .EXT_pipeline_robustness = true,
    /* KHR extensions */
+   .KHR_acceleration_structure = true,
+   .KHR_calibrated_timestamps = true,
+   .KHR_compute_shader_derivatives = true,
+   .KHR_cooperative_matrix = true,
+   .KHR_deferred_host_operations = false, /* implementation in driver */
+   .KHR_depth_clamp_zero_one = true,
    .KHR_external_fence_fd = true,
    .KHR_external_memory_fd = true,
    .KHR_external_semaphore_fd = true,
-   .KHR_push_descriptor = true,
+   .KHR_fragment_shader_barycentric = true,
+   .KHR_fragment_shading_rate = true,
+   .KHR_maintenance7 = true,
+   .KHR_pipeline_library = true,
+   .KHR_ray_query = true,
+   .KHR_ray_tracing_maintenance1 = true,
+   .KHR_ray_tracing_pipeline = true,
+   .KHR_ray_tracing_position_fetch = true,
+   .KHR_robustness2 = true,
+   .KHR_shader_bfloat16 = true,
+   .KHR_shader_clock = true,
+   .KHR_shader_fma = true,
+   .KHR_shader_maximal_reconvergence = true,
+   .KHR_shader_quad_control = true,
+   .KHR_shader_relaxed_extended_instruction = true,
+   .KHR_shader_subgroup_uniform_control_flow = true,
+   .KHR_shader_untyped_pointers = true,
+   .KHR_workgroup_memory_explicit_layout = true,
    /* EXT extensions */
+   .EXT_attachment_feedback_loop_dynamic_state = true,
+   .EXT_attachment_feedback_loop_layout = true,
+   .EXT_blend_operation_advanced = true,
+   .EXT_border_color_swizzle = true,
+   .EXT_buffer_device_address = true,
    .EXT_calibrated_timestamps = true,
+   .EXT_color_write_enable = true,
    .EXT_conservative_rasterization = true,
    .EXT_conditional_rendering = true,
    .EXT_custom_border_color = true,
+   .EXT_depth_bias_control = true,
+   .EXT_depth_clamp_control = true,
+   .EXT_depth_clamp_zero_one = true,
    .EXT_depth_clip_control = true,
    .EXT_depth_clip_enable = true,
+   .EXT_depth_range_unrestricted = true,
+   .EXT_descriptor_heap = true,
+   .EXT_dynamic_rendering_unused_attachments = true,
+   .EXT_extended_dynamic_state3 = true,
+   .EXT_external_memory_acquire_unmodified = true,
    .EXT_external_memory_dma_buf = true,
+   .EXT_filter_cubic = true,
+   .EXT_fragment_shader_interlock = true,
+   .EXT_global_priority = true,
+   .EXT_global_priority_query = true,
+   .EXT_graphics_pipeline_library = true,
+   .EXT_image_2d_view_of_3d = true,
    .EXT_image_drm_format_modifier = true,
+   .EXT_image_sliced_view_of_3d = true,
    .EXT_image_view_min_lod = true,
    .EXT_index_type_uint8 = true,
+   .EXT_legacy_dithering = true,
+   .EXT_legacy_vertex_attributes = true,
    .EXT_line_rasterization = true,
+   .EXT_load_store_op_none = true,
+   .EXT_memory_budget = true,
+   .EXT_mesh_shader = true,
    .EXT_multi_draw = true,
+   .EXT_multisampled_render_to_single_sampled = true,
    .EXT_mutable_descriptor_type = true,
+   .EXT_nested_command_buffer = true,
+   .EXT_non_seamless_cube_map = true,
    .EXT_pci_bus_info = true,
+   .EXT_pipeline_library_group_handles = true,
+   .EXT_post_depth_coverage = true,
    .EXT_primitive_topology_list_restart = true,
    .EXT_primitives_generated_query = true,
    .EXT_provoking_vertex = true,
    .EXT_queue_family_foreign = true,
+   .EXT_rasterization_order_attachment_access = true,
    .EXT_robustness2 = true,
+   .EXT_sample_locations = true,
+   .EXT_shader_atomic_float = true,
+   .EXT_shader_atomic_float2 = true,
+   .EXT_shader_float8 = true,
+   .EXT_shader_image_atomic_int64 = true,
+   .EXT_shader_replicated_composites = true,
    .EXT_shader_stencil_export = true,
+   .EXT_shader_subgroup_ballot = true,
+   .EXT_shader_subgroup_vote = true,
+   .EXT_shader_uniform_buffer_unsized_array = true,
    .EXT_transform_feedback = true,
    .EXT_vertex_attribute_divisor = true,
+   .EXT_vertex_input_dynamic_state = true,
+   .EXT_ycbcr_image_arrays = true,
    /* vendor extensions */
+   .ARM_rasterization_order_attachment_access = true,
+   .GOOGLE_decorate_string = true,
+   .GOOGLE_hlsl_functionality1 = true,
+   .GOOGLE_user_type = true,
+   .IMG_filter_cubic = true,
+   .NV_compute_shader_derivatives = true,
    .VALVE_mutable_descriptor_type = true,
 };
+
+static const struct debug_named_value vkr_debug_options[] = {
+   { "validate", VKR_DEBUG_VALIDATE, "Force enabling the validation layer" },
+   { "udmabuf", VKR_DEBUG_UDMABUF, "Force udmabuf for host visible memory" },
+   { "gbm", VKR_DEBUG_GBM, "Force gbm for host visible memory" },
+   DEBUG_NAMED_VALUE_END
+};
+
+uint32_t vkr_debug_flags;
+
+DEBUG_GET_ONCE_FLAGS_OPTION(vkr_debug_flags, "VKR_DEBUG", vkr_debug_options, 0)
+
+void
+vkr_debug_init(void)
+{
+   vkr_debug_flags = debug_get_option_vkr_debug_flags();
+}
 
 void
 vkr_log(const char *fmt, ...)
 {
-   const char prefix[] = "vkr: ";
-   char line[1024];
-   size_t len;
    va_list va;
-   int ret;
-
-   len = ARRAY_SIZE(prefix) - 1;
-   memcpy(line, prefix, len);
 
    va_start(va, fmt);
-   ret = vsnprintf(line + len, ARRAY_SIZE(line) - len, fmt, va);
+   virgl_prefixed_logv("vkr", VIRGL_LOG_LEVEL_INFO, fmt, va);
    va_end(va);
-
-   if (ret < 0) {
-      const char log_error[] = "log error";
-      memcpy(line + len, log_error, ARRAY_SIZE(log_error) - 1);
-      len += ARRAY_SIZE(log_error) - 1;
-   } else if ((size_t)ret < ARRAY_SIZE(line) - len) {
-      len += ret;
-   } else {
-      len = ARRAY_SIZE(line) - 1;
-   }
-
-   /* make room for newline */
-   if (len + 1 >= ARRAY_SIZE(line))
-      len--;
-
-   line[len++] = '\n';
-   line[len] = '\0';
-
-   virgl_log("%s", line);
 }
 
 void

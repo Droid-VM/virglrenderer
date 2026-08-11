@@ -76,7 +76,7 @@ vkr_dispatch_vkResetDescriptorPool(struct vn_dispatch_context *dispatch,
    struct vkr_descriptor_pool *pool =
       vkr_descriptor_pool_from_handle(args->descriptorPool);
    if (!pool) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -99,7 +99,7 @@ vkr_dispatch_vkAllocateDescriptorSets(struct vn_dispatch_context *dispatch,
    VkResult result;
 
    if (!pool) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 
@@ -122,7 +122,7 @@ vkr_dispatch_vkFreeDescriptorSets(struct vn_dispatch_context *dispatch,
 
    /* args->pDescriptorSets is marked noautovalidity="true" */
    if (args->descriptorSetCount && !args->pDescriptorSets) {
-      vkr_cs_decoder_set_fatal(&ctx->decoder);
+      vkr_context_set_fatal(ctx);
       return;
    }
 

@@ -1206,6 +1206,16 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
    }
 }
 
+/* KGSL timestamp for a guest fence seqno. Guest seqnos start at 0, which is
+ * KGSL's "unused" timestamp value; bias every timestamp that crosses into
+ * KGSL by +1 so the first guest submit never lands on it. The mapping is
+ * applied on submit, fence-event and wait alike, so it stays consistent.
+ * (Defensive: a GPU_COMMAND EPROTO observed on 6.12/A840 turned out to be
+ * the post-fault marker, not a timestamp rejection -- but ts=0 remains a
+ * reserved value worth staying off of. Verified neutral on A830.)
+ */
+#define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
+
 static int
 kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *out_id)
 {
@@ -1841,7 +1851,7 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       .cmdsize = sizeof(struct kgsl_command_object),
       .numcmds = n,
       .context_id = req->queue_id,
-      .timestamp = req->fence, /* guest-assigned seqno (USER_GENERATED_TS) */
+      .timestamp = KGSL_GUEST_TS(req->fence), /* guest seqno (USER_GENERATED_TS) */
    };
 
    int ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
@@ -1864,12 +1874,12 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (!getenv("NCTX_NO_FENCE")) {
       if (kctx->use_wait_timestamp) {
          drm_timeline_set_last_timestamp(&kctx->timelines[ring_idx - 1],
-                                         req->queue_id, req->fence);
+                                         req->queue_id, KGSL_GUEST_TS(req->fence));
       } else {
          struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
          struct kgsl_timestamp_event event = {
             .type = KGSL_TIMESTAMP_EVENT_FENCE,
-            .timestamp = req->fence,
+            .timestamp = KGSL_GUEST_TS(req->fence),
             .context_id = req->queue_id,
             .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
             .len = sizeof(fence_priv),
@@ -1921,7 +1931,7 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     */
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
-      .timestamp = req->fence,
+      .timestamp = KGSL_GUEST_TS(req->fence),
       .timeout = 0,
    };
 

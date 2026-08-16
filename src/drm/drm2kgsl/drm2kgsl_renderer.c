@@ -2532,7 +2532,7 @@ drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *deb
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG context-create pid=%d", getpid());
 
-   drm_log("");
+   drm_dbg("");
 
    struct kgsl_context *kctx =
       calloc(1, sizeof(*kctx) + g_nr_timelines * sizeof(kctx->timelines[0]));

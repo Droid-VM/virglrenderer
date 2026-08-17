@@ -12,8 +12,8 @@ relicense them either — a patched upstream file is still an upstream file.
 
 ## Material written for DroidVM
 
-Files carrying `SPDX-License-Identifier: GPL-3.0-or-later` are DroidVM work
-and are licensed under the GNU GPL, version 3 or later, **with the
+Files carrying `SPDX-License-Identifier: GPL-2.0-or-later` are DroidVM work
+and are licensed under the GNU GPL, version 2 or later, **with the
 additional permissions in `ADDITIONAL-PERMISSIONS`**.
 
 Those permissions exist so this work can go upstream. They let anyone

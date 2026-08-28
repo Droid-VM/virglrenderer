@@ -387,8 +387,35 @@ START_TEST(virgl_test_get_resource_info)
   ck_assert_int_eq(res.height, info.height);
   ck_assert_int_eq(res.depth, info.depth);
   ck_assert_int_eq(res.flags, info.flags);
+  ck_assert_int_eq(info.fd, -1);
   virgl_renderer_ctx_detach_resource(1, res.handle);
 
+  virgl_renderer_resource_unref(1);
+}
+END_TEST
+
+START_TEST(virgl_test_get_resource_info_ext)
+{
+  int ret;
+  struct virgl_renderer_resource_create_args res;
+  struct virgl_renderer_resource_info_ext info = { 0 };
+
+  testvirgl_init_simple_2d_resource(&res, 1);
+  ret = virgl_renderer_resource_create(&res, NULL, 0);
+  ck_assert_int_eq(ret, 0);
+
+  virgl_renderer_ctx_attach_resource(1, res.handle);
+
+  ret = virgl_renderer_resource_get_info_ext(res.handle, &info);
+  ck_assert_int_eq(ret, 0);
+  ck_assert_int_eq(info.version, VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION);
+  ck_assert_int_eq(info.base.handle, res.handle);
+  ck_assert_int_eq(info.base.width, res.width);
+  ck_assert_int_eq(info.base.height, res.height);
+  ck_assert_int_eq(info.base.fd, -1);
+  ck_assert(info.d3d_tex2d == NULL);
+
+  virgl_renderer_ctx_detach_resource(1, res.handle);
   virgl_renderer_resource_unref(1);
 }
 END_TEST
@@ -533,6 +560,7 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_init_egl_create_ctx_create_unbind_illegal_ctx);
 
   tcase_add_test(tc_core, virgl_test_get_resource_info);
+  tcase_add_test(tc_core, virgl_test_get_resource_info_ext);
   tcase_add_test(tc_core, virgl_test_get_resource_info_no_info);
   tcase_add_test(tc_core, virgl_test_get_resource_info_no_res);
   tcase_add_test(tc_core, virgl_init_egl_create_ctx_create_attach_res);

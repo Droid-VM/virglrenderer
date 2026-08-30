@@ -6,18 +6,41 @@
 #include "config.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <xf86drm.h>
 
 #include "drm_hw.h"
 #include "drm_renderer.h"
+#include "drm_util.h"
+
+#ifdef ENABLE_DRM2KGSL
+#  include "drm2kgsl/drm2kgsl_renderer.h"
+#endif
 
 #ifdef ENABLE_DRM_MSM
 #  include "msm/msm_renderer.h"
+#endif
+
+#ifdef ENABLE_DRM_AMDGPU
+#  include "amdgpu/amdgpu_renderer.h"
+#endif
+
+#ifdef ENABLE_DRM_ASAHI
+#  include "asahi/asahi_renderer.h"
+#endif
+
+#ifdef ENABLE_DRM_PANFROST
+#  include "panfrost/panfrost_renderer.h"
+#endif
+
+#ifdef ENABLE_DRM_I915
+#  include "i915/i915_renderer.h"
 #endif
 
 static struct virgl_renderer_capset_drm capset;
@@ -25,15 +48,63 @@ static struct virgl_renderer_capset_drm capset;
 static const struct backend {
    uint32_t context_type;
    const char *name;
+   /* KGSL is a plain character device, not a DRM node: it is opened by path
+    * and probed without drmGetVersion().
+    */
+   bool char_device;
+   const char *node;
    int (*probe)(int fd, struct virgl_renderer_capset_drm *capset);
-   struct virgl_context *(*create)(int fd);
+   struct virgl_context *(*create)(int fd, size_t debug_len, const char *debug_name);
 } backends[] = {
+#ifdef ENABLE_DRM2KGSL
+   {
+      /* Guest speaks the msm protocol; host bridges it to KGSL. */
+      .context_type = VIRTGPU_DRM_CONTEXT_MSM,
+      .name = "drm2kgsl",
+      .char_device = true,
+      .node = KGSL_DEVICE_NODE,
+      .probe = drm2kgsl_renderer_probe,
+      .create = drm2kgsl_renderer_create,
+   },
+#endif
 #ifdef ENABLE_DRM_MSM
    {
       .context_type = VIRTGPU_DRM_CONTEXT_MSM,
       .name = "msm",
       .probe = msm_renderer_probe,
       .create = msm_renderer_create,
+   },
+#endif
+#ifdef ENABLE_DRM_AMDGPU
+   {
+      .context_type = VIRTGPU_DRM_CONTEXT_AMDGPU,
+      .name = "amdgpu",
+      .probe = amdgpu_renderer_probe,
+      .create = amdgpu_renderer_create,
+   },
+#endif
+#ifdef ENABLE_DRM_ASAHI
+   {
+      .context_type = VIRTGPU_DRM_CONTEXT_ASAHI,
+      .name = "asahi",
+      .probe = asahi_renderer_probe,
+      .create = asahi_renderer_create,
+   },
+#endif
+#ifdef ENABLE_DRM_PANFROST
+   {
+      .context_type = VIRTGPU_DRM_CONTEXT_PANFROST,
+      .name = "panfrost",
+      .probe = panfrost_renderer_probe,
+      .create = panfrost_renderer_create,
+   },
+#endif
+#ifdef ENABLE_DRM_I915
+   {
+      .context_type = VIRTGPU_DRM_CONTEXT_I915,
+      .name = "i915",
+      .probe = i915_renderer_probe,
+      .create = i915_renderer_create,
    },
 #endif
 };
@@ -44,6 +115,27 @@ drm_renderer_init(int drm_fd)
    for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
       const struct backend *b = &backends[i];
       int fd;
+
+      /* Character-device backends (drm2kgsl) have no DRM version node; open by
+       * path and let the backend fill the capset from its own properties.
+       */
+      if (b->char_device) {
+         if (drm_fd != -1)
+            continue;
+
+         fd = open(b->node, O_RDWR | O_CLOEXEC);
+         if (fd < 0)
+            continue;
+
+         capset.context_type = b->context_type;
+
+         int ret = b->probe(fd, &capset);
+         if (ret)
+            memset(&capset, 0, sizeof(capset));
+
+         close(fd);
+         return ret;
+      }
 
       if (drm_fd != -1) {
          fd = drm_fd;
@@ -106,10 +198,7 @@ size_t
 drm_renderer_capset(void *_c)
 {
    struct virgl_renderer_capset_drm *c = _c;
-   drm_log("c=%p", c);
-
-   if (!capset.context_type)
-      return 0;
+   drm_log("c=%p", _c);
 
    if (c)
       *c = capset;
@@ -118,7 +207,7 @@ drm_renderer_capset(void *_c)
 }
 
 struct virgl_context *
-drm_renderer_create(UNUSED size_t debug_len, UNUSED const char *debug_name)
+drm_renderer_create(size_t debug_len, const char *debug_name, int drm_fd)
 {
    for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
       const struct backend *b = &backends[i];
@@ -126,11 +215,30 @@ drm_renderer_create(UNUSED size_t debug_len, UNUSED const char *debug_name)
       if (b->context_type != capset.context_type)
          continue;
 
-      int fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
+      if (b->char_device) {
+         int fd = open(b->node, O_RDWR | O_CLOEXEC);
+         if (fd < 0)
+            return NULL;
+         return b->create(fd, debug_len, debug_name);
+      }
+
+      int fd = drm_fd;
+      if (fd < 0)
+         fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
       if (fd < 0)
          return NULL;
 
-      return b->create(fd);
+#ifdef DRM_IOCTL_SET_CLIENT_NAME
+      if (debug_len && debug_name) {
+         struct drm_set_client_name n = {
+            .name_len = debug_len,
+            .name = (uint64_t) debug_name
+         };
+         drmIoctl(fd, DRM_IOCTL_SET_CLIENT_NAME, &n);
+      }
+#endif
+
+      return b->create(fd, debug_len, debug_name);
    }
 
    return NULL;

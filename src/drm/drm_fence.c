@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <string.h>
 
 #include "virgl_context.h"
+#include "virgl_fence.h"
 #include "virgl_util.h"
 
 #include "util/os_file.h"
@@ -20,18 +23,43 @@
  * Tracking for a single fence on a timeline
  */
 struct drm_fence {
-   int fd;
+   int fd;               /* sync_file fd, or -1 for the by_timestamp variant */
    uint32_t flags;
    uint64_t fence_id;
+   /* by_timestamp variant (fd < 0): wait on (ctx_id, timestamp) via the
+    * timeline's wait_timestamp hook instead of poll()ing an fd. */
+   bool by_timestamp;
+   uint32_t ctx_id;
+   uint32_t timestamp;
    struct list_head node;
 };
 
 static void
 drm_fence_destroy(struct drm_fence *fence)
 {
-   close(fence->fd);
+   if (fence->fd >= 0)
+      close(fence->fd);
    list_del(&fence->node);
    free(fence);
+}
+
+static struct drm_fence *
+drm_fence_create_timestamp(uint32_t ctx_id, uint32_t timestamp, uint32_t flags,
+                           uint64_t fence_id)
+{
+   struct drm_fence *fence = calloc(1, sizeof(*fence));
+
+   if (!fence)
+      return NULL;
+
+   fence->fd = -1;
+   fence->by_timestamp = true;
+   fence->ctx_id = ctx_id;
+   fence->timestamp = timestamp;
+   fence->flags = flags;
+   fence->fence_id = fence_id;
+
+   return fence;
 }
 
 static struct drm_fence *
@@ -66,7 +94,7 @@ thread_sync(void *arg)
    while (!timeline->stop_sync_thread) {
       if (list_is_empty(&timeline->pending_fences)) {
          if (cnd_wait(&timeline->fence_cond, &timeline->fence_mutex))
-            drm_log("error waiting on fence condition");
+            drm_err("error waiting on fence condition");
          continue;
       }
 
@@ -75,17 +103,31 @@ thread_sync(void *arg)
       int ret;
 
       mtx_unlock(&timeline->fence_mutex);
-      ret = poll(&(struct pollfd){fence->fd, POLLIN}, 1, -1); /* wait forever */
+      if (fence->by_timestamp) {
+         /* Block until the GPU retires the timestamp (no sync_file fd). A NULL
+          * hook degrades to signal-immediately. The hook uses a bounded chunk
+          * timeout so shutdown stays responsive; ETIMEDOUT means still working. */
+         ret = timeline->wait_timestamp
+                  ? timeline->wait_timestamp(timeline->wait_timestamp_arg,
+                                             fence->ctx_id, fence->timestamp)
+                  : 0;
+      } else {
+         ret = poll(&(struct pollfd){fence->fd, POLLIN}, 1, -1); /* wait forever */
+      }
       mtx_lock(&timeline->fence_mutex);
 
-      if (ret == 1) {
-         drm_dbg("fence signaled: %p (%" PRIu64 ")", fence, fence->fence_id);
-         timeline->vctx->fence_retire(timeline->vctx, timeline->ring_idx,
-                                      fence->fence_id);
-         write_eventfd(timeline->eventfd, 1);
+      if (fence->by_timestamp) {
+         if (ret == ETIMEDOUT && !timeline->stop_sync_thread)
+            continue; /* GPU still working -- keep pending and re-wait */
+         drm_dbg("fence signaled: %p (%" PRIu64 ")", (void*)fence, fence->fence_id);
+         timeline->fence_retire(timeline->vctx, timeline->ring_idx, fence->fence_id);
+         drm_fence_destroy(fence);
+      } else if (ret == 1) {
+         drm_dbg("fence signaled: %p (%" PRIu64 ")", (void*)fence, fence->fence_id);
+         timeline->fence_retire(timeline->vctx, timeline->ring_idx, fence->fence_id);
          drm_fence_destroy(fence);
       } else if (ret != 0) {
-         drm_log("poll failed: %s", strerror(errno));
+         drm_err("poll failed: %s", strerror(errno));
       }
    }
    mtx_unlock(&timeline->fence_mutex);
@@ -95,12 +137,13 @@ thread_sync(void *arg)
 
 void
 drm_timeline_init(struct drm_timeline *timeline, struct virgl_context *vctx,
-                  const char *name, int eventfd, int ring_idx)
+                  const char *name, int ring_idx,
+                  virgl_context_fence_retire fence_retire)
 {
    timeline->vctx = vctx;
    timeline->name = name;
-   timeline->eventfd = eventfd;
    timeline->ring_idx = ring_idx;
+   timeline->fence_retire = fence_retire;
 
    timeline->last_fence_fd = -1;
 
@@ -140,16 +183,33 @@ int
 drm_timeline_submit_fence(struct drm_timeline *timeline, uint32_t flags,
                           uint64_t fence_id)
 {
-   if (timeline->last_fence_fd == -1)
+   struct drm_fence *fence;
+
+   if (timeline->last_fence_fd != -1) {
+      fence = drm_fence_create(timeline->last_fence_fd, flags, fence_id);
+      if (!fence)
+         return -ENOMEM;
+
+      drm_dbg("fence: %p (%" PRIu64 ")", (void*)fence, fence->fence_id);
+      virgl_fence_set_fd(fence_id, fence->fd);
+
+      close(timeline->last_fence_fd);
+      timeline->last_fence_fd = -1;
+   } else if (timeline->last_ts_valid) {
+      fence = drm_fence_create_timestamp(timeline->last_ctx_id,
+                                         timeline->last_timestamp, flags,
+                                         fence_id);
+      if (!fence)
+         return -ENOMEM;
+
+      drm_dbg("fence: %p (%" PRIu64 ") ts ctx=%u ts=%u", (void*)fence,
+              fence->fence_id, fence->ctx_id, fence->timestamp);
+
+      /* No sync_file fd to export -- the wait is by (ctx, timestamp). */
+      timeline->last_ts_valid = false;
+   } else {
       return -EINVAL;
-
-   struct drm_fence *fence =
-      drm_fence_create(timeline->last_fence_fd, flags, fence_id);
-
-   if (!fence)
-      return -ENOMEM;
-
-   drm_dbg("fence: %p (%" PRIu64 ")", fence, fence->fence_id);
+   }
 
    mtx_lock(&timeline->fence_mutex);
    list_addtail(&fence->node, &timeline->pending_fences);
@@ -166,4 +226,28 @@ drm_timeline_set_last_fence_fd(struct drm_timeline *timeline, int fd)
    if (timeline->last_fence_fd != -1)
       close(timeline->last_fence_fd);
    timeline->last_fence_fd = fd;
+}
+
+void
+drm_timeline_set_wait_timestamp_fn(
+   struct drm_timeline *timeline,
+   int (*fn)(void *arg, uint32_t ctx_id, uint32_t timestamp), void *arg)
+{
+   timeline->wait_timestamp = fn;
+   timeline->wait_timestamp_arg = arg;
+}
+
+void
+drm_timeline_set_last_timestamp(struct drm_timeline *timeline, uint32_t ctx_id,
+                                uint32_t timestamp)
+{
+   timeline->last_ctx_id = ctx_id;
+   timeline->last_timestamp = timestamp;
+   timeline->last_ts_valid = true;
+}
+
+bool
+drm_timeline_has_pending(const struct drm_timeline *timeline)
+{
+   return timeline->last_fence_fd != -1 || timeline->last_ts_valid;
 }

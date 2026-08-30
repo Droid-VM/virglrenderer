@@ -46,6 +46,10 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
+   /* Optional persistent host mapping supplied by the context. The generic resource_map path
+    * returns this pointer directly and never munmaps it. */
+   void *map_ptr;
+
    /* Offset of map_ptr in the fd returned by get_blob(). */
    uint64_t fd_offset;
 
@@ -106,6 +110,16 @@ struct virgl_context {
                    uint64_t blob_size,
                    uint32_t blob_flags,
                    struct virgl_context_blob *blob);
+
+   /*
+    * Optional.  Hand the context a dma-buf the GUEST allocated, covering the pages of the blob
+    * whose get_blob() call comes next.  Takes ownership of fd.
+    *
+    * This exists because get_blob() has no way to receive it: with guest-allocated memory the
+    * VMM is the only party that can turn the blob's guest iovecs into a dma-buf (it alone holds
+    * the guest memfd), and it must do so before the context is asked to produce the blob.
+    */
+   int (*set_guest_blob_fd)(struct virgl_context *ctx, uint64_t blob_id, int fd);
 
    int (*submit_cmd)(struct virgl_context *ctx,
                      const void *buffer,

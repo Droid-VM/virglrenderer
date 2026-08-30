@@ -381,6 +381,16 @@ VIRGL_EXPORT int virgl_renderer_resource_map(uint32_t res_handle, void **map, ui
 
 VIRGL_EXPORT int virgl_renderer_resource_unmap(uint32_t res_handle);
 
+/* Query a resource's host mapping without taking it; -EINVAL when it has none. */
+VIRGL_EXPORT int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, void **out_map,
+                                                    uint64_t *out_size);
+
+/* Hand a context the dma-buf covering a guest-allocated blob's pages, before the
+ * virgl_renderer_resource_create_blob() that produces it. Takes ownership of fd on success.
+ * -ENOTSUP if the context does not implement guest-allocated blobs. */
+VIRGL_EXPORT int virgl_renderer_resource_set_guest_blob_fd(uint32_t ctx_id, uint64_t blob_id,
+                                                           int fd);
+
 #define VIRGL_RENDERER_MAP_CACHE_MASK      0x0f
 #define VIRGL_RENDERER_MAP_CACHE_NONE      0x00
 #define VIRGL_RENDERER_MAP_CACHE_CACHED    0x01

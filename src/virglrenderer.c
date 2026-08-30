@@ -51,6 +51,7 @@
 #include "virglrenderer_hw.h"
 
 #include "virgl_context.h"
+#include "virgl_fence.h"
 #include "virgl_resource.h"
 #include "virgl_util.h"
 
@@ -67,6 +68,7 @@ struct global_state {
    bool vkr_initialized;
    bool proxy_initialized;
    bool external_winsys_initialized;
+   bool fence_initialized;
 };
 
 static struct global_state state;
@@ -239,7 +241,8 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
          return EINVAL;
       break;
    case VIRGL_RENDERER_CAPSET_DRM:
-      ctx = drm_renderer_create(nlen, name);
+      /* -1: use the device picked at drm_renderer_init time (KGSL host: no /dev/dri). */
+      ctx = drm_renderer_create(nlen, name, -1);
       break;
    default:
       return EINVAL;
@@ -290,6 +293,73 @@ int virgl_renderer_submit_cmd(void *buffer,
    return ctx->submit_cmd(ctx, buffer, ndw * sizeof(uint32_t));
 }
 
+/* CPU-copy fallback for transfers on fd-backed blob resources that have no
+ * vrend pipe resource (e.g. DRM native-context BOs used as KMS scanout).
+ * crosvm's display readback (the VNC / screenshot fallback when the display
+ * backend cannot import a dmabuf) issues transfer_read with ctx_id 0, which
+ * previously returned EINVAL for such blobs, leaving the display black.
+ *
+ * The blob carries no format/pitch metadata, so interpret the transfer as a
+ * linear 32bpp image with a host pitch equal to the caller's stride (crosvm
+ * passes its framebuffer stride; scanout BOs are linear and 32bpp on this
+ * stack, so the pitches match for the full-width flush this path serves).
+ */
+static int
+virgl_resource_transfer_blob(struct virgl_resource *res,
+                             const struct vrend_transfer_info *info,
+                             int transfer_mode)
+{
+   const struct pipe_box *box = info->box;
+   const uint32_t bpp = 4;
+   void *map = res->mapped;
+   bool tmp_map = false;
+   int ret = 0;
+
+   if (res->fd < 0 ||
+       (res->fd_type != VIRGL_RESOURCE_FD_SHM &&
+        res->fd_type != VIRGL_RESOURCE_FD_DMABUF))
+      return EINVAL;
+   if (!box || box->width < 0 || box->height < 0 || !res->map_size)
+      return EINVAL;
+
+   if (!map) {
+      /* Map at fd_offset, not 0. A resource's fd is not necessarily a dedicated object: the
+       * drm2kgsl arena hands out dups of one big memfd (a crosvm Drm2KgslPool is a slice of the guest
+       * RAM memfd) and expresses the resource's position with fd_offset. Mapping from 0 reads
+       * whatever happens to live at the start of that fd, and SIGBUSes outright once
+       * fd_offset + map_size passes the end of it. */
+      map = mmap(NULL, res->map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 res->fd, res->fd_offset);
+      if (map == MAP_FAILED)
+         return EINVAL;
+      tmp_map = true;
+   }
+
+   const uint32_t row_len = (uint32_t)box->width * bpp;
+   const uint32_t stride = info->stride ? info->stride : row_len;
+
+   for (int h = 0; h < box->height; h++) {
+      const uint64_t iov_off = info->offset + (uint64_t)h * stride;
+      const uint64_t res_off =
+         ((uint64_t)box->y + h) * stride + (uint64_t)box->x * bpp;
+
+      if (res_off + row_len > res->map_size) {
+         ret = EINVAL;
+         break;
+      }
+      if (transfer_mode == VIRGL_TRANSFER_FROM_HOST)
+         vrend_write_to_iovec(info->iovec, info->iovec_cnt, iov_off,
+                              (char *)map + res_off, row_len);
+      else
+         vrend_read_from_iovec(info->iovec, info->iovec_cnt, iov_off,
+                               (char *)map + res_off, row_len);
+   }
+
+   if (tmp_map)
+      munmap(map, res->map_size);
+   return ret;
+}
+
 int virgl_renderer_transfer_write_iov(uint32_t handle,
                                       uint32_t ctx_id,
                                       int level,
@@ -326,7 +396,8 @@ int virgl_renderer_transfer_write_iov(uint32_t handle,
                               VIRGL_TRANSFER_TO_HOST);
    } else {
       if (!res->pipe_resource)
-         return EINVAL;
+         return virgl_resource_transfer_blob(res, &transfer_info,
+                                             VIRGL_TRANSFER_TO_HOST);
 
       return vrend_renderer_transfer_pipe(res->pipe_resource, &transfer_info,
                                           VIRGL_TRANSFER_TO_HOST);
@@ -365,7 +436,8 @@ int virgl_renderer_transfer_read_iov(uint32_t handle, uint32_t ctx_id,
                               VIRGL_TRANSFER_FROM_HOST);
    } else {
       if (!res->pipe_resource)
-         return EINVAL;
+         return virgl_resource_transfer_blob(res, &transfer_info,
+                                             VIRGL_TRANSFER_FROM_HOST);
 
       return vrend_renderer_transfer_pipe(res->pipe_resource, &transfer_info,
                                           VIRGL_TRANSFER_FROM_HOST);
@@ -703,6 +775,9 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
    if (state.vrend_initialized)
       vrend_renderer_fini();
 
+   if (state.fence_initialized)
+      virgl_fence_table_cleanup();
+
    if (state.winsys_initialized || state.external_winsys_initialized)
       vrend_winsys_cleanup();
 
@@ -854,6 +929,19 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
          drm_fd = cbs->get_drm_fd(cookie);
 
       drm_renderer_init(drm_fd);
+   }
+
+   /* Upstream initializes the fence table here; the vendoring dropped the
+    * call, leaving virgl_fence_table NULL — the first drm-context submit
+    * that exports a fence (drm_timeline_submit_fence -> virgl_fence_set_fd)
+    * then dereferenced NULL and killed crosvm right after GEM_SUBMIT. */
+   if (!state.fence_initialized) {
+      ret = virgl_fence_table_init();
+      if (ret) {
+         virgl_error("failed to initialize fence table\n");
+         goto fail;
+      }
+      state.fence_initialized = true;
    }
 
    return 0;
@@ -1035,7 +1123,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    TRACE_FUNC();
    struct virgl_resource *res;
    struct virgl_context *ctx;
-   struct virgl_context_blob blob;
+   struct virgl_context_blob blob = { 0 };
    bool has_host_storage;
    bool has_guest_storage;
    int ret;
@@ -1124,6 +1212,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
 
    res->map_info = blob.map_info;
    res->map_size = args->size;
+   res->map_ptr = blob.map_ptr;
    res->fd_offset = blob.fd_offset;
 
    return 0;
@@ -1139,7 +1228,10 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
    if (!res || res->mapped)
       return -EINVAL;
 
-   if (res->pipe_resource) {
+   if (res->map_ptr) {
+      map = res->map_ptr;
+      map_size = res->map_size;
+   } else if (res->pipe_resource) {
       ret = vrend_renderer_resource_map(res->pipe_resource, &map, &map_size);
       if (!ret)
          res->map_size = map_size;
@@ -1167,6 +1259,45 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
    return ret;
 }
 
+/* Read a resource's host mapping WITHOUT taking it.
+ *
+ * virgl_renderer_resource_map() is not a query: it refuses a resource that is already mapped,
+ * it records res->mapped, and for a dmabuf without a map_ptr it mmaps -- so its partner unmap
+ * munmaps. Using that pair to ask "where does this resource live" mutates renderer state and,
+ * on a resource the renderer is still using, pulls the mapping out from under it (SIGBUS in
+ * vrend_write_to_iovec). Resources that carry a map_ptr -- the drm2kgsl arena BOs -- can answer the
+ * question for free, so answer only those and leave everything else to say "I do not know".
+ */
+int virgl_renderer_resource_get_map_ptr(uint32_t res_handle, void **out_map, uint64_t *out_size)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->map_ptr)
+      return -EINVAL;
+   *out_map = res->map_ptr;
+   *out_size = res->map_size;
+   return 0;
+}
+
+/* Hand a context a dma-buf the GUEST allocated, for the blob it is about to be asked to
+ * produce.  Takes ownership of fd on success; on failure the caller still owns it.
+ *
+ * Guest-allocated blob memory has an ordering problem no existing entry point solves: only the
+ * VMM can turn the blob's guest iovecs into a dma-buf, and the context needs that dma-buf inside
+ * get_blob(), whose signature carries no room for it. So the VMM parks it here first.
+ */
+int virgl_renderer_resource_set_guest_blob_fd(uint32_t ctx_id, uint64_t blob_id, int fd)
+{
+   TRACE_FUNC();
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+
+   if (!ctx)
+      return -EINVAL;
+   if (!ctx->set_guest_blob_fd)
+      return -ENOTSUP;
+
+   return ctx->set_guest_blob_fd(ctx, blob_id, fd);
+}
+
 int virgl_renderer_resource_unmap(uint32_t res_handle)
 {
    TRACE_FUNC();
@@ -1175,7 +1306,9 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
    if (!res || !res->mapped)
       return -EINVAL;
 
-   if (res->pipe_resource) {
+   if (res->map_ptr) {
+      ret = 0;
+   } else if (res->pipe_resource) {
       ret = vrend_renderer_resource_unmap(res->pipe_resource);
    } else {
       switch (res->fd_type) {

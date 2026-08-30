@@ -19,7 +19,6 @@ BreakBeforeBraces: Custom
 ColumnLimit: 90
 ContinuationIndentWidth: 3
 Cpp11BracedListStyle: false
-Cpp11BracedListStyle: true
 BreakStringLiterals: false
 ForEachMacros:
   - BITSET_FOREACH_SET

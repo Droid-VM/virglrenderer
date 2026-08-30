@@ -6,6 +6,11 @@
 #ifndef MSM_PROTO_H_
 #define MSM_PROTO_H_
 
+#include "drm_util.h"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
 /**
  * General protocol notes:
  * 1) Request (req) messages are generally sent over DRM_VIRTGPU_EXECBUFFER
@@ -17,37 +22,15 @@
  * 3) Host and guest could have different pointer sizes, ie. 32b guest and
  *    64b host, or visa versa, so similar to kernel uabi, req and rsp msgs
  *    should be explicitly padded to avoid 32b vs 64b struct padding issues
+ * 4) Messages must only require 4 byte alignment. Structs with 64-bit ints
+ *    need to be marked with DRM_ALIGN_4 to avoid alignment problems.
  */
 
 /**
  * Defines the layout of shmem buffer used for host->guest communication.
  */
 struct msm_shmem {
-   /**
-    * The sequence # of last cmd processed by the host
-    */
-   uint32_t seqno;
-
-   /**
-    * Offset to the start of rsp memory region in the shmem buffer.  This
-    * is set by the host when the shmem buffer is allocated, to allow for
-    * extending the shmem buffer with new fields.  The size of the rsp
-    * memory region is the size of the shmem buffer (controlled by the
-    * guest) minus rsp_mem_offset.
-    *
-    * The guest should use the msm_shmem_has_field() macro to determine
-    * if the host supports a given field, ie. to handle compatibility of
-    * newer guest vs older host.
-    *
-    * Making the guest userspace responsible for backwards compatibility
-    * simplifies the host VMM.
-    */
-   uint32_t rsp_mem_offset;
-
-#define msm_shmem_has_field(shmem, field) ({                         \
-      struct msm_shmem *_shmem = (shmem);                            \
-      (_shmem->rsp_mem_offset > offsetof(struct msm_shmem, field));  \
-   })
+   struct vdrm_shmem base;
 
    /**
     * Counter that is incremented on asynchronous errors, like SUBMIT
@@ -55,13 +38,13 @@ struct msm_shmem {
     * lost.
     */
    uint32_t async_error;
-};
 
-#define DEFINE_CAST(parent, child)                                             \
-   static inline struct child *to_##child(const struct parent *x)              \
-   {                                                                           \
-      return (struct child *)x;                                                \
-   }
+   /**
+    * Counter that is incremented on global fault (see MSM_PARAM_FAULTS)
+    */
+   uint32_t global_faults;
+};
+DEFINE_CAST(vdrm_shmem, msm_shmem)
 
 /*
  * Possible cmd types for "command stream", ie. payload of EXECBUF ioctl:
@@ -81,33 +64,23 @@ enum msm_ccmd {
    MSM_CCMD_LAST,
 };
 
-struct msm_ccmd_req {
-   uint32_t cmd;
-   uint32_t len;
-   uint32_t seqno;
-
-   /* Offset into shmem ctrl buffer to write response.  The host ensures
-    * that it doesn't write outside the bounds of the ctrl buffer, but
-    * otherwise it is up to the guest to manage allocation of where responses
-    * should be written in the ctrl buf.
-    */
-   uint32_t rsp_off;
-};
-
-struct msm_ccmd_rsp {
-   uint32_t len;
-};
-
-#define MSM_CCMD(_cmd, _len) (struct msm_ccmd_req){ \
+#ifdef __cplusplus
+#define MSM_CCMD(_cmd, _len) {                      \
        .cmd = MSM_CCMD_##_cmd,                      \
        .len = (_len),                               \
    }
+#else
+#define MSM_CCMD(_cmd, _len) (struct vdrm_ccmd_req){ \
+       .cmd = MSM_CCMD_##_cmd,                      \
+       .len = (_len),                               \
+   }
+#endif
 
 /*
  * MSM_CCMD_NOP
  */
 struct msm_ccmd_nop_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 };
 
 /*
@@ -116,15 +89,15 @@ struct msm_ccmd_nop_req {
  * Forward simple/flat IOC_RW or IOC_W ioctls.  Limited ioctls are supported.
  */
 struct msm_ccmd_ioctl_simple_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t cmd;
    uint8_t payload[];
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_ioctl_simple_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_ioctl_simple_req)
 
 struct msm_ccmd_ioctl_simple_rsp {
-   struct msm_ccmd_rsp hdr;
+   struct vdrm_ccmd_rsp hdr;
 
    /* ioctl return value, interrupted syscalls are handled on the host without
     * returning to the guest.
@@ -148,14 +121,49 @@ struct msm_ccmd_ioctl_simple_rsp {
  * No response.
  */
 struct msm_ccmd_gem_new_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint64_t iova;
    uint64_t size;
    uint32_t flags;
    uint32_t blob_id;
-};
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_new_req)
+} DRM_ALIGN_4;
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_new_req)
+
+/*
+ * Arena v2 extension (DroidVM drm2kgsl native-context):
+ *
+ *  - GEM_NEW with iova == 0 "blesses" the arena: the host allocates the
+ *    physical page pool (req->size bytes) once; the guest then creates and
+ *    maps a single virtio blob for it (the only GuestAccept of the session).
+ *  - GEM_NEW whose hdr.len extends past the base struct carries a run list
+ *    describing scattered arena backing for this BO:
+ *       uint32_t nr_runs; uint32_t pad; struct msm_gem_new_run runs[nr_runs];
+ *    The host stitches the runs to the (contiguous) guest iova with one
+ *    multi-entry BIND_RANGES; the guest stitches the same runs into a linear
+ *    CPU mapping with its own stage-1 page tables.  No per-BO backing, share
+ *    or accept.
+ *  - GEM_NEW without a run list keeps the full legacy per-BO path (SCANOUT /
+ *    export BOs, or a guest that predates the arena).
+ */
+struct msm_gem_new_run {
+   uint64_t arena_off;
+   uint64_t len;
+} DRM_ALIGN_4;
+
+/*
+ * GUEST-ALLOC (DroidVM): the guest already owns this BO's pages.
+ *
+ * Set in msm_ccmd_gem_new_req::flags to say "do not allocate anything -- the pages arrive
+ * separately, as the dma-buf the VMM builds from the blob's guest iovecs".  The host records
+ * the iova and flags when this ccmd runs, and completes the object when the matching
+ * RESOURCE_CREATE_BLOB hands it that dma-buf, which is the reverse of the host-allocating path
+ * where the object exists in full by the time the blob is created.
+ *
+ * The bit is deliberately high: msm's own GEM flags are the low DRM_MSM_BO_* bits and the host
+ * masks this one off before anything sees it as a KGSL flag.
+ */
+#define MSM_BO_GUEST_ALLOC 0x80000000
 
 /*
  * MSM_CCMD_GEM_SET_IOVA
@@ -164,12 +172,13 @@ DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_new_req)
  * (by setting it to zero) when a BO is freed.
  */
 struct msm_ccmd_gem_set_iova_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint64_t iova;
    uint32_t res_id;
-};
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_set_iova_req)
+   uint32_t __pad;
+} DRM_ALIGN_4;
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_set_iova_req)
 
 /*
  * MSM_CCMD_GEM_CPU_PREP
@@ -181,15 +190,15 @@ DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_set_iova_req)
  * should poll if needed.
  */
 struct msm_ccmd_gem_cpu_prep_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t res_id;
    uint32_t op;
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_cpu_prep_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_cpu_prep_req)
 
 struct msm_ccmd_gem_cpu_prep_rsp {
-   struct msm_ccmd_rsp hdr;
+   struct vdrm_ccmd_rsp hdr;
 
    int32_t ret;
 };
@@ -202,7 +211,7 @@ struct msm_ccmd_gem_cpu_prep_rsp {
  * No response.
  */
 struct msm_ccmd_gem_set_name_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t res_id;
    /* Note: packet size aligned to 4 bytes, so the string name may
@@ -211,7 +220,7 @@ struct msm_ccmd_gem_set_name_req {
    uint32_t len;
    uint8_t  payload[];
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_set_name_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_set_name_req)
 
 /*
  * MSM_CCMD_GEM_SUBMIT
@@ -229,7 +238,7 @@ DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_set_name_req)
  * No response.
  */
 struct msm_ccmd_gem_submit_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t flags;
    uint32_t queue_id;
@@ -253,7 +262,7 @@ struct msm_ccmd_gem_submit_req {
     */
    int8_t   payload[];
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_submit_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_submit_req)
 
 /*
  * MSM_CCMD_GEM_UPLOAD
@@ -263,7 +272,7 @@ DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_submit_req)
  * No response.
  */
 struct msm_ccmd_gem_upload_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t res_id;
    uint32_t pad;
@@ -275,7 +284,7 @@ struct msm_ccmd_gem_upload_req {
    uint32_t len;
    uint8_t  payload[];
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_upload_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_gem_upload_req)
 
 /*
  * MSM_CCMD_SUBMITQUEUE_QUERY
@@ -283,16 +292,16 @@ DEFINE_CAST(msm_ccmd_req, msm_ccmd_gem_upload_req)
  * Maps to DRM_MSM_SUBMITQUEUE_QUERY
  */
 struct msm_ccmd_submitqueue_query_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t queue_id;
    uint32_t param;
    uint32_t len;   /* size of payload in rsp */
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_submitqueue_query_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_submitqueue_query_req)
 
 struct msm_ccmd_submitqueue_query_rsp {
-   struct msm_ccmd_rsp hdr;
+   struct vdrm_ccmd_rsp hdr;
 
    int32_t  ret;
    uint32_t out_len;
@@ -309,15 +318,15 @@ struct msm_ccmd_submitqueue_query_rsp {
  * should poll if needed.
  */
 struct msm_ccmd_wait_fence_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t queue_id;
    uint32_t fence;
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_wait_fence_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_wait_fence_req)
 
 struct msm_ccmd_wait_fence_rsp {
-   struct msm_ccmd_rsp hdr;
+   struct vdrm_ccmd_rsp hdr;
 
    int32_t ret;
 };
@@ -334,7 +343,7 @@ struct msm_ccmd_wait_fence_rsp {
  * No response.
  */
 struct msm_ccmd_set_debuginfo_req {
-   struct msm_ccmd_req hdr;
+   struct vdrm_ccmd_req hdr;
 
    uint32_t comm_len;
    uint32_t cmdline_len;
@@ -345,6 +354,8 @@ struct msm_ccmd_set_debuginfo_req {
     */
    int8_t   payload[];
 };
-DEFINE_CAST(msm_ccmd_req, msm_ccmd_set_debuginfo_req)
+DEFINE_CAST(vdrm_ccmd_req, msm_ccmd_set_debuginfo_req)
+
+#pragma GCC diagnostic pop
 
 #endif /* MSM_PROTO_H_ */

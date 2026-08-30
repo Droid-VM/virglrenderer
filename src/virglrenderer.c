@@ -32,12 +32,16 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#if defined(__linux__)
+#include <linux/udmabuf.h>
+#include <sys/ioctl.h>
+#endif
 
 #include "pipe/p_state.h"
 #include "util/u_format.h"
 #include "util/u_math.h"
 #include "vkr_allocator.h"
-#include "vkr_renderer.h"
+#include "vkr_virgl_adapter.h"
 #include "drm_renderer.h"
 #include "vrend_renderer.h"
 #include "proxy/proxy_renderer.h"
@@ -1075,6 +1079,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
 
    res->map_info = blob.map_info;
    res->map_size = args->size;
+   res->fd_offset = blob.fd_offset;
 
    return 0;
 }
@@ -1184,6 +1189,62 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
    }
 
    return 0;
+}
+
+int
+virgl_renderer_resource_export_display_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
+{
+#if !defined(__linux__)
+   (void)res_id;
+   (void)fd_type;
+   (void)fd;
+   return EINVAL;
+#else
+   struct virgl_resource *res = virgl_resource_lookup(res_id);
+   if (!res)
+      return EINVAL;
+
+   int source_fd = -1;
+   enum virgl_resource_fd_type source_type = virgl_resource_export_fd(res, &source_fd);
+   if (source_type == VIRGL_RESOURCE_FD_DMABUF) {
+      *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF;
+      *fd = source_fd;
+      return 0;
+   }
+   if (source_type != VIRGL_RESOURCE_FD_SHM || source_fd < 0)
+      return EINVAL;
+
+   long page_size = sysconf(_SC_PAGESIZE);
+   if (page_size <= 0 || res->map_size == 0 ||
+       (res->fd_offset % (uint64_t)page_size) != 0 ||
+       (res->map_size % (uint64_t)page_size) != 0) {
+      close(source_fd);
+      return EINVAL;
+   }
+
+   int udmabuf_device = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+   if (udmabuf_device < 0) {
+      int ret = errno;
+      close(source_fd);
+      return ret;
+   }
+   struct udmabuf_create create = {
+      .memfd = (uint32_t)source_fd,
+      .flags = UDMABUF_FLAGS_CLOEXEC,
+      .offset = res->fd_offset,
+      .size = res->map_size,
+   };
+   int display_fd = ioctl(udmabuf_device, UDMABUF_CREATE, &create);
+   int saved_errno = errno;
+   close(udmabuf_device);
+   close(source_fd);
+   if (display_fd < 0)
+      return saved_errno;
+
+   *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF;
+   *fd = display_fd;
+   return 0;
+#endif
 }
 
 int

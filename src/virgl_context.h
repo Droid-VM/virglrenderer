@@ -46,6 +46,9 @@ struct virgl_context_blob {
 
    uint32_t map_info;
 
+   /* Offset of map_ptr in the fd returned by get_blob(). */
+   uint64_t fd_offset;
+
    struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
 };
 

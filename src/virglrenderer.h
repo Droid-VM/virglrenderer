@@ -317,10 +317,25 @@ struct virgl_renderer_resource_info {
    uint32_t tex_id;
    uint32_t stride;
    int drm_fourcc;
+   int fd;
+};
+
+#define VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION 0
+
+struct virgl_renderer_resource_info_ext {
+   int version;
+   struct virgl_renderer_resource_info base;
+   bool has_dmabuf_export;
+   int planes;
+   uint64_t modifiers;
+   void *d3d_tex2d;
 };
 
 VIRGL_EXPORT int virgl_renderer_resource_get_info(int res_handle,
                                                   struct virgl_renderer_resource_info *info);
+
+VIRGL_EXPORT int virgl_renderer_resource_get_info_ext(int res_handle,
+                                                      struct virgl_renderer_resource_info_ext *info);
 
 VIRGL_EXPORT void virgl_renderer_cleanup(void *cookie);
 

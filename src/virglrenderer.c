@@ -465,25 +465,70 @@ void virgl_renderer_ctx_detach_resource(int ctx_id, int res_handle)
    ctx->detach_resource(ctx, res);
 }
 
-int virgl_renderer_resource_get_info(int res_handle,
-                                     struct virgl_renderer_resource_info *info)
+static int virgl_renderer_resource_get_info_common(
+   int res_handle, struct virgl_renderer_resource_info *info)
 {
-   TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
 
-   if (!res || !res->pipe_resource)
+   if (!res)
       return EINVAL;
    if (!info)
       return EINVAL;
 
+   info->handle = res_handle;
+   info->fd = res->fd;
+
+   /* Blob resources do not necessarily have typed pipe-resource metadata. */
+   if (!res->pipe_resource)
+      return 0;
+
    vrend_renderer_resource_get_info(res->pipe_resource,
                                     (struct vrend_renderer_resource_info *)info);
-   info->handle = res_handle;
+
+   return 0;
+}
+
+int virgl_renderer_resource_get_info(int res_handle,
+                                     struct virgl_renderer_resource_info *info)
+{
+   TRACE_FUNC();
+   int ret = virgl_renderer_resource_get_info_common(res_handle, info);
+
+   if (ret)
+      return ret;
 
    if (state.winsys_initialized) {
       return vrend_winsys_get_fourcc_for_texture(info->tex_id,
                                                  info->virgl_format,
                                                  &info->drm_fourcc);
+   }
+
+   return 0;
+}
+
+int virgl_renderer_resource_get_info_ext(
+   int res_handle, struct virgl_renderer_resource_info_ext *info_ext)
+{
+   TRACE_FUNC();
+
+   if (!info_ext)
+      return EINVAL;
+
+   info_ext->version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION;
+   info_ext->has_dmabuf_export = false;
+   info_ext->planes = 0;
+   info_ext->modifiers = 0;
+   info_ext->d3d_tex2d = NULL;
+
+   int ret = virgl_renderer_resource_get_info_common(res_handle,
+                                                     &info_ext->base);
+   if (ret)
+      return ret;
+
+   if (state.winsys_initialized) {
+      return vrend_winsys_get_fourcc_for_texture(info_ext->base.tex_id,
+                                                 info_ext->base.virgl_format,
+                                                 &info_ext->base.drm_fourcc);
    }
 
    return 0;

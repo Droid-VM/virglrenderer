@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -57,7 +60,7 @@ vn_decode_VkDescriptorUpdateTemplateCreateInfo_self_temp(struct vn_cs_decoder *d
     vn_decode_uint32_t(dec, &val->descriptorUpdateEntryCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->descriptorUpdateEntryCount);
-        val->pDescriptorUpdateEntries = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pDescriptorUpdateEntries) * iter_count);
+        val->pDescriptorUpdateEntries = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pDescriptorUpdateEntries), iter_count);
         if (!val->pDescriptorUpdateEntries) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkDescriptorUpdateTemplateEntry_temp(dec, &((VkDescriptorUpdateTemplateEntry *)val->pDescriptorUpdateEntries)[i]);
@@ -218,8 +221,12 @@ static inline void vn_dispatch_vkCreateDescriptorUpdateTemplate(struct vn_dispat
         vn_dispatch_debug_log(ctx, "vkCreateDescriptorUpdateTemplate returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateDescriptorUpdateTemplate_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateDescriptorUpdateTemplate_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -242,9 +249,12 @@ static inline void vn_dispatch_vkDestroyDescriptorUpdateTemplate(struct vn_dispa
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyDescriptorUpdateTemplate(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyDescriptorUpdateTemplate_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyDescriptorUpdateTemplate_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

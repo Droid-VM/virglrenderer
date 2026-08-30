@@ -75,7 +75,9 @@ static inline void vrend_printf(const char *fmt, ...)
 {
    va_list va;
    va_start(va, fmt);
-   virgl_logv(fmt, va);
+   /* vrend_printf is the legacy renderer debug stream.  Keep it at DEBUG so
+    * the leveled callback does not turn every diagnostic into an INFO record. */
+   virgl_logv_level(VIRGL_LOG_LEVEL_DEBUG, fmt, va);
    va_end(va);
 }
 

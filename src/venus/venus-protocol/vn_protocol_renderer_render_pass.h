@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -70,7 +73,7 @@ vn_decode_VkSubpassDescription_temp(struct vn_cs_decoder *dec, VkSubpassDescript
     vn_decode_uint32_t(dec, &val->inputAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->inputAttachmentCount);
-        val->pInputAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pInputAttachments) * iter_count);
+        val->pInputAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pInputAttachments), iter_count);
         if (!val->pInputAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference_temp(dec, &((VkAttachmentReference *)val->pInputAttachments)[i]);
@@ -81,7 +84,7 @@ vn_decode_VkSubpassDescription_temp(struct vn_cs_decoder *dec, VkSubpassDescript
     vn_decode_uint32_t(dec, &val->colorAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->colorAttachmentCount);
-        val->pColorAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pColorAttachments) * iter_count);
+        val->pColorAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pColorAttachments), iter_count);
         if (!val->pColorAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference_temp(dec, &((VkAttachmentReference *)val->pColorAttachments)[i]);
@@ -91,7 +94,7 @@ vn_decode_VkSubpassDescription_temp(struct vn_cs_decoder *dec, VkSubpassDescript
     }
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->colorAttachmentCount);
-        val->pResolveAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pResolveAttachments) * iter_count);
+        val->pResolveAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pResolveAttachments), iter_count);
         if (!val->pResolveAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference_temp(dec, &((VkAttachmentReference *)val->pResolveAttachments)[i]);
@@ -109,7 +112,7 @@ vn_decode_VkSubpassDescription_temp(struct vn_cs_decoder *dec, VkSubpassDescript
     vn_decode_uint32_t(dec, &val->preserveAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->preserveAttachmentCount);
-        val->pPreserveAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pPreserveAttachments) * array_size);
+        val->pPreserveAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pPreserveAttachments), array_size);
         if (!val->pPreserveAttachments) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pPreserveAttachments, array_size);
     } else {
@@ -187,7 +190,7 @@ vn_decode_VkRenderPassMultiviewCreateInfo_self_temp(struct vn_cs_decoder *dec, V
     vn_decode_uint32_t(dec, &val->subpassCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->subpassCount);
-        val->pViewMasks = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pViewMasks) * array_size);
+        val->pViewMasks = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pViewMasks), array_size);
         if (!val->pViewMasks) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pViewMasks, array_size);
     } else {
@@ -197,7 +200,7 @@ vn_decode_VkRenderPassMultiviewCreateInfo_self_temp(struct vn_cs_decoder *dec, V
     vn_decode_uint32_t(dec, &val->dependencyCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->dependencyCount);
-        val->pViewOffsets = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pViewOffsets) * array_size);
+        val->pViewOffsets = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pViewOffsets), array_size);
         if (!val->pViewOffsets) return;
         vn_decode_int32_t_array(dec, (int32_t *)val->pViewOffsets, array_size);
     } else {
@@ -207,7 +210,7 @@ vn_decode_VkRenderPassMultiviewCreateInfo_self_temp(struct vn_cs_decoder *dec, V
     vn_decode_uint32_t(dec, &val->correlationMaskCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->correlationMaskCount);
-        val->pCorrelationMasks = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pCorrelationMasks) * array_size);
+        val->pCorrelationMasks = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pCorrelationMasks), array_size);
         if (!val->pCorrelationMasks) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pCorrelationMasks, array_size);
     } else {
@@ -296,7 +299,7 @@ vn_decode_VkRenderPassInputAttachmentAspectCreateInfo_self_temp(struct vn_cs_dec
     vn_decode_uint32_t(dec, &val->aspectReferenceCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->aspectReferenceCount);
-        val->pAspectReferences = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pAspectReferences) * iter_count);
+        val->pAspectReferences = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pAspectReferences), iter_count);
         if (!val->pAspectReferences) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkInputAttachmentAspectReference_temp(dec, &((VkInputAttachmentAspectReference *)val->pAspectReferences)[i]);
@@ -366,7 +369,7 @@ vn_decode_VkRenderPassCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderPassMultiviewCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
+            ((VkRenderPassMultiviewCreateInfo *)pnext)->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderPassMultiviewCreateInfo_self_temp(dec, (VkRenderPassMultiviewCreateInfo *)pnext);
         }
         break;
@@ -374,7 +377,7 @@ vn_decode_VkRenderPassCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkRenderPassInputAttachmentAspectCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
+            ((VkRenderPassInputAttachmentAspectCreateInfo *)pnext)->pNext = vn_decode_VkRenderPassCreateInfo_pnext_temp(dec);
             vn_decode_VkRenderPassInputAttachmentAspectCreateInfo_self_temp(dec, (VkRenderPassInputAttachmentAspectCreateInfo *)pnext);
         }
         break;
@@ -396,7 +399,7 @@ vn_decode_VkRenderPassCreateInfo_self_temp(struct vn_cs_decoder *dec, VkRenderPa
     vn_decode_uint32_t(dec, &val->attachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->attachmentCount);
-        val->pAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pAttachments) * iter_count);
+        val->pAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pAttachments), iter_count);
         if (!val->pAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentDescription_temp(dec, &((VkAttachmentDescription *)val->pAttachments)[i]);
@@ -407,7 +410,7 @@ vn_decode_VkRenderPassCreateInfo_self_temp(struct vn_cs_decoder *dec, VkRenderPa
     vn_decode_uint32_t(dec, &val->subpassCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->subpassCount);
-        val->pSubpasses = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pSubpasses) * iter_count);
+        val->pSubpasses = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pSubpasses), iter_count);
         if (!val->pSubpasses) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkSubpassDescription_temp(dec, &((VkSubpassDescription *)val->pSubpasses)[i]);
@@ -418,7 +421,7 @@ vn_decode_VkRenderPassCreateInfo_self_temp(struct vn_cs_decoder *dec, VkRenderPa
     vn_decode_uint32_t(dec, &val->dependencyCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->dependencyCount);
-        val->pDependencies = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pDependencies) * iter_count);
+        val->pDependencies = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pDependencies), iter_count);
         if (!val->pDependencies) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkSubpassDependency_temp(dec, &((VkSubpassDependency *)val->pDependencies)[i]);
@@ -479,6 +482,79 @@ vn_replace_VkRenderPassCreateInfo_handle(VkRenderPassCreateInfo *val)
             break;
         case VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO:
             vn_replace_VkRenderPassInputAttachmentAspectCreateInfo_handle_self((VkRenderPassInputAttachmentAspectCreateInfo *)pnext);
+            break;
+        default:
+            /* ignore unknown/unsupported struct */
+            break;
+        }
+        pnext = pnext->pNext;
+    } while (pnext);
+}
+
+/* struct VkRenderingAreaInfo chain */
+
+static inline void *
+vn_decode_VkRenderingAreaInfo_pnext_temp(struct vn_cs_decoder *dec)
+{
+    /* no known/supported struct */
+    if (vn_decode_simple_pointer(dec))
+        vn_cs_decoder_set_fatal(dec);
+    return NULL;
+}
+
+static inline void
+vn_decode_VkRenderingAreaInfo_self_temp(struct vn_cs_decoder *dec, VkRenderingAreaInfo *val)
+{
+    /* skip val->{sType,pNext} */
+    vn_decode_uint32_t(dec, &val->viewMask);
+    vn_decode_uint32_t(dec, &val->colorAttachmentCount);
+    if (vn_peek_array_size(dec)) {
+        const size_t array_size = vn_decode_array_size(dec, val->colorAttachmentCount);
+        val->pColorAttachmentFormats = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pColorAttachmentFormats), array_size);
+        if (!val->pColorAttachmentFormats) return;
+        vn_decode_VkFormat_array(dec, (VkFormat *)val->pColorAttachmentFormats, array_size);
+    } else {
+        vn_decode_array_size_unchecked(dec);
+        val->pColorAttachmentFormats = NULL;
+    }
+    vn_decode_VkFormat(dec, &val->depthAttachmentFormat);
+    vn_decode_VkFormat(dec, &val->stencilAttachmentFormat);
+}
+
+static inline void
+vn_decode_VkRenderingAreaInfo_temp(struct vn_cs_decoder *dec, VkRenderingAreaInfo *val)
+{
+    VkStructureType stype;
+    vn_decode_VkStructureType(dec, &stype);
+    if (stype != VK_STRUCTURE_TYPE_RENDERING_AREA_INFO)
+        vn_cs_decoder_set_fatal(dec);
+
+    val->sType = stype;
+    val->pNext = vn_decode_VkRenderingAreaInfo_pnext_temp(dec);
+    vn_decode_VkRenderingAreaInfo_self_temp(dec, val);
+}
+
+static inline void
+vn_replace_VkRenderingAreaInfo_handle_self(VkRenderingAreaInfo *val)
+{
+    /* skip val->sType */
+    /* skip val->pNext */
+    /* skip val->viewMask */
+    /* skip val->colorAttachmentCount */
+    /* skip val->pColorAttachmentFormats */
+    /* skip val->depthAttachmentFormat */
+    /* skip val->stencilAttachmentFormat */
+}
+
+static inline void
+vn_replace_VkRenderingAreaInfo_handle(VkRenderingAreaInfo *val)
+{
+    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
+
+    do {
+        switch ((int32_t)pnext->sType) {
+        case VK_STRUCTURE_TYPE_RENDERING_AREA_INFO:
+            vn_replace_VkRenderingAreaInfo_handle_self((VkRenderingAreaInfo *)pnext);
             break;
         default:
             /* ignore unknown/unsupported struct */
@@ -564,7 +640,7 @@ vn_decode_VkAttachmentDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkAttachmentDescriptionStencilLayout));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkAttachmentDescription2_pnext_temp(dec);
+            ((VkAttachmentDescriptionStencilLayout *)pnext)->pNext = vn_decode_VkAttachmentDescription2_pnext_temp(dec);
             vn_decode_VkAttachmentDescriptionStencilLayout_self_temp(dec, (VkAttachmentDescriptionStencilLayout *)pnext);
         }
         break;
@@ -717,7 +793,7 @@ vn_decode_VkAttachmentReference2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkAttachmentReferenceStencilLayout));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkAttachmentReference2_pnext_temp(dec);
+            ((VkAttachmentReferenceStencilLayout *)pnext)->pNext = vn_decode_VkAttachmentReference2_pnext_temp(dec);
             vn_decode_VkAttachmentReferenceStencilLayout_self_temp(dec, (VkAttachmentReferenceStencilLayout *)pnext);
         }
         break;
@@ -852,6 +928,72 @@ vn_replace_VkSubpassDescriptionDepthStencilResolve_handle(VkSubpassDescriptionDe
     } while (pnext);
 }
 
+/* struct VkFragmentShadingRateAttachmentInfoKHR chain */
+
+static inline void *
+vn_decode_VkFragmentShadingRateAttachmentInfoKHR_pnext_temp(struct vn_cs_decoder *dec)
+{
+    /* no known/supported struct */
+    if (vn_decode_simple_pointer(dec))
+        vn_cs_decoder_set_fatal(dec);
+    return NULL;
+}
+
+static inline void
+vn_decode_VkFragmentShadingRateAttachmentInfoKHR_self_temp(struct vn_cs_decoder *dec, VkFragmentShadingRateAttachmentInfoKHR *val)
+{
+    /* skip val->{sType,pNext} */
+    if (vn_decode_simple_pointer(dec)) {
+        val->pFragmentShadingRateAttachment = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pFragmentShadingRateAttachment));
+        if (!val->pFragmentShadingRateAttachment) return;
+        vn_decode_VkAttachmentReference2_temp(dec, (VkAttachmentReference2 *)val->pFragmentShadingRateAttachment);
+    } else {
+        val->pFragmentShadingRateAttachment = NULL;
+    }
+    vn_decode_VkExtent2D_temp(dec, &val->shadingRateAttachmentTexelSize);
+}
+
+static inline void
+vn_decode_VkFragmentShadingRateAttachmentInfoKHR_temp(struct vn_cs_decoder *dec, VkFragmentShadingRateAttachmentInfoKHR *val)
+{
+    VkStructureType stype;
+    vn_decode_VkStructureType(dec, &stype);
+    if (stype != VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR)
+        vn_cs_decoder_set_fatal(dec);
+
+    val->sType = stype;
+    val->pNext = vn_decode_VkFragmentShadingRateAttachmentInfoKHR_pnext_temp(dec);
+    vn_decode_VkFragmentShadingRateAttachmentInfoKHR_self_temp(dec, val);
+}
+
+static inline void
+vn_replace_VkFragmentShadingRateAttachmentInfoKHR_handle_self(VkFragmentShadingRateAttachmentInfoKHR *val)
+{
+    /* skip val->sType */
+    /* skip val->pNext */
+    if (val->pFragmentShadingRateAttachment)
+        vn_replace_VkAttachmentReference2_handle((VkAttachmentReference2 *)val->pFragmentShadingRateAttachment);
+    vn_replace_VkExtent2D_handle(&val->shadingRateAttachmentTexelSize);
+}
+
+static inline void
+vn_replace_VkFragmentShadingRateAttachmentInfoKHR_handle(VkFragmentShadingRateAttachmentInfoKHR *val)
+{
+    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
+
+    do {
+        switch ((int32_t)pnext->sType) {
+        case VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR:
+            vn_replace_VkFragmentShadingRateAttachmentInfoKHR_handle_self((VkFragmentShadingRateAttachmentInfoKHR *)pnext);
+            break;
+        default:
+            /* ignore unknown/unsupported struct */
+            break;
+        }
+        pnext = pnext->pNext;
+    } while (pnext);
+}
+
 /* struct VkSubpassDescription2 chain */
 
 static inline void *
@@ -869,8 +1011,24 @@ vn_decode_VkSubpassDescription2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSubpassDescriptionDepthStencilResolve));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            ((VkSubpassDescriptionDepthStencilResolve *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
             vn_decode_VkSubpassDescriptionDepthStencilResolve_self_temp(dec, (VkSubpassDescriptionDepthStencilResolve *)pnext);
+        }
+        break;
+    case VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkFragmentShadingRateAttachmentInfoKHR));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkFragmentShadingRateAttachmentInfoKHR *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            vn_decode_VkFragmentShadingRateAttachmentInfoKHR_self_temp(dec, (VkFragmentShadingRateAttachmentInfoKHR *)pnext);
+        }
+        break;
+    case VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT:
+        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMultisampledRenderToSingleSampledInfoEXT));
+        if (pnext) {
+            pnext->sType = stype;
+            ((VkMultisampledRenderToSingleSampledInfoEXT *)pnext)->pNext = vn_decode_VkSubpassDescription2_pnext_temp(dec);
+            vn_decode_VkMultisampledRenderToSingleSampledInfoEXT_self_temp(dec, (VkMultisampledRenderToSingleSampledInfoEXT *)pnext);
         }
         break;
     default:
@@ -893,7 +1051,7 @@ vn_decode_VkSubpassDescription2_self_temp(struct vn_cs_decoder *dec, VkSubpassDe
     vn_decode_uint32_t(dec, &val->inputAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->inputAttachmentCount);
-        val->pInputAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pInputAttachments) * iter_count);
+        val->pInputAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pInputAttachments), iter_count);
         if (!val->pInputAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference2_temp(dec, &((VkAttachmentReference2 *)val->pInputAttachments)[i]);
@@ -904,7 +1062,7 @@ vn_decode_VkSubpassDescription2_self_temp(struct vn_cs_decoder *dec, VkSubpassDe
     vn_decode_uint32_t(dec, &val->colorAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->colorAttachmentCount);
-        val->pColorAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pColorAttachments) * iter_count);
+        val->pColorAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pColorAttachments), iter_count);
         if (!val->pColorAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference2_temp(dec, &((VkAttachmentReference2 *)val->pColorAttachments)[i]);
@@ -914,7 +1072,7 @@ vn_decode_VkSubpassDescription2_self_temp(struct vn_cs_decoder *dec, VkSubpassDe
     }
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->colorAttachmentCount);
-        val->pResolveAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pResolveAttachments) * iter_count);
+        val->pResolveAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pResolveAttachments), iter_count);
         if (!val->pResolveAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentReference2_temp(dec, &((VkAttachmentReference2 *)val->pResolveAttachments)[i]);
@@ -932,7 +1090,7 @@ vn_decode_VkSubpassDescription2_self_temp(struct vn_cs_decoder *dec, VkSubpassDe
     vn_decode_uint32_t(dec, &val->preserveAttachmentCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->preserveAttachmentCount);
-        val->pPreserveAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pPreserveAttachments) * array_size);
+        val->pPreserveAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pPreserveAttachments), array_size);
         if (!val->pPreserveAttachments) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pPreserveAttachments, array_size);
     } else {
@@ -995,6 +1153,12 @@ vn_replace_VkSubpassDescription2_handle(VkSubpassDescription2 *val)
         case VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE:
             vn_replace_VkSubpassDescriptionDepthStencilResolve_handle_self((VkSubpassDescriptionDepthStencilResolve *)pnext);
             break;
+        case VK_STRUCTURE_TYPE_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR:
+            vn_replace_VkFragmentShadingRateAttachmentInfoKHR_handle_self((VkFragmentShadingRateAttachmentInfoKHR *)pnext);
+            break;
+        case VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT:
+            vn_replace_VkMultisampledRenderToSingleSampledInfoEXT_handle_self((VkMultisampledRenderToSingleSampledInfoEXT *)pnext);
+            break;
         default:
             /* ignore unknown/unsupported struct */
             break;
@@ -1020,7 +1184,7 @@ vn_decode_VkSubpassDependency2_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkMemoryBarrier2));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSubpassDependency2_pnext_temp(dec);
+            ((VkMemoryBarrier2 *)pnext)->pNext = vn_decode_VkSubpassDependency2_pnext_temp(dec);
             vn_decode_VkMemoryBarrier2_self_temp(dec, (VkMemoryBarrier2 *)pnext);
         }
         break;
@@ -1116,7 +1280,7 @@ vn_decode_VkRenderPassCreateInfo2_self_temp(struct vn_cs_decoder *dec, VkRenderP
     vn_decode_uint32_t(dec, &val->attachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->attachmentCount);
-        val->pAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pAttachments) * iter_count);
+        val->pAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pAttachments), iter_count);
         if (!val->pAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkAttachmentDescription2_temp(dec, &((VkAttachmentDescription2 *)val->pAttachments)[i]);
@@ -1127,7 +1291,7 @@ vn_decode_VkRenderPassCreateInfo2_self_temp(struct vn_cs_decoder *dec, VkRenderP
     vn_decode_uint32_t(dec, &val->subpassCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->subpassCount);
-        val->pSubpasses = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pSubpasses) * iter_count);
+        val->pSubpasses = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pSubpasses), iter_count);
         if (!val->pSubpasses) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkSubpassDescription2_temp(dec, &((VkSubpassDescription2 *)val->pSubpasses)[i]);
@@ -1138,7 +1302,7 @@ vn_decode_VkRenderPassCreateInfo2_self_temp(struct vn_cs_decoder *dec, VkRenderP
     vn_decode_uint32_t(dec, &val->dependencyCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->dependencyCount);
-        val->pDependencies = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pDependencies) * iter_count);
+        val->pDependencies = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pDependencies), iter_count);
         if (!val->pDependencies) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkSubpassDependency2_temp(dec, &((VkSubpassDependency2 *)val->pDependencies)[i]);
@@ -1149,7 +1313,7 @@ vn_decode_VkRenderPassCreateInfo2_self_temp(struct vn_cs_decoder *dec, VkRenderP
     vn_decode_uint32_t(dec, &val->correlatedViewMaskCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->correlatedViewMaskCount);
-        val->pCorrelatedViewMasks = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pCorrelatedViewMasks) * array_size);
+        val->pCorrelatedViewMasks = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pCorrelatedViewMasks), array_size);
         if (!val->pCorrelatedViewMasks) return;
         vn_decode_uint32_t_array(dec, (uint32_t *)val->pCorrelatedViewMasks, array_size);
     } else {
@@ -1319,6 +1483,45 @@ static inline void vn_encode_vkGetRenderAreaGranularity_reply(struct vn_cs_encod
         vn_encode_VkExtent2D(enc, args->pGranularity);
 }
 
+static inline void vn_decode_vkGetRenderingAreaGranularity_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkGetRenderingAreaGranularity *args)
+{
+    vn_decode_VkDevice_lookup(dec, &args->device);
+    if (vn_decode_simple_pointer(dec)) {
+        args->pRenderingAreaInfo = vn_cs_decoder_alloc_temp(dec, sizeof(*args->pRenderingAreaInfo));
+        if (!args->pRenderingAreaInfo) return;
+        vn_decode_VkRenderingAreaInfo_temp(dec, (VkRenderingAreaInfo *)args->pRenderingAreaInfo);
+    } else {
+        args->pRenderingAreaInfo = NULL;
+        vn_cs_decoder_set_fatal(dec);
+    }
+    if (vn_decode_simple_pointer(dec)) {
+        args->pGranularity = vn_cs_decoder_alloc_temp(dec, sizeof(*args->pGranularity));
+        if (!args->pGranularity) return;
+        vn_decode_VkExtent2D_partial_temp(dec, args->pGranularity);
+    } else {
+        args->pGranularity = NULL;
+        vn_cs_decoder_set_fatal(dec);
+    }
+}
+
+static inline void vn_replace_vkGetRenderingAreaGranularity_args_handle(struct vn_command_vkGetRenderingAreaGranularity *args)
+{
+    vn_replace_VkDevice_handle(&args->device);
+    if (args->pRenderingAreaInfo)
+        vn_replace_VkRenderingAreaInfo_handle((VkRenderingAreaInfo *)args->pRenderingAreaInfo);
+    /* skip args->pGranularity */
+}
+
+static inline void vn_encode_vkGetRenderingAreaGranularity_reply(struct vn_cs_encoder *enc, const struct vn_command_vkGetRenderingAreaGranularity *args)
+{
+    vn_encode_VkCommandTypeEXT(enc, &(VkCommandTypeEXT){VK_COMMAND_TYPE_vkGetRenderingAreaGranularity_EXT});
+
+    /* skip args->device */
+    /* skip args->pRenderingAreaInfo */
+    if (vn_encode_simple_pointer(enc, args->pGranularity))
+        vn_encode_VkExtent2D(enc, args->pGranularity);
+}
+
 static inline void vn_decode_vkCreateRenderPass2_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkCreateRenderPass2 *args)
 {
     vn_decode_VkDevice_lookup(dec, &args->device);
@@ -1389,8 +1592,12 @@ static inline void vn_dispatch_vkCreateRenderPass(struct vn_dispatch_context *ct
         vn_dispatch_debug_log(ctx, "vkCreateRenderPass returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateRenderPass_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateRenderPass_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1413,9 +1620,12 @@ static inline void vn_dispatch_vkDestroyRenderPass(struct vn_dispatch_context *c
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyRenderPass(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyRenderPass_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyRenderPass_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1438,9 +1648,40 @@ static inline void vn_dispatch_vkGetRenderAreaGranularity(struct vn_dispatch_con
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkGetRenderAreaGranularity(ctx, &args);
 
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetRenderAreaGranularity_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetRenderAreaGranularity_reply(ctx->encoder, &args);
+    vn_cs_decoder_reset_temp_pool(ctx->decoder);
+}
+
+static inline void vn_dispatch_vkGetRenderingAreaGranularity(struct vn_dispatch_context *ctx, VkCommandFlagsEXT flags)
+{
+    struct vn_command_vkGetRenderingAreaGranularity args;
+
+    if (!ctx->dispatch_vkGetRenderingAreaGranularity) {
+        vn_cs_decoder_set_fatal(ctx->decoder);
+        return;
+    }
+
+    vn_decode_vkGetRenderingAreaGranularity_args_temp(ctx->decoder, &args);
+    if (!args.device) {
+        vn_cs_decoder_set_fatal(ctx->decoder);
+        return;
+    }
+
+    if (!vn_cs_decoder_get_fatal(ctx->decoder))
+        ctx->dispatch_vkGetRenderingAreaGranularity(ctx, &args);
+
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkGetRenderingAreaGranularity_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -1468,8 +1709,12 @@ static inline void vn_dispatch_vkCreateRenderPass2(struct vn_dispatch_context *c
         vn_dispatch_debug_log(ctx, "vkCreateRenderPass2 returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateRenderPass2_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateRenderPass2_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

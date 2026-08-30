@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -95,7 +98,7 @@ vn_decode_VkFenceCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkExportFenceCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkFenceCreateInfo_pnext_temp(dec);
+            ((VkExportFenceCreateInfo *)pnext)->pNext = vn_decode_VkFenceCreateInfo_pnext_temp(dec);
             vn_decode_VkExportFenceCreateInfo_self_temp(dec, (VkExportFenceCreateInfo *)pnext);
         }
         break;
@@ -238,7 +241,7 @@ static inline void vn_decode_vkResetFences_args_temp(struct vn_cs_decoder *dec, 
     vn_decode_uint32_t(dec, &args->fenceCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, args->fenceCount);
-        args->pFences = vn_cs_decoder_alloc_temp(dec, sizeof(*args->pFences) * iter_count);
+        args->pFences = vn_cs_decoder_alloc_temp_array(dec, sizeof(*args->pFences), iter_count);
         if (!args->pFences) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkFence_lookup(dec, &((VkFence *)args->pFences)[i]);
@@ -295,7 +298,7 @@ static inline void vn_decode_vkWaitForFences_args_temp(struct vn_cs_decoder *dec
     vn_decode_uint32_t(dec, &args->fenceCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, args->fenceCount);
-        args->pFences = vn_cs_decoder_alloc_temp(dec, sizeof(*args->pFences) * iter_count);
+        args->pFences = vn_cs_decoder_alloc_temp_array(dec, sizeof(*args->pFences), iter_count);
         if (!args->pFences) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkFence_lookup(dec, &((VkFence *)args->pFences)[i]);
@@ -331,21 +334,21 @@ static inline void vn_encode_vkWaitForFences_reply(struct vn_cs_encoder *enc, co
     /* skip args->timeout */
 }
 
-static inline void vn_decode_vkResetFenceResource100000MESA_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkResetFenceResource100000MESA *args)
+static inline void vn_decode_vkResetFenceResourceMESA_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkResetFenceResourceMESA *args)
 {
     vn_decode_VkDevice_lookup(dec, &args->device);
     vn_decode_VkFence_lookup(dec, &args->fence);
 }
 
-static inline void vn_replace_vkResetFenceResource100000MESA_args_handle(struct vn_command_vkResetFenceResource100000MESA *args)
+static inline void vn_replace_vkResetFenceResourceMESA_args_handle(struct vn_command_vkResetFenceResourceMESA *args)
 {
     vn_replace_VkDevice_handle(&args->device);
     vn_replace_VkFence_handle(&args->fence);
 }
 
-static inline void vn_encode_vkResetFenceResource100000MESA_reply(struct vn_cs_encoder *enc, const struct vn_command_vkResetFenceResource100000MESA *args)
+static inline void vn_encode_vkResetFenceResourceMESA_reply(struct vn_cs_encoder *enc, const struct vn_command_vkResetFenceResourceMESA *args)
 {
-    vn_encode_VkCommandTypeEXT(enc, &(VkCommandTypeEXT){VK_COMMAND_TYPE_vkResetFenceResource100000MESA_EXT});
+    vn_encode_VkCommandTypeEXT(enc, &(VkCommandTypeEXT){VK_COMMAND_TYPE_vkResetFenceResourceMESA_EXT});
 
     /* skip args->device */
     /* skip args->fence */
@@ -374,8 +377,12 @@ static inline void vn_dispatch_vkCreateFence(struct vn_dispatch_context *ctx, Vk
         vn_dispatch_debug_log(ctx, "vkCreateFence returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateFence_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateFence_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -398,9 +405,12 @@ static inline void vn_dispatch_vkDestroyFence(struct vn_dispatch_context *ctx, V
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyFence(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyFence_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyFence_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -428,8 +438,12 @@ static inline void vn_dispatch_vkResetFences(struct vn_dispatch_context *ctx, Vk
         vn_dispatch_debug_log(ctx, "vkResetFences returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkResetFences_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkResetFences_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -457,8 +471,16 @@ static inline void vn_dispatch_vkGetFenceStatus(struct vn_dispatch_context *ctx,
         vn_dispatch_debug_log(ctx, "vkGetFenceStatus returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkGetFenceStatus_reply(ctx->encoder, &args);
+    if (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) {
+        if (!vn_cs_decoder_get_fatal(ctx->decoder)) {
+            if (vn_cs_encoder_acquire(ctx->encoder)) {
+                vn_encode_vkGetFenceStatus_reply(ctx->encoder, &args);
+                vn_cs_encoder_release(ctx->encoder);
+            }
+        }
+    } else if (args.ret == VK_ERROR_DEVICE_LOST) {
+        vn_cs_decoder_set_fatal(ctx->decoder);
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -486,33 +508,44 @@ static inline void vn_dispatch_vkWaitForFences(struct vn_dispatch_context *ctx, 
         vn_dispatch_debug_log(ctx, "vkWaitForFences returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkWaitForFences_reply(ctx->encoder, &args);
+    if (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) {
+        if (!vn_cs_decoder_get_fatal(ctx->decoder)) {
+            if (vn_cs_encoder_acquire(ctx->encoder)) {
+                vn_encode_vkWaitForFences_reply(ctx->encoder, &args);
+                vn_cs_encoder_release(ctx->encoder);
+            }
+        }
+    } else if (args.ret == VK_ERROR_DEVICE_LOST) {
+        vn_cs_decoder_set_fatal(ctx->decoder);
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
 
-static inline void vn_dispatch_vkResetFenceResource100000MESA(struct vn_dispatch_context *ctx, VkCommandFlagsEXT flags)
+static inline void vn_dispatch_vkResetFenceResourceMESA(struct vn_dispatch_context *ctx, VkCommandFlagsEXT flags)
 {
-    struct vn_command_vkResetFenceResource100000MESA args;
+    struct vn_command_vkResetFenceResourceMESA args;
 
-    if (!ctx->dispatch_vkResetFenceResource100000MESA) {
+    if (!ctx->dispatch_vkResetFenceResourceMESA) {
         vn_cs_decoder_set_fatal(ctx->decoder);
         return;
     }
 
-    vn_decode_vkResetFenceResource100000MESA_args_temp(ctx->decoder, &args);
+    vn_decode_vkResetFenceResourceMESA_args_temp(ctx->decoder, &args);
     if (!args.device) {
         vn_cs_decoder_set_fatal(ctx->decoder);
         return;
     }
 
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
-        ctx->dispatch_vkResetFenceResource100000MESA(ctx, &args);
+        ctx->dispatch_vkResetFenceResourceMESA(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkResetFenceResource100000MESA_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkResetFenceResourceMESA_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

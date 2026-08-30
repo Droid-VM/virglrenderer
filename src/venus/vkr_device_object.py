@@ -65,6 +65,26 @@ vkr_{create_func_name}_create_driver_handles(
 }}
 '''
 
+PIPELINE_OBJECT_CREATE_DRIVER_HANDLES_TEMPL2 = '''
+/* create an array of driver {vk_type}s and update the object_array */
+static inline VkResult
+vkr_{create_func_name}_create_driver_handles(
+   UNUSED struct vkr_context *ctx,
+   struct vn_command_{create_cmd} *args,
+   struct object_array *arr)
+{{
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vn_device_proc_table *vk = &dev->proc_table;
+
+   /* handles in args are replaced */
+   vn_replace_{create_cmd}_args_handle(args);
+   args->ret = vk->{proc_create}(args->device, args->{create_hop},
+      args->{create_cache}, args->{create_count}, args->{create_info}, NULL,
+      arr->handle_storage);
+   return args->ret;
+}}
+'''
+
 SIMPLE_OBJECT_DESTROY_DRIVER_HANDLE_TEMPL = '''
 /* destroy a driver {vk_type} */
 static inline void
@@ -401,7 +421,10 @@ def pipeline_object_generator(json_obj):
     for json_variant in json_obj['variants']:
         tmp_obj = apply_variant(json_obj, json_variant)
         contents += PIPELINE_OBJECT_INIT_ARRAY_TEMPL.format(**tmp_obj)
-        contents += PIPELINE_OBJECT_CREATE_DRIVER_HANDLES_TEMPL.format(**tmp_obj)
+        if tmp_obj['create_hop']:
+            contents += PIPELINE_OBJECT_CREATE_DRIVER_HANDLES_TEMPL2.format(**tmp_obj)
+        else:
+            contents += PIPELINE_OBJECT_CREATE_DRIVER_HANDLES_TEMPL.format(**tmp_obj)
         contents += PIPELINE_OBJECT_CREATE_ARRAY_TEMPL.format(**tmp_obj)
 
     return contents

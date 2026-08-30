@@ -59,6 +59,17 @@ struct virgl_resource_opaque_fd_metadata {
     uint32_t memory_type_index;
 };
 
+/* Upstream 1.3 name for the same OPAQUE-fd metadata, used by the vendored
+ * venus renderer (vkr).  Kept as a separate type: same content, but upstream
+ * orders device_uuid first and field-for-field copies must stay honest.
+ */
+struct virgl_resource_vulkan_info {
+   uint8_t device_uuid[16];
+   uint8_t driver_uuid[16];
+   uint64_t allocation_size;
+   uint32_t memory_type_index;
+};
+
 /**
  * A global cross-context resource.  A virgl_resource is not directly usable
  * by renderer contexts, but must be attached and imported into renderer
@@ -104,6 +115,11 @@ struct virgl_resource {
    uint64_t fd_offset;
 
    struct virgl_resource_opaque_fd_metadata opaque_fd_metadata;
+
+   /* same OPAQUE-fd metadata under upstream 1.3's name/layout; read by the
+    * vendored venus renderer (vkr_allocator)
+    */
+   struct virgl_resource_vulkan_info vulkan_info;
 
    void *private_data;
 };

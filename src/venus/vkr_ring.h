@@ -8,8 +8,10 @@
 
 #include "vkr_common.h"
 
+#include "venus-protocol/vn_protocol_renderer_defines.h"
+
 /* We read from the ring buffer to a temporary buffer for
- * virgl_context::submit_cmd.  Until that is changed, we want to put a limit
+ * vkr_context_submit_cmd.  Until that is changed, we want to put a limit
  * on the size of the temporary buffer.  It also makes no sense to have huge
  * rings.
  *
@@ -17,11 +19,11 @@
  */
 #define VKR_RING_BUFFER_MAX_SIZE (16u * 1024 * 1024)
 
-/* The layout of a ring in a virgl_resource.  This is parsed and discarded by
- * vkr_ring_create.
+/* The layout of a ring in a vkr_resource. This is parsed and
+ * discarded by vkr_ring_create.
  */
 struct vkr_ring_layout {
-   const struct vkr_resource_attachment *attachment;
+   const struct vkr_resource *resource;
 
    struct vkr_region head;
    struct vkr_region tail;
@@ -48,10 +50,6 @@ struct vkr_ring_control {
 
 /* the buffer region of a ring */
 struct vkr_ring_buffer {
-   /* the base of the region in the resource */
-   int base_iov_index;
-   size_t base_iov_offset;
-
    uint32_t size;
    uint32_t mask;
 
@@ -60,17 +58,12 @@ struct vkr_ring_buffer {
     */
    uint32_t cur;
 
-   /* The current iov and iov offset in the resource. */
-   const struct iovec *cur_iov;
-   int cur_iov_index;
-   size_t cur_iov_offset;
+   const uint8_t *data;
 };
 
 /* the extra region of a ring */
 struct vkr_ring_extra {
-   /* the base of the region in the resource */
-   int base_iov_index;
-   size_t base_iov_offset;
+   size_t offset;
 
    /* used for offset validation */
    struct vkr_region region;
@@ -86,26 +79,34 @@ struct vkr_ring {
    struct list_head head;
 
    /* ring regions */
-   const struct vkr_resource_attachment *attachment;
+   const struct vkr_resource *resource;
    struct vkr_ring_control control;
    struct vkr_ring_buffer buffer;
    struct vkr_ring_extra extra;
 
+   /* ring cs */
+   struct vkr_cs_encoder encoder;
+   struct vkr_cs_decoder decoder;
+   struct vn_dispatch_context dispatch;
+
    /* ring thread */
-   struct virgl_context *context;
    uint64_t idle_timeout;
    void *cmd;
 
    mtx_t mutex;
    cnd_t cond;
    thrd_t thread;
+   bool prio_valid;
+   int prio;
    atomic_bool started;
    atomic_bool pending_notify;
+   atomic_bool monitor;
+   uint64_t virtqueue_seqno;
 };
 
 struct vkr_ring *
 vkr_ring_create(const struct vkr_ring_layout *layout,
-                struct virgl_context *ctx,
+                struct vkr_context *ctx,
                 uint64_t idle_timeout);
 
 void
@@ -122,5 +123,23 @@ vkr_ring_notify(struct vkr_ring *ring);
 
 bool
 vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val);
+
+void
+vkr_ring_submit_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno);
+
+bool
+vkr_ring_wait_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno);
+
+static inline uint32_t
+vkr_ring_load_head(const struct vkr_ring *ring)
+{
+   return atomic_load_explicit(ring->control.head, memory_order_acquire);
+}
+
+static inline void
+vkr_ring_set_status_bits(struct vkr_ring *ring, uint32_t mask)
+{
+   atomic_fetch_or_explicit(ring->control.status, mask, memory_order_seq_cst);
+}
 
 #endif /* VKR_RING_H */

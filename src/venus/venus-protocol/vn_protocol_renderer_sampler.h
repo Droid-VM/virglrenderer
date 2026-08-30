@@ -11,256 +11,11 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-
-/* struct VkSamplerReductionModeCreateInfo chain */
-
-static inline void *
-vn_decode_VkSamplerReductionModeCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
-{
-    /* no known/supported struct */
-    if (vn_decode_simple_pointer(dec))
-        vn_cs_decoder_set_fatal(dec);
-    return NULL;
-}
-
-static inline void
-vn_decode_VkSamplerReductionModeCreateInfo_self_temp(struct vn_cs_decoder *dec, VkSamplerReductionModeCreateInfo *val)
-{
-    /* skip val->{sType,pNext} */
-    vn_decode_VkSamplerReductionMode(dec, &val->reductionMode);
-}
-
-static inline void
-vn_decode_VkSamplerReductionModeCreateInfo_temp(struct vn_cs_decoder *dec, VkSamplerReductionModeCreateInfo *val)
-{
-    VkStructureType stype;
-    vn_decode_VkStructureType(dec, &stype);
-    if (stype != VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO)
-        vn_cs_decoder_set_fatal(dec);
-
-    val->sType = stype;
-    val->pNext = vn_decode_VkSamplerReductionModeCreateInfo_pnext_temp(dec);
-    vn_decode_VkSamplerReductionModeCreateInfo_self_temp(dec, val);
-}
-
-static inline void
-vn_replace_VkSamplerReductionModeCreateInfo_handle_self(VkSamplerReductionModeCreateInfo *val)
-{
-    /* skip val->sType */
-    /* skip val->pNext */
-    /* skip val->reductionMode */
-}
-
-static inline void
-vn_replace_VkSamplerReductionModeCreateInfo_handle(VkSamplerReductionModeCreateInfo *val)
-{
-    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
-
-    do {
-        switch ((int32_t)pnext->sType) {
-        case VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO:
-            vn_replace_VkSamplerReductionModeCreateInfo_handle_self((VkSamplerReductionModeCreateInfo *)pnext);
-            break;
-        default:
-            /* ignore unknown/unsupported struct */
-            break;
-        }
-        pnext = pnext->pNext;
-    } while (pnext);
-}
-
-/* struct VkSamplerCustomBorderColorCreateInfoEXT chain */
-
-static inline void *
-vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_pnext_temp(struct vn_cs_decoder *dec)
-{
-    /* no known/supported struct */
-    if (vn_decode_simple_pointer(dec))
-        vn_cs_decoder_set_fatal(dec);
-    return NULL;
-}
-
-static inline void
-vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_self_temp(struct vn_cs_decoder *dec, VkSamplerCustomBorderColorCreateInfoEXT *val)
-{
-    /* skip val->{sType,pNext} */
-    vn_decode_VkClearColorValue_temp(dec, &val->customBorderColor);
-    vn_decode_VkFormat(dec, &val->format);
-}
-
-static inline void
-vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_temp(struct vn_cs_decoder *dec, VkSamplerCustomBorderColorCreateInfoEXT *val)
-{
-    VkStructureType stype;
-    vn_decode_VkStructureType(dec, &stype);
-    if (stype != VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT)
-        vn_cs_decoder_set_fatal(dec);
-
-    val->sType = stype;
-    val->pNext = vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_pnext_temp(dec);
-    vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_self_temp(dec, val);
-}
-
-static inline void
-vn_replace_VkSamplerCustomBorderColorCreateInfoEXT_handle_self(VkSamplerCustomBorderColorCreateInfoEXT *val)
-{
-    /* skip val->sType */
-    /* skip val->pNext */
-    /* skip val->customBorderColor */
-    /* skip val->format */
-}
-
-static inline void
-vn_replace_VkSamplerCustomBorderColorCreateInfoEXT_handle(VkSamplerCustomBorderColorCreateInfoEXT *val)
-{
-    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
-
-    do {
-        switch ((int32_t)pnext->sType) {
-        case VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT:
-            vn_replace_VkSamplerCustomBorderColorCreateInfoEXT_handle_self((VkSamplerCustomBorderColorCreateInfoEXT *)pnext);
-            break;
-        default:
-            /* ignore unknown/unsupported struct */
-            break;
-        }
-        pnext = pnext->pNext;
-    } while (pnext);
-}
-
-/* struct VkSamplerCreateInfo chain */
-
-static inline void *
-vn_decode_VkSamplerCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
-{
-    VkBaseOutStructure *pnext;
-    VkStructureType stype;
-
-    if (!vn_decode_simple_pointer(dec))
-        return NULL;
-
-    vn_decode_VkStructureType(dec, &stype);
-    switch ((int32_t)stype) {
-    case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO:
-        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerYcbcrConversionInfo));
-        if (pnext) {
-            pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
-            vn_decode_VkSamplerYcbcrConversionInfo_self_temp(dec, (VkSamplerYcbcrConversionInfo *)pnext);
-        }
-        break;
-    case VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO:
-        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerReductionModeCreateInfo));
-        if (pnext) {
-            pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
-            vn_decode_VkSamplerReductionModeCreateInfo_self_temp(dec, (VkSamplerReductionModeCreateInfo *)pnext);
-        }
-        break;
-    case VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT:
-        pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkSamplerCustomBorderColorCreateInfoEXT));
-        if (pnext) {
-            pnext->sType = stype;
-            pnext->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
-            vn_decode_VkSamplerCustomBorderColorCreateInfoEXT_self_temp(dec, (VkSamplerCustomBorderColorCreateInfoEXT *)pnext);
-        }
-        break;
-    default:
-        /* unexpected struct */
-        pnext = NULL;
-        vn_cs_decoder_set_fatal(dec);
-        break;
-    }
-
-    return pnext;
-}
-
-static inline void
-vn_decode_VkSamplerCreateInfo_self_temp(struct vn_cs_decoder *dec, VkSamplerCreateInfo *val)
-{
-    /* skip val->{sType,pNext} */
-    vn_decode_VkFlags(dec, &val->flags);
-    vn_decode_VkFilter(dec, &val->magFilter);
-    vn_decode_VkFilter(dec, &val->minFilter);
-    vn_decode_VkSamplerMipmapMode(dec, &val->mipmapMode);
-    vn_decode_VkSamplerAddressMode(dec, &val->addressModeU);
-    vn_decode_VkSamplerAddressMode(dec, &val->addressModeV);
-    vn_decode_VkSamplerAddressMode(dec, &val->addressModeW);
-    vn_decode_float(dec, &val->mipLodBias);
-    vn_decode_VkBool32(dec, &val->anisotropyEnable);
-    vn_decode_float(dec, &val->maxAnisotropy);
-    vn_decode_VkBool32(dec, &val->compareEnable);
-    vn_decode_VkCompareOp(dec, &val->compareOp);
-    vn_decode_float(dec, &val->minLod);
-    vn_decode_float(dec, &val->maxLod);
-    vn_decode_VkBorderColor(dec, &val->borderColor);
-    vn_decode_VkBool32(dec, &val->unnormalizedCoordinates);
-}
-
-static inline void
-vn_decode_VkSamplerCreateInfo_temp(struct vn_cs_decoder *dec, VkSamplerCreateInfo *val)
-{
-    VkStructureType stype;
-    vn_decode_VkStructureType(dec, &stype);
-    if (stype != VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
-        vn_cs_decoder_set_fatal(dec);
-
-    val->sType = stype;
-    val->pNext = vn_decode_VkSamplerCreateInfo_pnext_temp(dec);
-    vn_decode_VkSamplerCreateInfo_self_temp(dec, val);
-}
-
-static inline void
-vn_replace_VkSamplerCreateInfo_handle_self(VkSamplerCreateInfo *val)
-{
-    /* skip val->sType */
-    /* skip val->pNext */
-    /* skip val->flags */
-    /* skip val->magFilter */
-    /* skip val->minFilter */
-    /* skip val->mipmapMode */
-    /* skip val->addressModeU */
-    /* skip val->addressModeV */
-    /* skip val->addressModeW */
-    /* skip val->mipLodBias */
-    /* skip val->anisotropyEnable */
-    /* skip val->maxAnisotropy */
-    /* skip val->compareEnable */
-    /* skip val->compareOp */
-    /* skip val->minLod */
-    /* skip val->maxLod */
-    /* skip val->borderColor */
-    /* skip val->unnormalizedCoordinates */
-}
-
-static inline void
-vn_replace_VkSamplerCreateInfo_handle(VkSamplerCreateInfo *val)
-{
-    struct VkBaseOutStructure *pnext = (struct VkBaseOutStructure *)val;
-
-    do {
-        switch ((int32_t)pnext->sType) {
-        case VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO:
-            vn_replace_VkSamplerCreateInfo_handle_self((VkSamplerCreateInfo *)pnext);
-            break;
-        case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO:
-            vn_replace_VkSamplerYcbcrConversionInfo_handle_self((VkSamplerYcbcrConversionInfo *)pnext);
-            break;
-        case VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO:
-            vn_replace_VkSamplerReductionModeCreateInfo_handle_self((VkSamplerReductionModeCreateInfo *)pnext);
-            break;
-        case VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT:
-            vn_replace_VkSamplerCustomBorderColorCreateInfoEXT_handle_self((VkSamplerCustomBorderColorCreateInfoEXT *)pnext);
-            break;
-        default:
-            /* ignore unknown/unsupported struct */
-            break;
-        }
-        pnext = pnext->pNext;
-    } while (pnext);
-}
 
 static inline void vn_decode_vkCreateSampler_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkCreateSampler *args)
 {
@@ -359,8 +114,12 @@ static inline void vn_dispatch_vkCreateSampler(struct vn_dispatch_context *ctx, 
         vn_dispatch_debug_log(ctx, "vkCreateSampler returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateSampler_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateSampler_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -383,9 +142,12 @@ static inline void vn_dispatch_vkDestroySampler(struct vn_dispatch_context *ctx,
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroySampler(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroySampler_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroySampler_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

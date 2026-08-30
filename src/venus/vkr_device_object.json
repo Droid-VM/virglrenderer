@@ -218,6 +218,7 @@
                 "generator": "pipeline-object",
                 "create_func_name": "graphics_pipeline",
                 "create_cmd": "vkCreateGraphicsPipelines",
+                "create_hop": "",
                 "create_cache": "pipelineCache",
                 "create_count": "createInfoCount",
                 "create_info": "pCreateInfos",
@@ -228,6 +229,11 @@
                     {
                         "create_func_name": "compute_pipeline",
                         "create_cmd": "vkCreateComputePipelines"
+                    },
+                    {
+                        "create_func_name": "ray_tracing_pipeline",
+                        "create_cmd": "vkCreateRayTracingPipelinesKHR",
+                        "create_hop": "deferredOperation"
                     }
                 ]
             }
@@ -311,6 +317,22 @@
                 "create_obj": "pFramebuffer",
                 "destroy_cmd": "vkDestroyFramebuffer",
                 "destroy_obj": "framebuffer"
+            }
+        ]
+    },
+    {
+        "filename": "vkr_acceleration_structure_gen.h",
+        "objects": [
+            {
+                "vkr_type": "acceleration_structure",
+                "vk_type": "VkAccelerationStructureKHR",
+                "vk_enum": "VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR",
+                "generator": "simple-object",
+                "create_cmd": "vkCreateAccelerationStructureKHR",
+                "create_info": "pCreateInfo",
+                "create_obj": "pAccelerationStructure",
+                "destroy_cmd": "vkDestroyAccelerationStructureKHR",
+                "destroy_obj": "accelerationStructure"
             }
         ]
     }

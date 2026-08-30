@@ -46,9 +46,17 @@
 // Avoid dependency on minigbm
 //#define ENABLE_MINIGBM_ALLOCATION 1
 
-// Disable experimental venus support (for now)
-//#define ENABLE_VENUS 1
+// venus (Vulkan-over-virtio) renderer for the DroidVM venus route
+#define ENABLE_VENUS 1
 //#define ENABLE_VENUS_VALIDATE 1
+// vkr resolves Vulkan by dlopen (ANDROID_EMU_VK_LOADER_PATH -> host turnip,
+// HMI hwvulkan bridge); nothing links libvulkan
+#define ENABLE_VULKAN_DLOAD 1
+// In-process venus: the VMM outlives every context, so teardown must really
+// destroy the VK objects and DeviceWaitIdle first -- the semantics upstream
+// keys off "render server worker is a thread, not a process". Sole effect is
+// ctx->on_worker_thread = true (vkr_context.c).
+#define ENABLE_RENDER_SERVER_WORKER_THREAD 1
 
 // Disable direct DRM support - only used by freedreno
 #define ENABLE_DRM 1

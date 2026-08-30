@@ -6,46 +6,18 @@
 #include "vkr_ring.h"
 
 #include <stdio.h>
+#include <sys/resource.h>
 #include <time.h>
 
-#include "vrend_iov.h"
+#include "venus-protocol/vn_protocol_renderer_dispatches.h"
 
 #include "vkr_context.h"
 
-enum vkr_ring_status_flag {
-   VKR_RING_STATUS_IDLE = 1u << 0,
-};
-
-/* callers must make sure they do not seek to end-of-resource or beyond */
-static const struct iovec *
-seek_resource(const struct vkr_resource_attachment *att,
-              int base_iov_index,
-              size_t offset,
-              int *out_iov_index,
-              size_t *out_iov_offset)
+static inline void *
+get_resource_pointer(const struct vkr_resource *res, size_t offset)
 {
-   const struct iovec *iov = &att->iov[base_iov_index];
-   assert(iov - att->iov < att->iov_count);
-   while (offset >= iov->iov_len) {
-      offset -= iov->iov_len;
-      iov++;
-      assert(iov - att->iov < att->iov_count);
-   }
-
-   *out_iov_index = iov - att->iov;
-   *out_iov_offset = offset;
-
-   return iov;
-}
-
-static void *
-get_resource_pointer(const struct vkr_resource_attachment *att,
-                     int base_iov_index,
-                     size_t offset)
-{
-   const struct iovec *iov =
-      seek_resource(att, base_iov_index, offset, &base_iov_index, &offset);
-   return (uint8_t *)iov->iov_base + offset;
+   assert(offset < res->size);
+   return res->u.data + offset;
 }
 
 static void
@@ -53,9 +25,7 @@ vkr_ring_init_extra(struct vkr_ring *ring, const struct vkr_ring_layout *layout)
 {
    struct vkr_ring_extra *extra = &ring->extra;
 
-   seek_resource(layout->attachment, 0, layout->extra.begin, &extra->base_iov_index,
-                 &extra->base_iov_offset);
-
+   extra->offset = layout->extra.begin;
    extra->region = vkr_region_make_relative(&layout->extra);
 }
 
@@ -64,18 +34,11 @@ vkr_ring_init_buffer(struct vkr_ring *ring, const struct vkr_ring_layout *layout
 {
    struct vkr_ring_buffer *buf = &ring->buffer;
 
-   const struct iovec *base_iov =
-      seek_resource(layout->attachment, 0, layout->buffer.begin, &buf->base_iov_index,
-                    &buf->base_iov_offset);
-
    buf->size = vkr_region_size(&layout->buffer);
    assert(util_is_power_of_two_nonzero(buf->size));
    buf->mask = buf->size - 1;
-
    buf->cur = 0;
-   buf->cur_iov = base_iov;
-   buf->cur_iov_index = buf->base_iov_index;
-   buf->cur_iov_offset = buf->base_iov_offset;
+   buf->data = get_resource_pointer(layout->resource, layout->buffer.begin);
 }
 
 static bool
@@ -83,9 +46,9 @@ vkr_ring_init_control(struct vkr_ring *ring, const struct vkr_ring_layout *layou
 {
    struct vkr_ring_control *ctrl = &ring->control;
 
-   ctrl->head = get_resource_pointer(layout->attachment, 0, layout->head.begin);
-   ctrl->tail = get_resource_pointer(layout->attachment, 0, layout->tail.begin);
-   ctrl->status = get_resource_pointer(layout->attachment, 0, layout->status.begin);
+   ctrl->head = get_resource_pointer(layout->resource, layout->head.begin);
+   ctrl->tail = get_resource_pointer(layout->resource, layout->tail.begin);
+   ctrl->status = get_resource_pointer(layout->resource, layout->status.begin);
 
    /* we will manage head and status, and we expect them to be 0 initially */
    if (*ctrl->head || *ctrl->status)
@@ -95,12 +58,12 @@ vkr_ring_init_control(struct vkr_ring *ring, const struct vkr_ring_layout *layou
 }
 
 static void
-vkr_ring_store_head(struct vkr_ring *ring)
+vkr_ring_store_head(struct vkr_ring *ring, uint32_t ring_head)
 {
    /* the renderer is expected to load the head with memory_order_acquire,
     * forming a release-acquire ordering
     */
-   atomic_store_explicit(ring->control.head, ring->buffer.cur, memory_order_release);
+   atomic_store_explicit(ring->control.head, ring_head, memory_order_release);
 }
 
 static uint32_t
@@ -113,120 +76,89 @@ vkr_ring_load_tail(const struct vkr_ring *ring)
 }
 
 static void
-vkr_ring_store_status(struct vkr_ring *ring, uint32_t status)
+vkr_ring_unset_status_bits(struct vkr_ring *ring, uint32_t mask)
 {
-   atomic_store_explicit(ring->control.status, status, memory_order_seq_cst);
+   atomic_fetch_and_explicit(ring->control.status, ~mask, memory_order_seq_cst);
 }
 
-/* TODO consider requiring virgl_resource to be logically contiguous */
 static void
 vkr_ring_read_buffer(struct vkr_ring *ring, void *data, uint32_t size)
 {
    struct vkr_ring_buffer *buf = &ring->buffer;
-   const struct vkr_resource_attachment *att = ring->attachment;
 
+   const size_t offset = buf->cur & buf->mask;
    assert(size <= buf->size);
-   const uint32_t buf_offset = buf->cur & buf->mask;
-   const uint32_t buf_avail = buf->size - buf_offset;
-   const bool wrap = size >= buf_avail;
-
-   uint32_t read_size;
-   uint32_t wrap_size;
-   if (!wrap) {
-      read_size = size;
-      wrap_size = 0;
+   if (offset + size <= buf->size) {
+      memcpy(data, buf->data + offset, size);
    } else {
-      read_size = buf_avail;
-      /* When size == buf_avail, wrap is true but wrap_size is 0.  We want to
-       * wrap because it seems slightly faster on the next call.  Besides,
-       * seek_resource does not support seeking to end-of-resource which could
-       * happen if we don't wrap and the buffer region end coincides with the
-       * resource end.
-       */
-      wrap_size = size - buf_avail;
-   }
-
-   /* do the reads */
-   if (read_size <= buf->cur_iov->iov_len - buf->cur_iov_offset) {
-      const void *src = (const uint8_t *)buf->cur_iov->iov_base + buf->cur_iov_offset;
-      memcpy(data, src, read_size);
-
-      /* fast path */
-      if (!wrap) {
-         assert(!wrap_size);
-         buf->cur += read_size;
-         buf->cur_iov_offset += read_size;
-         return;
-      }
-   } else {
-      vrend_read_from_iovec(buf->cur_iov, att->iov_count - buf->cur_iov_index,
-                            buf->cur_iov_offset, data, read_size);
-   }
-
-   if (wrap_size) {
-      vrend_read_from_iovec(att->iov + buf->base_iov_index,
-                            att->iov_count - buf->base_iov_index, buf->base_iov_offset,
-                            (char *)data + read_size, wrap_size);
+      const size_t s = buf->size - offset;
+      memcpy(data, buf->data + offset, s);
+      memcpy((uint8_t *)data + s, buf->data, size - s);
    }
 
    /* advance cur */
    buf->cur += size;
-   if (!wrap) {
-      buf->cur_iov = seek_resource(att, buf->cur_iov_index, buf->cur_iov_offset + size,
-                                   &buf->cur_iov_index, &buf->cur_iov_offset);
-   } else {
-      buf->cur_iov =
-         seek_resource(att, buf->base_iov_index, buf->base_iov_offset + wrap_size,
-                       &buf->cur_iov_index, &buf->cur_iov_offset);
-   }
+}
+
+static inline void
+vkr_ring_init_dispatch(struct vkr_ring *ring, struct vkr_context *ctx)
+{
+   ring->dispatch = ctx->dispatch;
+   ring->dispatch.encoder = (struct vn_cs_encoder *)&ring->encoder;
+   ring->dispatch.decoder = (struct vn_cs_decoder *)&ring->decoder;
 }
 
 struct vkr_ring *
 vkr_ring_create(const struct vkr_ring_layout *layout,
-                struct virgl_context *ctx,
+                struct vkr_context *ctx,
                 uint64_t idle_timeout)
 {
-   struct vkr_ring *ring;
-   int ret;
-
-   ring = calloc(1, sizeof(*ring));
+   struct vkr_ring *ring = calloc(1, sizeof(*ring));
    if (!ring)
       return NULL;
 
-   ring->attachment = layout->attachment;
+   ring->resource = layout->resource;
 
-   if (!vkr_ring_init_control(ring, layout)) {
-      free(ring);
-      return NULL;
-   }
+   if (!vkr_ring_init_control(ring, layout))
+      goto err_init_control;
 
    vkr_ring_init_buffer(ring, layout);
    vkr_ring_init_extra(ring, layout);
 
    ring->cmd = malloc(ring->buffer.size);
-   if (!ring->cmd) {
-      free(ring);
-      return NULL;
-   }
+   if (!ring->cmd)
+      goto err_cmd_malloc;
 
-   ring->context = ctx;
+   if (vkr_cs_decoder_init(&ring->decoder, ctx))
+      goto err_cs_decoder_init;
+
+   if (vkr_cs_encoder_init(&ring->encoder, &ctx->cs_fatal_error))
+      goto err_cs_encoder_init;
+
+   vkr_ring_init_dispatch(ring, ctx);
+
    ring->idle_timeout = idle_timeout;
 
-   ret = mtx_init(&ring->mutex, mtx_plain);
-   if (ret != thrd_success) {
-      free(ring->cmd);
-      free(ring);
-      return NULL;
-   }
-   ret = cnd_init(&ring->cond);
-   if (ret != thrd_success) {
-      mtx_destroy(&ring->mutex);
-      free(ring->cmd);
-      free(ring);
-      return NULL;
-   }
+   if (mtx_init(&ring->mutex, mtx_plain) != thrd_success)
+      goto err_mtx_init;
+
+   if (cnd_init(&ring->cond) != thrd_success)
+      goto err_cond_init;
 
    return ring;
+
+err_cond_init:
+   mtx_destroy(&ring->mutex);
+err_mtx_init:
+   vkr_cs_encoder_fini(&ring->encoder);
+err_cs_encoder_init:
+   vkr_cs_decoder_fini(&ring->decoder);
+err_cs_decoder_init:
+   free(ring->cmd);
+err_cmd_malloc:
+err_init_control:
+   free(ring);
+   return NULL;
 }
 
 void
@@ -235,6 +167,8 @@ vkr_ring_destroy(struct vkr_ring *ring)
    list_del(&ring->head);
 
    assert(!ring->started);
+   vkr_cs_decoder_fini(&ring->decoder);
+   vkr_cs_encoder_fini(&ring->encoder);
    mtx_destroy(&ring->mutex);
    cnd_destroy(&ring->cond);
    free(ring->cmd);
@@ -270,41 +204,92 @@ vkr_ring_relax(uint32_t *iter)
       .tv_sec = us / 1000000,
       .tv_nsec = (us % 1000000) * 1000,
    };
+#ifdef __APPLE__
+   /* macOS does not implement clock_nanosleep; a unified path is TBD */
+   nanosleep(&ts, NULL);
+#else
    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+#endif
+}
+
+static bool
+vkr_ring_submit_cmd(struct vkr_ring *ring,
+                    const uint8_t *buffer,
+                    size_t size,
+                    uint32_t ring_head)
+{
+   struct vkr_cs_decoder *dec = &ring->decoder;
+   if (vkr_cs_decoder_get_fatal(dec)) {
+      vkr_log("ring_submit_cmd: early bail due to fatal decoder state");
+      return false;
+   }
+
+   vkr_cs_decoder_set_buffer_stream(dec, buffer, size);
+
+   while (vkr_cs_decoder_has_command(dec)) {
+      vn_dispatch_command(&ring->dispatch);
+      if (vkr_cs_decoder_get_fatal(dec)) {
+         vkr_log("ring_submit_cmd: vn_dispatch_command failed");
+
+         vkr_cs_decoder_reset(dec);
+         return false;
+      }
+
+      /* update the ring head intra-cs to optimize ring space */
+      const uint32_t cur_ring_head = ring_head + (dec->cur - buffer);
+      vkr_ring_store_head(ring, cur_ring_head);
+      vkr_context_on_ring_seqno_update(ring->dispatch.data, ring->id, cur_ring_head);
+   }
+
+   vkr_cs_decoder_reset(dec);
+   return true;
 }
 
 static int
 vkr_ring_thread(void *arg)
 {
    struct vkr_ring *ring = arg;
-   struct virgl_context *ctx = ring->context;
+   struct vkr_context *ctx = ring->dispatch.data;
    char thread_name[16];
 
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
+   if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
+#ifdef DEBUG
+      /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
+       * requesting a high priority outside of the normal range would be at the best
+       * effort. Thus only enable logging on debug build.
+       */
+      vkr_log("failed to set ring thread priority to %d (%d)", ring->prio, errno);
+#endif
+   }
 
    uint64_t last_submit = vkr_ring_now();
    uint32_t relax_iter = 0;
    int ret = 0;
    while (ring->started) {
       bool wait = false;
-      uint32_t cmd_size;
-
       if (vkr_ring_now() >= last_submit + ring->idle_timeout) {
          ring->pending_notify = false;
-         vkr_ring_store_status(ring, VKR_RING_STATUS_IDLE);
+         vkr_ring_set_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
          wait = ring->buffer.cur == vkr_ring_load_tail(ring);
          if (!wait)
-            vkr_ring_store_status(ring, 0);
+            vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
       }
 
       if (wait) {
          TRACE_SCOPE("ring idle");
 
          mtx_lock(&ring->mutex);
-         if (ring->started && !ring->pending_notify)
-            cnd_wait(&ring->cond, &ring->mutex);
-         vkr_ring_store_status(ring, 0);
+         while (ring->started && !ring->pending_notify) {
+            ret = cnd_wait(&ring->cond, &ring->mutex);
+            if (ret != thrd_success) {
+               vkr_log("%s: ring idle cnd_wait has failed(%d)", __func__, ret);
+               ret = -EINVAL;
+               goto out;
+            }
+         }
+         vkr_ring_unset_status_bits(ring, VK_RING_STATUS_IDLE_BIT_MESA);
          mtx_unlock(&ring->mutex);
 
          if (!ring->started)
@@ -314,22 +299,50 @@ vkr_ring_thread(void *arg)
          relax_iter = 0;
       }
 
-      cmd_size = vkr_ring_load_tail(ring) - ring->buffer.cur;
+      const uint32_t cmd_size = vkr_ring_load_tail(ring) - ring->buffer.cur;
       if (cmd_size) {
          if (cmd_size > ring->buffer.size) {
+            vkr_log("%s: cmd_size(%u) > ring->buffer.size(%u)", __func__, cmd_size,
+                    ring->buffer.size);
             ret = -EINVAL;
             break;
          }
 
+         const uint32_t ring_head = ring->buffer.cur;
          vkr_ring_read_buffer(ring, ring->cmd, cmd_size);
-         ctx->submit_cmd(ctx, ring->cmd, cmd_size);
-         vkr_ring_store_head(ring);
+
+         if (!vkr_ring_submit_cmd(ring, ring->cmd, cmd_size, ring_head)) {
+            ret = -EINVAL;
+            break;
+         }
 
          last_submit = vkr_ring_now();
          relax_iter = 0;
       } else {
+         /* Get the active wait_ring seqno first to ensure ordering. */
+         uint32_t wait_ring_seqno = 0;
+         if (vkr_context_get_wait_ring_seqno(ctx, ring->id, &wait_ring_seqno)) {
+            /* Error out if the latest ring cmd is unable to signal the virtqueue that is
+             * currently waiting for this ring. This happens when the driver emits invalid
+             * asynchronous ring wait cmds.
+             */
+            const uint32_t ring_tail = vkr_ring_load_tail(ring);
+            if (unlikely(!vkr_seqno_ge(ring_tail, wait_ring_seqno))) {
+               vkr_log("%s: ring seqno(%u) unable to reach wait seqno(%u)", __func__,
+                       ring_tail, wait_ring_seqno);
+               ret = -EINVAL;
+               break;
+            }
+         }
+
          vkr_ring_relax(&relax_iter);
       }
+   }
+
+out:
+   if (ret < 0) {
+      vkr_ring_set_status_bits(ring, VK_RING_STATUS_FATAL_BIT_MESA);
+      vkr_context_on_ring_fatal(ctx);
    }
 
    return ret;
@@ -390,8 +403,7 @@ vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val)
 
       /* Mesa always sets offset to 0 and the cache hit rate will be 100% */
       extra->cached_offset = offset;
-      extra->cached_data = get_resource_pointer(ring->attachment, extra->base_iov_index,
-                                                extra->base_iov_offset + offset);
+      extra->cached_data = get_resource_pointer(ring->resource, extra->offset + offset);
    }
 
    atomic_store_explicit(extra->cached_data, val, memory_order_release);
@@ -401,4 +413,38 @@ vkr_ring_write_extra(struct vkr_ring *ring, size_t offset, uint32_t val)
    }
 
    return true;
+}
+
+void
+vkr_ring_submit_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno)
+{
+   mtx_lock(&ring->mutex);
+   ring->virtqueue_seqno = seqno;
+
+   /* There are 3 cases:
+    * 1. ring is not waiting on the cond thus no-op
+    * 2. ring is idle and then wakes up earlier
+    * 3. ring is waiting for roundtrip and then checks seqno again
+    */
+   cnd_signal(&ring->cond);
+   mtx_unlock(&ring->mutex);
+
+   {
+      TRACE_SCOPE("submit vq seqno done");
+   }
+}
+
+bool
+vkr_ring_wait_virtqueue_seqno(struct vkr_ring *ring, uint64_t seqno)
+{
+   TRACE_FUNC();
+
+   bool ok = true;
+
+   mtx_lock(&ring->mutex);
+   while (ok && ring->started && ring->virtqueue_seqno < seqno)
+      ok = cnd_wait(&ring->cond, &ring->mutex) == thrd_success;
+   mtx_unlock(&ring->mutex);
+
+   return ok;
 }

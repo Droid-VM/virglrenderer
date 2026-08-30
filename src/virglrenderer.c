@@ -180,7 +180,7 @@ void virgl_renderer_fill_caps(uint32_t set, uint32_t version,
       break;
    case VIRGL_RENDERER_CAPSET_VENUS:
       if (state.vkr_initialized)
-         vkr_get_capset(caps);
+         vkr_adapter_get_capset(caps);
       break;
    case VIRGL_RENDERER_CAPSET_DRM:
       drm_renderer_capset(caps);
@@ -236,7 +236,7 @@ int virgl_renderer_context_create_with_flags(uint32_t ctx_id,
       if (state.proxy_initialized)
          ctx = proxy_context_create(ctx_id, ctx_flags, nlen, name);
       else if (state.vkr_initialized)
-         ctx = vkr_context_create(nlen, name);
+         ctx = vkr_adapter_context_create(ctx_id, nlen, name);
       else
          return EINVAL;
       break;
@@ -619,7 +619,7 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
       break;
    case VIRGL_RENDERER_CAPSET_VENUS:
       *max_ver = 0;
-      *max_size = vkr_get_capset(NULL);
+      *max_size = vkr_adapter_get_capset(NULL);
       break;
    case VIRGL_RENDERER_CAPSET_DRM:
       *max_ver = 0;
@@ -767,7 +767,7 @@ void virgl_renderer_cleanup(UNUSED void *cookie)
       proxy_renderer_fini();
 
    if (state.vkr_initialized) {
-      vkr_renderer_fini();
+      vkr_adapter_renderer_fini();
       /* vkr_allocator_init is called on-demand upon the first map */
       vkr_allocator_fini();
    }
@@ -900,15 +900,9 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
    }
 
    if (!state.vkr_initialized && (flags & VIRGL_RENDERER_VENUS)) {
-      uint32_t vkr_flags = 0;
-      if (flags & VIRGL_RENDERER_THREAD_SYNC)
-         vkr_flags |= VKR_RENDERER_THREAD_SYNC;
-      if (flags & VIRGL_RENDERER_ASYNC_FENCE_CB)
-         vkr_flags |= VKR_RENDERER_ASYNC_FENCE_CB;
-      if (flags & VIRGL_RENDERER_RENDER_SERVER)
-         vkr_flags |= VKR_RENDERER_RENDER_SERVER;
-
-      ret = vkr_renderer_init(vkr_flags);
+      /* the adapter maps THREAD_SYNC/ASYNC_FENCE_CB itself; upstream 1.3
+       * dropped the render-server vkr flag (venus is in-process here) */
+      ret = vkr_adapter_renderer_init(flags) ? 0 : EINVAL;
       if (ret)
          goto fail;
       state.vkr_initialized = true;
@@ -983,7 +977,7 @@ void virgl_renderer_reset(void)
       proxy_renderer_reset();
 
    if (state.vkr_initialized)
-      vkr_renderer_reset();
+      vkr_adapter_renderer_reset();
 
    if (state.vrend_initialized)
       vrend_renderer_reset();
@@ -1035,6 +1029,10 @@ virgl_debug_callback_type virgl_set_debug_callback(virgl_debug_callback_type cb)
 {
    virgl_debug_callback_type previous_cb = legacy_logger.logger;
    legacy_logger.logger = cb;
+   /* The deprecated callback has no level argument and historically received
+    * every renderer diagnostic.  Keep that contract; the leveled API used by
+    * crosvm controls filtering explicitly through virgl_set_log_level(). */
+   virgl_set_log_level(VIRGL_LOG_LEVEL_DEBUG);
    virgl_log_set_handler(virgl_legacy_logger, &legacy_logger, NULL);
    return previous_cb;
 }
@@ -1214,6 +1212,7 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
    res->map_size = args->size;
    res->map_ptr = blob.map_ptr;
    res->fd_offset = blob.fd_offset;
+   res->vulkan_info = blob.vulkan_info;
 
    return 0;
 }

@@ -120,6 +120,7 @@ const struct log_levels_lut {
    {"info", VIRGL_LOG_LEVEL_INFO},
    {"warning", VIRGL_LOG_LEVEL_WARNING},
    {"error", VIRGL_LOG_LEVEL_ERROR},
+   {"silent", VIRGL_LOG_LEVEL_SILENT},
    { NULL, 0 },
 };
 
@@ -129,6 +130,47 @@ static enum virgl_log_level_flags virgl_log_level = VIRGL_LOG_LEVEL_WARNING;
 static enum virgl_log_level_flags virgl_log_level = VIRGL_LOG_LEVEL_ERROR;
 #endif
 static bool virgl_log_level_initialized = false;
+
+static void
+virgl_log_init_level(void)
+{
+   if (virgl_log_level_initialized)
+      return;
+
+   const char *log_level_env = getenv("VIRGL_LOG_LEVEL");
+   if (log_level_env != NULL && log_level_env[0] != '\0') {
+      const struct log_levels_lut *lut = log_levels_table;
+      while (lut->name) {
+         if (!strcmp(lut->name, log_level_env)) {
+            virgl_log_level = lut->log_level;
+            break;
+         }
+         lut++;
+      }
+
+      if (!lut->name)
+         fprintf(stderr, "Unknown log level %s requested\n", log_level_env);
+   }
+
+   virgl_log_level_initialized = true;
+}
+
+static bool
+virgl_log_enabled(enum virgl_log_level_flags log_level)
+{
+   virgl_log_init_level();
+   return log_level < VIRGL_LOG_LEVEL_SILENT && log_level >= virgl_log_level;
+}
+
+void
+virgl_set_log_level(enum virgl_log_level_flags log_level)
+{
+   virgl_log_level = log_level >= VIRGL_LOG_LEVEL_DEBUG &&
+                     log_level <= VIRGL_LOG_LEVEL_SILENT
+      ? log_level
+      : VIRGL_LOG_LEVEL_SILENT;
+   virgl_log_level_initialized = true;
+}
 
 static
 void virgl_default_logger(UNUSED enum virgl_log_level_flags log_level,
@@ -162,25 +204,7 @@ void virgl_default_logger(UNUSED enum virgl_log_level_flags log_level,
       }
    }
 
-   if (!virgl_log_level_initialized) {
-      const char* log_level_env = getenv("VIRGL_LOG_LEVEL");
-      if (log_level_env != NULL && log_level_env[0] != '\0') {
-         const struct log_levels_lut *lut = log_levels_table;
-         while (lut->name) {
-            if (!strcmp(lut->name, log_level_env)) {
-               virgl_log_level = lut->log_level;
-               break;
-            }
-         }
-
-         if (!lut->name)
-            fprintf(fp, "Unknown log level %s requested\n", log_level_env);
-      }
-
-      virgl_log_level_initialized = true;
-   }
-
-   if (log_level < virgl_log_level)
+   if (!virgl_log_enabled(log_level))
       return;
 
    fprintf(fp, "%s", message);
@@ -207,15 +231,23 @@ void virgl_log_set_handler(virgl_log_callback_type log_cb,
 
 void virgl_logv(const char *fmt, va_list va)
 {
+   virgl_logv_level(VIRGL_LOG_LEVEL_INFO, fmt, va);
+}
+
+void
+virgl_logv_level(enum virgl_log_level_flags level, const char *fmt, va_list va)
+{
    char *str = NULL;
 
-   if (!virgl_log_data.log_cb)
+   /* Check before vasprintf: high-frequency debug messages must not allocate
+    * or format when the selected logger level will discard them. */
+   if (!virgl_log_data.log_cb || !virgl_log_enabled(level))
       return;
 
    if (vasprintf(&str, fmt, va) < 0)
       return;
 
-   virgl_log_data.log_cb(VIRGL_LOG_LEVEL_INFO, str, virgl_log_data.user_data);
+   virgl_log_data.log_cb(level, str, virgl_log_data.user_data);
    free (str);
 }
 

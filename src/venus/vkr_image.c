@@ -130,6 +130,31 @@ vkr_dispatch_vkGetImageSubresourceLayout(
 }
 
 static void
+vkr_dispatch_vkGetImageSubresourceLayout2(
+   UNUSED struct vn_dispatch_context *dispatch,
+   struct vn_command_vkGetImageSubresourceLayout2 *args)
+{
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vn_device_proc_table *vk = &dev->proc_table;
+
+   vn_replace_vkGetImageSubresourceLayout2_args_handle(args);
+   vk->GetImageSubresourceLayout2(args->device, args->image, args->pSubresource,
+                                  args->pLayout);
+}
+
+static void
+vkr_dispatch_vkGetDeviceImageSubresourceLayout(
+   UNUSED struct vn_dispatch_context *dispatch,
+   struct vn_command_vkGetDeviceImageSubresourceLayout *args)
+{
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   struct vn_device_proc_table *vk = &dev->proc_table;
+
+   vn_replace_vkGetDeviceImageSubresourceLayout_args_handle(args);
+   vk->GetDeviceImageSubresourceLayout(args->device, args->pInfo, args->pLayout);
+}
+
+static void
 vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkGetImageDrmFormatModifierPropertiesEXT *args)
@@ -232,6 +257,10 @@ vkr_context_init_image_dispatch(struct vkr_context *ctx)
    dispatch->dispatch_vkBindImageMemory2 = vkr_dispatch_vkBindImageMemory2;
    dispatch->dispatch_vkGetImageSubresourceLayout =
       vkr_dispatch_vkGetImageSubresourceLayout;
+   dispatch->dispatch_vkGetImageSubresourceLayout2 =
+      vkr_dispatch_vkGetImageSubresourceLayout2;
+   dispatch->dispatch_vkGetDeviceImageSubresourceLayout =
+      vkr_dispatch_vkGetDeviceImageSubresourceLayout;
 
    dispatch->dispatch_vkGetImageDrmFormatModifierPropertiesEXT =
       vkr_dispatch_vkGetImageDrmFormatModifierPropertiesEXT;

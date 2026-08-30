@@ -11,6 +11,9 @@
 #include "vn_protocol_renderer_structs.h"
 
 #pragma GCC diagnostic push
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 #pragma GCC diagnostic ignored "-Wpointer-arith"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -37,7 +40,7 @@ vn_decode_VkFramebufferAttachmentImageInfo_self_temp(struct vn_cs_decoder *dec, 
     vn_decode_uint32_t(dec, &val->viewFormatCount);
     if (vn_peek_array_size(dec)) {
         const size_t array_size = vn_decode_array_size(dec, val->viewFormatCount);
-        val->pViewFormats = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pViewFormats) * array_size);
+        val->pViewFormats = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pViewFormats), array_size);
         if (!val->pViewFormats) return;
         vn_decode_VkFormat_array(dec, (VkFormat *)val->pViewFormats, array_size);
     } else {
@@ -109,7 +112,7 @@ vn_decode_VkFramebufferAttachmentsCreateInfo_self_temp(struct vn_cs_decoder *dec
     vn_decode_uint32_t(dec, &val->attachmentImageInfoCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->attachmentImageInfoCount);
-        val->pAttachmentImageInfos = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pAttachmentImageInfos) * iter_count);
+        val->pAttachmentImageInfos = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pAttachmentImageInfos), iter_count);
         if (!val->pAttachmentImageInfos) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkFramebufferAttachmentImageInfo_temp(dec, &((VkFramebufferAttachmentImageInfo *)val->pAttachmentImageInfos)[i]);
@@ -179,7 +182,7 @@ vn_decode_VkFramebufferCreateInfo_pnext_temp(struct vn_cs_decoder *dec)
         pnext = vn_cs_decoder_alloc_temp(dec, sizeof(VkFramebufferAttachmentsCreateInfo));
         if (pnext) {
             pnext->sType = stype;
-            pnext->pNext = vn_decode_VkFramebufferCreateInfo_pnext_temp(dec);
+            ((VkFramebufferAttachmentsCreateInfo *)pnext)->pNext = vn_decode_VkFramebufferCreateInfo_pnext_temp(dec);
             vn_decode_VkFramebufferAttachmentsCreateInfo_self_temp(dec, (VkFramebufferAttachmentsCreateInfo *)pnext);
         }
         break;
@@ -202,7 +205,7 @@ vn_decode_VkFramebufferCreateInfo_self_temp(struct vn_cs_decoder *dec, VkFramebu
     vn_decode_uint32_t(dec, &val->attachmentCount);
     if (vn_peek_array_size(dec)) {
         const uint32_t iter_count = vn_decode_array_size(dec, val->attachmentCount);
-        val->pAttachments = vn_cs_decoder_alloc_temp(dec, sizeof(*val->pAttachments) * iter_count);
+        val->pAttachments = vn_cs_decoder_alloc_temp_array(dec, sizeof(*val->pAttachments), iter_count);
         if (!val->pAttachments) return;
         for (uint32_t i = 0; i < iter_count; i++)
             vn_decode_VkImageView_lookup(dec, &((VkImageView *)val->pAttachments)[i]);
@@ -363,8 +366,12 @@ static inline void vn_dispatch_vkCreateFramebuffer(struct vn_dispatch_context *c
         vn_dispatch_debug_log(ctx, "vkCreateFramebuffer returned %d", args.ret);
 #endif
 
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkCreateFramebuffer_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkCreateFramebuffer_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }
@@ -387,9 +394,12 @@ static inline void vn_dispatch_vkDestroyFramebuffer(struct vn_dispatch_context *
     if (!vn_cs_decoder_get_fatal(ctx->decoder))
         ctx->dispatch_vkDestroyFramebuffer(ctx, &args);
 
-
-    if (!vn_cs_decoder_get_fatal(ctx->decoder) && (flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT))
-       vn_encode_vkDestroyFramebuffer_reply(ctx->encoder, &args);
+    if ((flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT) && !vn_cs_decoder_get_fatal(ctx->decoder)) {
+        if (vn_cs_encoder_acquire(ctx->encoder)) {
+            vn_encode_vkDestroyFramebuffer_reply(ctx->encoder, &args);
+            vn_cs_encoder_release(ctx->encoder);
+        }
+    }
 
     vn_cs_decoder_reset_temp_pool(ctx->decoder);
 }

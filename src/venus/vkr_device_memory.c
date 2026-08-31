@@ -20,8 +20,19 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
 {
    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
    if (!res) {
-      vkr_log("failed to import resource: invalid res_id %u", res_info->resourceId);
-      vkr_context_set_fatal(ctx);
+      /* Not a protocol violation on this stack, so no vkr_context_set_fatal: the adapter
+       * attaches a resource only when it can export an fd, and IGNORES iovec-only guest
+       * memory ("attach of res N with no fd") -- so a res id the guest legitimately holds
+       * can be missing here.  The one importer that hits this is Xorg's glamor smooth
+       * takeover (-background none, hardcoded in sddm): it imports the boot framebuffer,
+       * a classic CREATE_2D resource with no host storage.  Setting the context fatal
+       * turned that one doomed import into a CS error, device loss, and an X server that
+       * dies before writing its display number -- the greeter black-screen loop.  The
+       * caller returns VK_ERROR_INVALID_EXTERNAL_HANDLE, glamor skips the copy, and the
+       * greeter comes up.
+       */
+      vkr_log("failed to import resource: invalid res_id %u (returning error, not fatal)",
+              res_info->resourceId);
       return false;
    }
 

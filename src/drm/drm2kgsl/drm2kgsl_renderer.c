@@ -1399,8 +1399,18 @@ kgsl_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    struct kgsl_object *obj = kgsl_object_from_res_id(kctx, req->res_id);
 
    if (!obj) {
-      drm_err("Could not lookup obj: res_id=%u", req->res_id);
-      goto out_error;
+      /* Not every attached resource is a kgsl object: the boot framebuffer
+       * (an iovec-backed virtio-gpu 2D resource, typically res_id=2) has no
+       * GEM/arena backing, so when Xorg's -background none takeover imports
+       * it and turnip asks for an iova, the lookup misses.  That miss must
+       * not go through out_error: async_error is added to the fault count
+       * turnip polls, and one tick turns into a phantom "GPU faulted or
+       * hung" device-lost that wedges zink for the life of the X server
+       * (same escalation the arena-import comment below describes).  Log it
+       * and carry on — the worst case is a blit from an unbound VA, which
+       * stays contained to this context. */
+      drm_err("Could not lookup obj: res_id=%u (ignored, not escalated)", req->res_id);
+      return 0;
    }
 
    /* Never explicitly unbind: a submit referencing this BO may still be on

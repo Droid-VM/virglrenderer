@@ -12480,6 +12480,57 @@ int vrend_renderer_export_ctx0_fence(uint32_t fence_id, int* out_fd) {
    return -EINVAL;
 }
 
+int vrend_renderer_get_resource_layout(struct vrend_context *ctx,
+                                       uint32_t out_handle, uint32_t target_handle)
+{
+   struct vrend_resource *out = vrend_renderer_ctx_res_lookup(ctx, out_handle);
+   struct vrend_resource *target = vrend_renderer_ctx_res_lookup(ctx, target_handle);
+   struct virgl_resource_layout layout = {0};
+   _Static_assert(sizeof(layout) == 80, "WDDM resource layout ABI");
+   if (!out || !target || out == target || out->base.target != PIPE_BUFFER ||
+       !out->iov || out->base.width0 < sizeof(layout) ||
+       vrend_get_iovec_size(out->iov, out->num_iovs) < sizeof(layout))
+      return EINVAL;
+   int ret = ENOTSUP;
+#ifdef ENABLE_MINIGBM_ALLOCATION
+   if (target->gbm_bo) {
+      int planes = gbm_bo_get_plane_count(target->gbm_bo);
+      uint64_t modifier = gbm_bo_get_modifier(target->gbm_bo);
+      if (planes > 0 && planes <= 4 && modifier != DRM_FORMAT_MOD_INVALID) {
+         layout.modifier = modifier;
+         layout.num_planes = planes;
+         ret = 0;
+         for (int i = 0; i < planes; i++) {
+            layout.planes[i].offset = gbm_bo_get_offset(target->gbm_bo, i);
+            layout.planes[i].stride = gbm_bo_get_stride_for_plane(target->gbm_bo, i);
+            layout.planes[i].size = gbm_bo_get_plane_size(target->gbm_bo, i);
+            if (!layout.planes[i].stride || !layout.planes[i].size)
+               ret = EINVAL;
+         }
+      }
+   } else
+#endif
+   {
+#ifdef HAVE_EPOXY_EGL_H
+      if (target->target == GL_TEXTURE_2D && target->base.last_level == 0 &&
+          target->base.depth0 == 1 && target->base.array_size == 1 &&
+          target->base.nr_samples == 0)
+         ret = virgl_egl_get_resource_layout(egl, target->id, &layout);
+#endif
+   }
+   // Bound bring-up diagnostics even if DWM recreates devices repeatedly.
+   static unsigned log_count;
+   if (log_count++ < 64)
+      vrend_printf("WDDM-LAYOUT out=%u target=%u format=%u bind=0x%x storage=0x%x ret=%d modifier=0x%llx planes=%u stride=%u size=%u\n",
+                   out_handle, target_handle, target->base.format, target->base.bind,
+                   target->storage_bits, ret, (unsigned long long)layout.modifier,
+                   layout.num_planes, layout.planes[0].stride, layout.planes[0].size);
+   if (ret)
+      return ret;
+   vrend_write_to_iovec(out->iov, out->num_iovs, 0, (const char *)&layout, sizeof(layout));
+   return 0;
+}
+
 void vrend_renderer_get_meminfo(struct vrend_context *ctx, uint32_t res_handle)
 {
    struct vrend_resource *res;

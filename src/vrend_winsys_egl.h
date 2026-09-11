@@ -55,6 +55,9 @@ int virgl_egl_get_fourcc_for_texture(struct virgl_egl *egl, uint32_t tex_id, uin
 
 int virgl_egl_get_fd_for_texture(struct virgl_egl *egl, uint32_t tex_id, int *fd);
 
+struct virgl_resource_layout;
+int virgl_egl_get_resource_layout(struct virgl_egl *egl, uint32_t tex_id,
+                                   struct virgl_resource_layout *layout);
 int virgl_egl_get_fd_for_texture2(struct virgl_egl *egl, uint32_t tex_id, int *fd, int *stride,
                                   int *offset);
 

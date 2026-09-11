@@ -449,10 +449,24 @@ int virgl_renderer_resource_attach_iov(int res_handle, struct iovec *iov,
 {
    TRACE_FUNC();
    struct virgl_resource *res = virgl_resource_lookup(res_handle);
-   if (!res)
+   if (!res) {
+      /* Both failure exits here return a bare EINVAL, which the guest sees
+       * only as ComponentError(22) with no resource id. Name them apart so a
+       * rejected attach can be attributed to a missing resource rather than to
+       * one that already owns a backing store. */
+      virgl_error("attach_iov: res_handle=%d not found (num_iovs=%d)\n",
+                  res_handle, num_iovs);
       return EINVAL;
+   }
 
-   return virgl_resource_attach_iov(res, iov, num_iovs);
+   int ret = virgl_resource_attach_iov(res, iov, num_iovs);
+   if (ret) {
+      virgl_error("attach_iov: res_handle=%d rejected: ret=%d iov=%p count=%d "
+                  "existing_iov=%p existing_count=%d pipe_resource=%p\n",
+                  res_handle, ret, (void *)iov, num_iovs, (void *)res->iov,
+                  res->iov_count, (void *)res->pipe_resource);
+   }
+   return ret;
 }
 
 void virgl_renderer_resource_detach_iov(int res_handle, struct iovec **iov_p, int *num_iovs_p)

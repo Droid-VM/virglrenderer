@@ -1599,6 +1599,15 @@ static int vrend_decode_ctx_get_blob(struct virgl_context *ctx,
    return 0;
 }
 
+static int vrend_decode_get_resource_layout(struct vrend_context *ctx,
+                                             const uint32_t *buf, uint32_t length)
+{
+   if (length != 2)
+      return EINVAL;
+   return vrend_renderer_get_resource_layout(ctx, get_buf_entry(buf, 1),
+                                             get_buf_entry(buf, 2));
+}
+
 static int vrend_decode_get_memory_info(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)
 {
    TRACE_FUNC();
@@ -1875,6 +1884,8 @@ static const vrend_decode_callback decode_table[VIRGL_MAX_COMMANDS] = {
    [VIRGL_CCMD_PIPE_RESOURCE_CREATE] = vrend_decode_pipe_resource_create,
    [VIRGL_CCMD_PIPE_RESOURCE_SET_TYPE] = vrend_decode_pipe_resource_set_type,
    [VIRGL_CCMD_GET_MEMORY_INFO] = vrend_decode_get_memory_info,
+   [VIRGL_CCMD_RESERVED_62] = vrend_unsupported,
+   [VIRGL_CCMD_GET_RESOURCE_LAYOUT] = vrend_decode_get_resource_layout,
    [VIRGL_CCMD_SEND_STRING_MARKER] = vrend_decode_send_string_marker,
    [VIRGL_CCMD_LINK_SHADER] = vrend_decode_link_shader,
 #ifdef ENABLE_VIDEO

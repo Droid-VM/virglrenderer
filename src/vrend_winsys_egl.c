@@ -449,6 +449,10 @@ virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct
                              egl->egl_conf,
                              vparams->shared ? eglGetCurrentContext() : EGL_NO_CONTEXT,
                              ctx_att);
+   if (egl_ctx == EGL_NO_CONTEXT && vparams->shared)
+      vrend_printf("Failed to create shared EGL context %d.%d: %s\n",
+                   vparams->major_ver, vparams->minor_ver,
+                   virgl_egl_error_string(eglGetError()));
    return (virgl_renderer_gl_context)egl_ctx;
 }
 

@@ -33,8 +33,10 @@
 #include <virglrenderer.h>
 #include <gbm.h>
 #include <sys/uio.h>
+#include <epoxy/egl.h>
 #include "testvirgl.h"
 #include "virgl_hw.h"
+#include "virgl_protocol.h"
 struct myinfo_struct {
   uint32_t test;
 };
@@ -154,6 +156,64 @@ START_TEST(virgl_init_egl_create_ctx_0)
   ret = virgl_renderer_context_create(0, strlen("test1"), "test1");
   ck_assert_int_eq(ret, EINVAL);
 
+  virgl_renderer_cleanup(&mystruct);
+}
+END_TEST
+
+static EGLContext fail_egl_create_context(EGLDisplay display, EGLConfig config,
+                                        EGLContext shared, const EGLint *attribs)
+{
+  (void)display;
+  (void)config;
+  (void)shared;
+  (void)attribs;
+  return EGL_NO_CONTEXT;
+}
+
+/* Exhausting host contexts must fail the request without unbinding the
+ * existing context or passing a NULL GL string to the GLSL version parser. */
+START_TEST(virgl_init_egl_create_ctx_failure)
+{
+  test_cbs.version = 1;
+  ck_assert_int_eq(virgl_renderer_init(&mystruct, context_flags, &test_cbs), 0);
+  ck_assert_int_eq(virgl_renderer_context_create(1, 4, "test"), 0);
+
+  EGLContext current = eglGetCurrentContext();
+  PFNEGLCREATECONTEXTPROC create_context = epoxy_eglCreateContext;
+  epoxy_eglCreateContext = fail_egl_create_context;
+  int ret = virgl_renderer_context_create(2, 4, "fail");
+  epoxy_eglCreateContext = create_context;
+
+  ck_assert_int_eq(ret, ENOMEM);
+  ck_assert_ptr_eq(eglGetCurrentContext(), current);
+  /* The failed ID remains reusable once allocation becomes possible. */
+  ck_assert_int_eq(virgl_renderer_context_create(2, 5, "retry"), 0);
+  virgl_renderer_context_destroy(2);
+  virgl_renderer_context_destroy(1);
+  virgl_renderer_cleanup(&mystruct);
+}
+END_TEST
+
+START_TEST(virgl_init_egl_create_sub_ctx_failure)
+{
+  test_cbs.version = 1;
+  ck_assert_int_eq(virgl_renderer_init(&mystruct, context_flags, &test_cbs), 0);
+  ck_assert_int_eq(virgl_renderer_context_create(1, 4, "test"), 0);
+
+  uint32_t set_ctx[] = { VIRGL_CCMD_SET_SUB_CTX | (1u << 16), 0 };
+  ck_assert_int_eq(virgl_renderer_submit_cmd(set_ctx, 1, 2), 0);
+  EGLContext current = eglGetCurrentContext();
+  PFNEGLCREATECONTEXTPROC create_context = epoxy_eglCreateContext;
+  epoxy_eglCreateContext = fail_egl_create_context;
+  uint32_t create_sub_ctx[] = { VIRGL_CCMD_CREATE_SUB_CTX | (1u << 16), 1 };
+  int ret = virgl_renderer_submit_cmd(create_sub_ctx, 1, 2);
+  epoxy_eglCreateContext = create_context;
+
+  ck_assert_int_eq(ret, ENOMEM);
+  ck_assert_ptr_eq(eglGetCurrentContext(), current);
+  virgl_renderer_context_destroy(1);
+  ck_assert_int_eq(virgl_renderer_context_create(2, 5, "retry"), 0);
+  virgl_renderer_context_destroy(2);
   virgl_renderer_cleanup(&mystruct);
 }
 END_TEST
@@ -540,6 +600,8 @@ static Suite *virgl_init_suite(void)
   tcase_add_test(tc_core, virgl_init_egl_double_init_conflict_args);
   tcase_add_test(tc_core, virgl_init_egl_create_ctx);
   tcase_add_test(tc_core, virgl_init_egl_create_ctx_0);
+  tcase_add_test(tc_core, virgl_init_egl_create_ctx_failure);
+  tcase_add_test(tc_core, virgl_init_egl_create_sub_ctx_failure);
   tcase_add_test(tc_core, virgl_init_egl_destroy_ctx_illegal);
   tcase_add_test(tc_core, virgl_init_egl_create_ctx_leak);
   tcase_add_test(tc_core, virgl_init_egl_create_ctx_reset);

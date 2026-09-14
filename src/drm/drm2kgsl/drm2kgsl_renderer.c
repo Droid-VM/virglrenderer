@@ -129,8 +129,8 @@ static unsigned g_nr_timelines;
  */
 #define KGSL_A830_CHIP_ID UINT64_C(0x44050000)
 
-/* Aggregate tracing for the host-side arena and fence paths.  It is enabled by
- * default; set CROSVM_DRM2KGSL_DIAG=0 to disable it.  Counters are process-wide
+/* Aggregate tracing for the host-side arena and fence paths.  Set
+ * CROSVM_DRM2KGSL_DIAG=1 to enable it.  Counters are process-wide
  * because the arena is shared by all KGSL contexts in the renderer process. */
 struct kgsl_diag_stats {
    uint64_t attach_calls;
@@ -178,7 +178,7 @@ static void
 kgsl_diag_init_once(void)
 {
    const char *env = getenv("CROSVM_DRM2KGSL_DIAG");
-   g_kgsl_diag.enabled = !env || strcmp(env, "0") != 0;
+   g_kgsl_diag.enabled = env && strcmp(env, "1") == 0;
    if (g_kgsl_diag.enabled)
       kgsl_diag_log("KGSL_DIAG enabled");
 }
@@ -1339,6 +1339,10 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    uint64_t blob_size = ALIGN_POT(req->size, getpagesize());
    int ret = 0;
 
+   if (kgsl_diag_enabled())
+      kgsl_diag_log("gem_new ctx=%u blob_id=%u size=0x%" PRIx64 " flags=0x%x iova=0x%" PRIx64,
+                    dctx->base.ctx_id, req->blob_id, req->size, req->flags, req->iova);
+
    if (!drm_context_blob_id_valid(dctx, req->blob_id)) {
       drm_err("Invalid blob_id %u", req->blob_id);
       ret = -EINVAL;
@@ -1762,25 +1766,6 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
                  nd > 3 ? ib[nd - 4] : 0, nd > 2 ? ib[nd - 3] : 0,
                  nd > 1 ? ib[nd - 2] : 0, nd > 0 ? ib[nd - 1] : 0);
 
-         /* System Settings reproducibly faults after consuming 0x100 dwords
-          * from its 0x7ffc-byte IB, and after 0x13a0 dwords from its
-          * 0x85e4-byte IB.  Capture the host-visible command words around both
-          * CP positions without turning every submit into a full IB dump. */
-         uint32_t window_dw = 0;
-         if (c->size == 0x7ffc)
-            window_dw = 0xf0;
-         else if (c->size == 0x85e4)
-            window_dw = 0x1390;
-
-         if (window_dw && window_dw + 8 <= nd) {
-            for (uint32_t w = window_dw; w < window_dw + 0x28; w += 8) {
-               drm_log("IB-WINDOW iova=0x%" PRIx64 "+0x%x "
-                       "%08x %08x %08x %08x %08x %08x %08x %08x",
-                       obj->iova + c->submit_offset, w * 4,
-                       ib[w], ib[w + 1], ib[w + 2], ib[w + 3],
-                       ib[w + 4], ib[w + 5], ib[w + 6], ib[w + 7]);
-            }
-         }
          /* Do not leave host cache aliases behind after the diagnostic read.
           * The guest updates these shared BOs through a WC mapping; a later
           * GPU access must not snoop a stale line populated by this probe. */
@@ -2245,7 +2230,7 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
 
    struct kgsl_object *obj = kgsl_object_from_blob_id(kctx, blob_id);
    if (!obj) {
-      drm_err("No object for blob_id %" PRIu64, blob_id);
+      drm_err("No object for ctx=%u blob_id %" PRIu64, dctx->base.ctx_id, blob_id);
       return -ENOENT;
    }
 

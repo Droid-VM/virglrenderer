@@ -62,6 +62,7 @@ fuzzy_tests = [
 test_depends = [
    libvirglrenderer_dep,
    check_dep,
+   epoxy_dep,
 ]
 
 if with_tracing == 'percetto'

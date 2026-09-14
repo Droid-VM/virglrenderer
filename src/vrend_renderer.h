@@ -484,7 +484,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
 void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
                                 uint32_t *max_size);
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_destroy_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_set_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 

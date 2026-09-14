@@ -4446,7 +4446,6 @@ void vrend_clear(struct vrend_context *ctx,
             colorf[i] = vrend_color_encode_as_srgb(colorf[i]);
       }
    }
-
    if (buffers & PIPE_CLEAR_COLOR) {
       if (sub_ctx->nr_cbufs && sub_ctx->surf[0] && vrend_format_is_emulated_alpha(sub_ctx->surf[0]->format)) {
          glClearColor(colorf[3], 0.0, 0.0, 0.0);
@@ -7145,7 +7144,12 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
          break;
    }
 
-   vrend_clicbs->make_current(gl_context);
+   if (!gl_context)
+      return ENOMEM;
+   if (vrend_clicbs->make_current(gl_context)) {
+      vrend_clicbs->destroy_gl_context(gl_context);
+      return EINVAL;
+   }
    gl_ver = epoxy_gl_version();
 
    /* enable error output as early as possible */
@@ -7237,6 +7241,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    /* create 0 context */
    vrend_state.ctx0 = vrend_create_context(0, strlen("HOST"), "HOST");
+   if (!vrend_state.ctx0)
+      return ENOMEM;
 
    vrend_state.eventfd = -1;
    if (flags & VREND_USE_THREAD_SYNC) {
@@ -7368,6 +7374,9 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
 
 void vrend_destroy_context(struct vrend_context *ctx)
 {
+   if (!ctx)
+      return;
+
    bool switch_0 = (ctx == vrend_state.current_ctx);
    struct vrend_context *cur = vrend_state.current_ctx;
    struct vrend_sub_context *sub, *tmp;
@@ -7439,6 +7448,8 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
 #endif
 
    grctx->res_hash = vrend_ctx_resource_init_table();
+   if (!grctx->res_hash)
+      goto fail;
    list_inithead(&grctx->untyped_resources);
 
    grctx->shader_cfg.max_shader_patch_varyings = vrend_state.max_shader_patch_varyings;
@@ -7457,15 +7468,29 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
    grctx->shader_cfg.has_nopersective = has_feature(feat_shader_noperspective_interpolation);
    grctx->shader_cfg.has_texture_shadow_lod = has_feature(feat_texture_shadow_lod);
 
-   vrend_renderer_create_sub_ctx(grctx, 0);
+   if (vrend_renderer_create_sub_ctx(grctx, 0))
+      goto fail;
    vrend_renderer_set_sub_ctx(grctx, 0);
 
    grctx->shader_cfg.glsl_version = vrender_get_glsl_version();
+   if (!grctx->shader_cfg.glsl_version) {
+      vrend_destroy_context(grctx);
+      return NULL;
+   }
 
    if (!grctx->ctx_id)
       grctx->fence_retire = vrend_clicbs->ctx0_fence_retire;
 
    return grctx;
+
+fail:
+#ifdef ENABLE_VIDEO
+   vrend_video_destroy_context(grctx->video);
+#endif
+   if (grctx->res_hash)
+      vrend_ctx_resource_fini_table(grctx->res_hash);
+   FREE(grctx);
+   return NULL;
 }
 
 static int check_resource_valid(const struct vrend_renderer_resource_create_args *args,
@@ -11075,9 +11100,13 @@ static int vrender_get_glsl_version(void)
 {
    int major_local = 0, minor_local = 0;
    const GLubyte *version_str;
-   ASSERTED int c;
+   int c;
 
    version_str = glGetString(GL_SHADING_LANGUAGE_VERSION);
+   if (!version_str) {
+      vrend_printf("GLSL version unavailable for current context\n");
+      return 0;
+   }
    if (vrend_state.use_gles) {
       c = sscanf((const char *)version_str, "%*s %*s %*s %*s %i.%i",
                   &major_local, &minor_local);
@@ -11085,7 +11114,10 @@ static int vrender_get_glsl_version(void)
       c = sscanf((const char *)version_str, "%i.%i",
                   &major_local, &minor_local);
    }
-   assert(c == 2);
+   if (c != 2) {
+      vrend_printf("Invalid GLSL version string: %s\n", version_str);
+      return 0;
+   }
 
    return (major_local * 100) + minor_local;
 }
@@ -12057,7 +12089,7 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
    }
 }
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
 {
    struct vrend_sub_context *sub;
    struct virgl_gl_ctx_param ctx_params;
@@ -12065,20 +12097,29 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
 
    LIST_FOR_EACH_ENTRY(sub, &ctx->sub_ctxs, head) {
       if (sub->sub_ctx_id == sub_ctx_id) {
-         return;
+         return 0;
       }
    }
 
    sub = CALLOC_STRUCT(vrend_sub_context);
    if (!sub)
-      return;
+      return ENOMEM;
 
    ctx_params.shared = (ctx->ctx_id == 0 && sub_ctx_id == 0) ? false : true;
    ctx_params.major_ver = vrend_state.gl_major_ver;
    ctx_params.minor_ver = vrend_state.gl_minor_ver;
    sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
+   if (!sub->gl_context) {
+      vrend_printf("Failed to create GL context %d sub %d\n", ctx->ctx_id, sub_ctx_id);
+      FREE(sub);
+      return ENOMEM;
+   }
    sub->parent = ctx;
-   vrend_clicbs->make_current(sub->gl_context);
+   if (vrend_clicbs->make_current(sub->gl_context)) {
+      vrend_clicbs->destroy_gl_context(sub->gl_context);
+      FREE(sub);
+      return EINVAL;
+   }
 
    /* enable if vrend_renderer_init function has done it as well */
    if (has_feature(feat_debug_cb)) {
@@ -12124,6 +12165,7 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
       ctx->sub0 = sub;
 
    vrend_set_tweak_from_env(&ctx->sub->tweaks);
+   return 0;
 }
 
 unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)
@@ -12517,6 +12559,16 @@ int vrend_renderer_get_resource_layout(struct vrend_context *ctx,
           target->base.nr_samples == 0)
          ret = virgl_egl_get_resource_layout(egl, target->id, &layout);
 #endif
+   }
+   /* Android EGL/minigbm may not expose DMA-BUF layout for scanout textures. */
+   if (ret == ENOTSUP && (target->base.bind & VIRGL_BIND_SCANOUT) &&
+       target->base.target == PIPE_TEXTURE_2D && target->base.nr_samples == 0) {
+      layout.modifier = 0;
+      layout.num_planes = 1;
+      layout.planes[0].offset = 0;
+      layout.planes[0].stride = target->base.width0 * 4;
+      layout.planes[0].size = layout.planes[0].stride * target->base.height0;
+      ret = layout.planes[0].stride && layout.planes[0].size ? 0 : EINVAL;
    }
    // Bound bring-up diagnostics even if DWM recreates devices repeatedly.
    static unsigned log_count;

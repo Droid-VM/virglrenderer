@@ -1144,8 +1144,7 @@ static int vrend_decode_create_sub_ctx(struct vrend_context *ctx, const uint32_t
 
    uint32_t ctx_sub_id = get_buf_entry(buf, 1);
 
-   vrend_renderer_create_sub_ctx(ctx, ctx_sub_id);
-   return 0;
+   return vrend_renderer_create_sub_ctx(ctx, ctx_sub_id);
 }
 
 static int vrend_decode_destroy_sub_ctx(struct vrend_context *ctx, const uint32_t *buf, uint32_t length)

@@ -9164,11 +9164,25 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
                                 int transfer_mode)
 {
    struct vrend_resource *res;
+   struct vrend_transfer_info linear_info;
 
    res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
    if (!res) {
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
       return EINVAL;
+   }
+
+   /* KMD's implicit transfers address a rectangle of the published blob layout,
+    * not a tightly packed rectangle starting at byte zero of the allocation. */
+   if (res->linear_blob_stride && !info->iovec && !info->stride && !info->offset) {
+      if (!info->box || info->level != 0 || info->box->z != 0 || info->box->depth != 1 ||
+          !check_transfer_bounds(res, info))
+         return EINVAL;
+      linear_info = *info;
+      linear_info.stride = res->linear_blob_stride;
+      linear_info.offset = res->linear_blob_offset +
+         (uint64_t)info->box->y * res->linear_blob_stride + (uint64_t)info->box->x * 4;
+      info = &linear_info;
    }
 
    if (!check_transfer_iovec(res, info)) {
@@ -12351,6 +12365,34 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
       uint32_t drm_format;
       int ret;
 
+      /* Android EGL may have no Linux DMA-BUF import extension. Only linear
+       * packed color blobs with guest backing can use the existing explicit
+       * transfer/Blt path; optimal/UBWC layouts must never be read as rows. */
+      if (!virgl_egl_supports_dmabuf_import(egl) && res->iov && res->iov_count > 0 &&
+          args->modifier == 0 && args->plane_count == 1 && args->width && args->height &&
+          (args->format == VIRGL_FORMAT_B8G8R8A8_UNORM ||
+           args->format == VIRGL_FORMAT_B8G8R8X8_UNORM ||
+           args->format == VIRGL_FORMAT_R8G8B8A8_UNORM ||
+           args->format == VIRGL_FORMAT_R8G8B8X8_UNORM)) {
+         const uint64_t row_bytes = (uint64_t)args->width * 4;
+         const uint64_t end = args->plane_offsets[0] +
+            (uint64_t)(args->height - 1) * args->plane_strides[0] + row_bytes;
+         if (row_bytes > args->plane_strides[0] || args->plane_strides[0] % 4 ||
+             end > UINT32_MAX || (uint64_t)args->plane_strides[0] * args->height > UINT32_MAX ||
+             end > res->map_size ||
+             end > vrend_get_iovec_size(res->iov, res->iov_count))
+            return EINVAL;
+         gr = (struct vrend_resource *)vrend_renderer_resource_create(&create_args, NULL);
+         if (!gr)
+            return ENOMEM;
+         gr->linear_blob_stride = args->plane_strides[0];
+         gr->linear_blob_offset = args->plane_offsets[0];
+         vrend_pipe_resource_attach_iov(&gr->base, res->iov, res->iov_count, NULL);
+         res->pipe_resource = &gr->base;
+         vrend_ctx_resource_insert(ctx->res_hash, res_id, gr);
+         return 0;
+      }
+
       if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF)
          return EINVAL;
 
@@ -12379,7 +12421,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                                   args->plane_strides,
                                                   args->plane_offsets);
       if (!gr->egl_image) {
-         vrend_printf("%s: failed to create egl image\n", __func__);
+         virgl_error("%s: failed to create egl image ctx=%d res=%u\n", __func__, ctx->ctx_id, res_id);
          FREE(gr);
          return EINVAL;
       }

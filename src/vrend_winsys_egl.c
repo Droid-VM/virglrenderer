@@ -623,6 +623,11 @@ bool virgl_has_egl_khr_gl_colorspace(struct virgl_egl *egl)
    return has_bit(egl->extension_bits, EGL_KHR_GL_COLORSPACE);
 }
 
+bool virgl_egl_supports_dmabuf_import(struct virgl_egl *egl)
+{
+   return egl && has_bit(egl->extension_bits, EGL_EXT_IMAGE_DMA_BUF_IMPORT);
+}
+
 void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t width,
                                   uint32_t height,
@@ -677,11 +682,15 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
    attrs[count++] = EGL_NONE;
    assert(count <= ARRAY_SIZE(attrs));
 
-   return (void *)eglCreateImageKHR(egl->egl_display,
+   void *image = (void *)eglCreateImageKHR(egl->egl_display,
                                     EGL_NO_CONTEXT,
                                     EGL_LINUX_DMA_BUF_EXT,
                                     (EGLClientBuffer)NULL,
                                     attrs);
+   if (!image)
+      virgl_error("DMA-BUF EGL import failed error=0x%x format=0x%x size=%ux%u modifier=0x%" PRIx64 "\n",
+                  eglGetError(), drm_format, width, height, drm_modifier);
+   return image;
 }
 
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image)

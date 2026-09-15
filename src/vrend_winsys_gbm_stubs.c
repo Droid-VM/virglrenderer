@@ -23,6 +23,8 @@
  **************************************************************************/
 
 #include "vrend_winsys_gbm.h"
+#include "virgl_hw.h"
+#include <drm_fourcc.h>
 #include <stddef.h>
 
 struct virgl_gbm *virgl_gbm_init(int fd) { return NULL; }
@@ -32,7 +34,33 @@ void virgl_gbm_fini(struct virgl_gbm *gbm) {
 }
 
 int virgl_gbm_convert_format(uint32_t *virgl_format, uint32_t *gbm_format) {
-  return 0;
+  /* EGL DMA-BUF imports need FourCC conversion even without a GBM allocator.
+   * Keep the supported pairs identical to vrend_winsys_gbm.c. */
+  static const struct {
+    uint32_t drm;
+    uint32_t virgl;
+  } formats[] = {
+    { DRM_FORMAT_RGB565, VIRGL_FORMAT_B5G6R5_UNORM },
+    { DRM_FORMAT_ARGB8888, VIRGL_FORMAT_B8G8R8A8_UNORM },
+    { DRM_FORMAT_XRGB8888, VIRGL_FORMAT_B8G8R8X8_UNORM },
+    { DRM_FORMAT_ABGR2101010, VIRGL_FORMAT_R10G10B10A2_UNORM },
+    { DRM_FORMAT_ABGR16161616F, VIRGL_FORMAT_R16G16B16A16_FLOAT },
+    { DRM_FORMAT_NV12, VIRGL_FORMAT_NV12 },
+    { DRM_FORMAT_ABGR8888, VIRGL_FORMAT_R8G8B8A8_UNORM },
+    { DRM_FORMAT_XBGR8888, VIRGL_FORMAT_R8G8B8X8_UNORM },
+    { DRM_FORMAT_R8, VIRGL_FORMAT_R8_UNORM },
+    { DRM_FORMAT_YVU420, VIRGL_FORMAT_YV12 },
+  };
+  if (!virgl_format || !gbm_format || (*virgl_format && *gbm_format))
+    return -1;
+  for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+    if (formats[i].virgl == *virgl_format || formats[i].drm == *gbm_format) {
+      *virgl_format = formats[i].virgl;
+      *gbm_format = formats[i].drm;
+      return 0;
+    }
+  }
+  return -1;
 }
 
 int virgl_gbm_transfer(struct gbm_bo *bo, uint32_t direction,

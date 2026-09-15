@@ -70,6 +70,7 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
                                   const uint32_t *plane_offsets);
+bool virgl_egl_supports_dmabuf_import(struct virgl_egl *egl);
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);
 
 void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo);

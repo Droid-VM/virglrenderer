@@ -85,6 +85,9 @@ struct vrend_resource {
    /* IOV pointing to shared guest memory storage for this resource. */
    const struct iovec *iov;
    uint32_t num_iovs;
+   /* Layout of a linear blob staged through guest backing instead of EGL. */
+   uint32_t linear_blob_stride;
+   uint32_t linear_blob_offset;
    uint64_t mipmap_offsets[VR_MAX_TEXTURE_2D_LEVELS];
    void *gbm_bo, *egl_image;
    void *aux_plane_egl_image[VIRGL_GBM_MAX_PLANES];

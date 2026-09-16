@@ -38,11 +38,12 @@
  *     existing share66 GuestAccept path exactly like gfxstream today.
  *
  *  3) Fence seqno.  The msm protocol has the guest assign the submit seqno
- *     (MSM_SUBMIT_FENCE_SN_IN).  KGSL normally assigns its own timestamp, but
- *     KGSL_CONTEXT_USER_GENERATED_TS lets us pass the guest seqno straight
- *     through as the KGSL timestamp, so the two timelines stay identical.  A
- *     sync_file fd for the vdrm ring fence is obtained from the completed
- *     submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
+ *     (MSM_SUBMIT_FENCE_SN_IN).  KGSL normally assigns its own timestamp, and
+ *     its user-generated timestamp mode requires strictly increasing values.
+ *     A large guest submit may therefore be split into several KGSL submits;
+ *     a per-submitqueue map translates each guest fence to the final host
+ *     timestamp.  A sync_file fd for the vdrm ring fence is obtained from the
+ *     completed submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
  */
 
 #include <errno.h>
@@ -123,6 +124,14 @@ static uint64_t g_gmem_base;
 static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
+
+/* KGSL rejects a GPU_COMMAND with more than this many IB objects before it
+ * even looks at the command list.  Keep this local to the backend because the
+ * value is a KGSL kernel ABI limit, not part of the msm wire protocol. */
+#define KGSL_GPU_COMMAND_MAX_IBS 2000u
+
+/* Guest seqno 0 maps to KGSL timestamp 1 because timestamp 0 is reserved. */
+#define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
 
 /* KGSL reports Adreno 830 as the canonical FD chip id below.  The fuse byte
  * is stripped during probe, so this also covers revisions such as 0x44050001.
@@ -337,6 +346,95 @@ struct kgsl_object {
 };
 DEFINE_CAST(drm_object, kgsl_object)
 
+/* KGSL contexts use user-generated timestamps, while the msm protocol exposes
+ * its own per-submit fence sequence.  A large guest submit may need several
+ * KGSL submissions, so keep the final host timestamp for every guest fence. */
+struct kgsl_queue_timestamp_map {
+   uint32_t last_host_timestamp;
+   uint32_t *guest_fences;
+   uint32_t *host_timestamps;
+   size_t count;
+   size_t capacity;
+};
+
+static void
+kgsl_queue_timestamp_map_free(struct kgsl_queue_timestamp_map *map)
+{
+   if (!map)
+      return;
+   free(map->guest_fences);
+   free(map->host_timestamps);
+   free(map);
+}
+
+static void
+kgsl_queue_timestamp_map_delete(struct hash_entry *entry)
+{
+   kgsl_queue_timestamp_map_free(entry->data);
+}
+
+static bool
+kgsl_queue_timestamp_map_reserve(struct kgsl_queue_timestamp_map *map)
+{
+   if (map->count < map->capacity)
+      return true;
+
+   size_t new_capacity = map->capacity ? map->capacity * 2 : 64;
+   size_t bytes = size_mul(new_capacity, sizeof(*map->guest_fences));
+   if (new_capacity < map->capacity || bytes == SIZE_MAX ||
+       size_mul(new_capacity, sizeof(*map->host_timestamps)) == SIZE_MAX)
+      return false;
+
+   uint32_t *guest = realloc(map->guest_fences,
+                             new_capacity * sizeof(*map->guest_fences));
+   uint32_t *host = realloc(map->host_timestamps,
+                            new_capacity * sizeof(*map->host_timestamps));
+   if (!guest || !host) {
+      /* Keep the original arrays usable if either allocation failed. */
+      if (guest)
+         map->guest_fences = guest;
+      if (host)
+         map->host_timestamps = host;
+      return false;
+   }
+
+   map->guest_fences = guest;
+   map->host_timestamps = host;
+   map->capacity = new_capacity;
+   return true;
+}
+
+static bool
+kgsl_queue_timestamp_map_append(struct kgsl_queue_timestamp_map *map,
+                                 uint32_t guest_fence,
+                                 uint32_t host_timestamp)
+{
+   if (!kgsl_queue_timestamp_map_reserve(map))
+      return false;
+
+   map->guest_fences[map->count] = guest_fence;
+   map->host_timestamps[map->count] = host_timestamp;
+   map->count++;
+   map->last_host_timestamp = host_timestamp;
+   return true;
+}
+
+static bool
+kgsl_queue_timestamp_map_lookup(const struct kgsl_queue_timestamp_map *map,
+                                uint32_t guest_fence,
+                                uint32_t *host_timestamp)
+{
+   /* Fence values are normally monotonic.  Search backwards so a repeated
+    * value (from a malformed guest) resolves to the newest submission. */
+   for (size_t i = map->count; i > 0; i--) {
+      if (map->guest_fences[i - 1] == guest_fence) {
+         *host_timestamp = map->host_timestamps[i - 1];
+         return true;
+      }
+   }
+   return false;
+}
+
 struct kgsl_context {
    struct drm_context base;
 
@@ -380,9 +478,29 @@ struct kgsl_context {
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
 
+   /* Maps submitqueue-id to the host timestamp sequence used for KGSL. */
+   struct hash_table *sq_to_timestamp_table;
+
    struct drm_timeline timelines[];
 };
 DEFINE_CAST(drm_context, kgsl_context)
+
+static uint32_t
+kgsl_queue_timestamp(const struct kgsl_context *kctx, uint32_t queue_id,
+                     uint32_t guest_fence)
+{
+   struct hash_entry *entry = _mesa_hash_table_search(
+      kctx->sq_to_timestamp_table, (void *)(uintptr_t)queue_id);
+   uint32_t host_timestamp;
+
+   if (entry && kgsl_queue_timestamp_map_lookup(entry->data, guest_fence,
+                                                 &host_timestamp))
+      return host_timestamp;
+
+   /* Preserve the old behavior for a fence submitted before its map entry was
+    * recorded, and for queues created by an older in-process caller. */
+   return KGSL_GUEST_TS(guest_fence);
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -1214,8 +1332,6 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
  * the post-fault marker, not a timestamp rejection -- but ts=0 remains a
  * reserved value worth staying off of. Verified neutral on A830.)
  */
-#define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
-
 static int
 kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *out_id)
 {
@@ -1299,11 +1415,31 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       uint32_t id;
       rsp->ret = kgsl_drawctxt_create(kctx, q->prio, &id);
       if (!rsp->ret) {
+         struct kgsl_queue_timestamp_map *timestamps =
+            calloc(1, sizeof(*timestamps));
+         if (!timestamps) {
+            kgsl_drawctxt_destroy(kctx, id);
+            rsp->ret = -ENOMEM;
+            break;
+         }
+
          q->id = id;
          unsigned ring_idx = MIN2(q->prio, g_nr_timelines - 1) + 1;
-         _mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
-                                 (void *)(uintptr_t)id,
-                                 (void *)(uintptr_t)ring_idx);
+         if (!_mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
+                                      (void *)(uintptr_t)id,
+                                      (void *)(uintptr_t)ring_idx) ||
+             !_mesa_hash_table_insert(kctx->sq_to_timestamp_table,
+                                      (void *)(uintptr_t)id, timestamps)) {
+            _mesa_hash_table_remove_key(kctx->sq_to_ring_idx_table,
+                                        (void *)(uintptr_t)id);
+            struct hash_entry *entry = _mesa_hash_table_search(
+               kctx->sq_to_timestamp_table, (void *)(uintptr_t)id);
+            if (entry)
+               _mesa_hash_table_remove(kctx->sq_to_timestamp_table, entry);
+            kgsl_queue_timestamp_map_free(timestamps);
+            kgsl_drawctxt_destroy(kctx, id);
+            rsp->ret = -ENOMEM;
+         }
       }
       break;
    }
@@ -1312,6 +1448,12 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       kgsl_drawctxt_destroy(kctx, id);
       _mesa_hash_table_remove_key(kctx->sq_to_ring_idx_table,
                                   (void *)(uintptr_t)id);
+      struct hash_entry *timestamp_entry = _mesa_hash_table_search(
+         kctx->sq_to_timestamp_table, (void *)(uintptr_t)id);
+      if (timestamp_entry) {
+         kgsl_queue_timestamp_map_free(timestamp_entry->data);
+         _mesa_hash_table_remove(kctx->sq_to_timestamp_table, timestamp_entry);
+      }
       rsp->ret = 0;
       break;
    }
@@ -1840,24 +1982,99 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    }
    unsigned ring_idx = (uintptr_t)entry->data;
 
-   struct kgsl_gpu_command cmd = {
-      .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
-      .cmdlist = (uintptr_t)kcmds,
-      .cmdsize = sizeof(struct kgsl_command_object),
-      .numcmds = n,
-      .context_id = req->queue_id,
-      .timestamp = KGSL_GUEST_TS(req->fence), /* guest seqno (USER_GENERATED_TS) */
-   };
+   struct hash_entry *timestamp_entry = _mesa_hash_table_search(
+      kctx->sq_to_timestamp_table, (void *)(uintptr_t)req->queue_id);
+   if (!timestamp_entry) {
+      drm_err("missing timestamp state for submitqueue: %u", req->queue_id);
+      free(kcmds);
+      return -EINVAL;
+   }
+   struct kgsl_queue_timestamp_map *timestamps = timestamp_entry->data;
 
-   int ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
-   free(kcmds);
+   /* Reserve the mapping before submitting any work.  The guest fence must
+    * remain waitable even when this submit contains many KGSL chunks. */
+   if (!kgsl_queue_timestamp_map_reserve(timestamps)) {
+      drm_err("timestamp map allocation failed queue=%u fence=%u",
+              req->queue_id, req->fence);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
+   }
+
+   uint32_t first_timestamp = KGSL_GUEST_TS(req->fence);
+   if (first_timestamp <= timestamps->last_host_timestamp) {
+      if (timestamps->last_host_timestamp == UINT32_MAX) {
+         drm_err("KGSL timestamp sequence exhausted queue=%u", req->queue_id);
+         free(kcmds);
+         if (kctx->shmem)
+            kctx->shmem->async_error++;
+         return 0;
+      }
+      first_timestamp = timestamps->last_host_timestamp + 1;
+   }
+
+   const unsigned chunk_count = (n - 1) / KGSL_GPU_COMMAND_MAX_IBS + 1;
+   uint64_t final_timestamp64 = (uint64_t)first_timestamp + chunk_count - 1;
+   if (final_timestamp64 > UINT32_MAX) {
+      drm_err("KGSL timestamp range exhausted queue=%u fence=%u chunks=%u",
+              req->queue_id, req->fence, chunk_count);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
+   }
+
+   int ret = 0;
+   unsigned submitted = 0;
+   for (unsigned chunk = 0; chunk < chunk_count; chunk++) {
+      unsigned first = chunk * KGSL_GPU_COMMAND_MAX_IBS;
+      unsigned count = MIN2(n - first, KGSL_GPU_COMMAND_MAX_IBS);
+      struct kgsl_gpu_command cmd = {
+         .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
+         .cmdlist = (uintptr_t)&kcmds[first],
+         .cmdsize = sizeof(struct kgsl_command_object),
+         .numcmds = count,
+         .context_id = req->queue_id,
+         .timestamp = first_timestamp + chunk,
+      };
+
+      ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
+      if (ret)
+         break;
+      submitted++;
+   }
 
    if (ret) {
-      drm_err("GPU_COMMAND failed: %s", strerror(errno));
+      drm_err("GPU_COMMAND failed: %s queue=%u fence=%u cmds=%u "
+              "chunk=%u/%u submitted=%u", strerror(errno), req->queue_id,
+              req->fence, n, submitted, chunk_count, submitted);
+      if (submitted < chunk_count) {
+         unsigned first = submitted * KGSL_GPU_COMMAND_MAX_IBS;
+         unsigned count = MIN2(n - first, KGSL_GPU_COMMAND_MAX_IBS);
+         drm_err("GPU_COMMAND failed chunk range: [%u, %u)", first,
+                 first + count);
+      }
+      free(kcmds);
       if (kctx->shmem)
          kctx->shmem->async_error++;
       return 0; /* async error, not a protocol error */
    }
+
+   uint32_t final_timestamp = (uint32_t)final_timestamp64;
+   if (!kgsl_queue_timestamp_map_append(timestamps, req->fence,
+                                        final_timestamp)) {
+      /* This should be impossible because the slot was reserved above, but
+       * keep the submit from becoming unwaitable if the map implementation
+       * changes later. */
+      drm_err("timestamp map append failed queue=%u fence=%u",
+              req->queue_id, req->fence);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
+   }
+   free(kcmds);
 
 
    /* Feed the ring timeline so the vdrm ring fence signals when the GPU passes
@@ -1869,12 +2086,12 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (!getenv("NCTX_NO_FENCE")) {
       if (kctx->use_wait_timestamp) {
          drm_timeline_set_last_timestamp(&kctx->timelines[ring_idx - 1],
-                                         req->queue_id, KGSL_GUEST_TS(req->fence));
+                                         req->queue_id, final_timestamp);
       } else {
          struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
          struct kgsl_timestamp_event event = {
             .type = KGSL_TIMESTAMP_EVENT_FENCE,
-            .timestamp = KGSL_GUEST_TS(req->fence),
+            .timestamp = final_timestamp,
             .context_id = req->queue_id,
             .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
             .len = sizeof(fence_priv),
@@ -1926,7 +2143,7 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     */
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
-      .timestamp = KGSL_GUEST_TS(req->fence),
+      .timestamp = kgsl_queue_timestamp(kctx, req->queue_id, req->fence),
       .timeout = 0,
    };
 
@@ -2471,6 +2688,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
       close(kctx->dma_heap_fd);
 
    _mesa_hash_table_destroy(kctx->sq_to_ring_idx_table, NULL);
+   _mesa_hash_table_destroy(kctx->sq_to_timestamp_table,
+                            kgsl_queue_timestamp_map_delete);
 
    free(kctx);
 }
@@ -2533,8 +2752,10 @@ drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *deb
       calloc(1, sizeof(*kctx) + g_nr_timelines * sizeof(kctx->timelines[0]));
    if (!kctx)
       return NULL;
+   bool drm_initialized = false;
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+   kctx->dma_heap_fd = -1;
    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
@@ -2579,8 +2800,14 @@ drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *deb
 
    if (!drm_context_init(&kctx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch)))
       goto fail_early;
+   drm_initialized = true;
 
    kctx->sq_to_ring_idx_table = _mesa_hash_table_create_u32_keys(NULL);
+   kctx->sq_to_timestamp_table = _mesa_hash_table_create_u32_keys(NULL);
+   if (!kctx->sq_to_ring_idx_table || !kctx->sq_to_timestamp_table) {
+      drm_err("submitqueue timestamp table allocation failed");
+      goto fail_early;
+   }
 
    for (unsigned i = 0; i < g_nr_timelines; i++) {
       drm_timeline_init(&kctx->timelines[i], &kctx->base.base, "kgsl-sync",
@@ -2611,9 +2838,15 @@ fail_early:
     * failed create (e.g. drm_context_init OOM) permanently leaks a slice;
     * after 32 leaks all CtxCreate return ENOMEM until crosvm restarts. */
    kgsl_va_slice_release(kctx);
+   if (drm_initialized)
+      drm_context_deinit(&kctx->base);
+   _mesa_hash_table_destroy(kctx->sq_to_ring_idx_table, NULL);
+   _mesa_hash_table_destroy(kctx->sq_to_timestamp_table,
+                            kgsl_queue_timestamp_map_delete);
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
-   close(fd);
+   if (!drm_initialized)
+      close(fd);
    free(kctx);
    return NULL;
 }

@@ -133,6 +133,34 @@ static unsigned g_nr_timelines;
 /* Guest seqno 0 maps to KGSL timestamp 1 because timestamp 0 is reserved. */
 #define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
 
+/*
+ * Power constraint.  msm-adreno-tz / GMU treat virtio IBs as idle, so a
+ * native-game-style KGSL_PROP_PWR_CONSTRAINT floor is required.  This kernel
+ * rejects PWR_PERC_* and accepts PWR_MAX.
+ *
+ * Do not vote MAX on every GPU_COMMAND: guest DWM presents every vsync
+ * (~70-120/s) and would pin turbo for the whole session.  A process-wide
+ * 250 ms window of GPU_COMMAND rate decides (DWM and MC share the
+ * Graphics ring, so queue ordinals cannot split them):
+ *   >= enter (default 130/s) -> SETPROPERTY MAX
+ *   hold_ms (default 400) below enter -> CONSTRAINT_NONE
+ * Idle desktop is DWM-only (~70-120/s).  MC+DWM was ~210/s.  After MC
+ * exits the window falls back to DWM and the hold expires.
+ * NCTX_PWR_CONSTRAINT:
+ *   unset / max            -> rate hysteresis + PWR_MAX
+ *   always                 -> every submit MAX (old pin-the-clock behaviour)
+ *   perc / perc:N          -> same hysteresis, PWR_PERC N (falls back)
+ *   0 / off                -> disabled
+ * NCTX_PWR_ENTER, NCTX_PWR_HOLD_MS override the thresholds.
+ */
+#define KGSL_PWR_KIND_OFF     0
+#define KGSL_PWR_KIND_PERC    1
+#define KGSL_PWR_KIND_MAX     2
+#define KGSL_PWR_PERC_DEFAULT 80u
+#define KGSL_PWR_WIN_NS       (250ull * 1000000ull)
+#define KGSL_PWR_ENTER_DEFAULT 130u
+#define KGSL_PWR_HOLD_MS_DEFAULT 400u
+
 /* KGSL reports Adreno 830 as the canonical FD chip id below.  The fuse byte
  * is stripped during probe, so this also covers revisions such as 0x44050001.
  */
@@ -516,6 +544,213 @@ kgsl_ioctl(int fd, unsigned long request, void *arg)
       ret = ioctl(fd, request, arg);
    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
    return ret;
+}
+
+/* Process-wide: SETPROPERTY of a perc level that this kernel rejects is
+ * remembered so later submits skip the failing flavour. */
+static pthread_once_t g_pwr_once = PTHREAD_ONCE_INIT;
+static mtx_t g_pwr_mutex;
+static int g_pwr_kind = KGSL_PWR_KIND_MAX;
+static unsigned g_pwr_perc = KGSL_PWR_PERC_DEFAULT;
+static bool g_pwr_perc_ok = true;
+static bool g_pwr_always;
+static unsigned g_pwr_enter = KGSL_PWR_ENTER_DEFAULT;
+static unsigned g_pwr_hold_ms = KGSL_PWR_HOLD_MS_DEFAULT;
+static uint64_t g_pwr_win_start_ns;
+static uint32_t g_pwr_win_subs;
+static uint64_t g_pwr_last_hot_ns;
+static bool g_pwr_hot;
+static bool g_pwr_applied;
+static uint32_t g_pwr_last_ctx;
+static int g_pwr_last_fd = -1;
+
+static uint64_t
+kgsl_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static unsigned
+kgsl_env_uint(const char *name, unsigned def)
+{
+   const char *e = getenv(name);
+   if (!e || !e[0])
+      return def;
+   return (unsigned)atoi(e);
+}
+
+static void
+kgsl_pwr_init_once(void)
+{
+   const char *env = getenv("NCTX_PWR_CONSTRAINT");
+   mtx_init(&g_pwr_mutex, mtx_plain);
+   g_pwr_kind = KGSL_PWR_KIND_MAX;
+   g_pwr_perc = KGSL_PWR_PERC_DEFAULT;
+   g_pwr_always = false;
+   g_pwr_enter = kgsl_env_uint("NCTX_PWR_ENTER", KGSL_PWR_ENTER_DEFAULT);
+   g_pwr_hold_ms = kgsl_env_uint("NCTX_PWR_HOLD_MS", KGSL_PWR_HOLD_MS_DEFAULT);
+   if (g_pwr_enter < 1)
+      g_pwr_enter = 1;
+   if (g_pwr_hold_ms < 50)
+      g_pwr_hold_ms = 50;
+   if (!env || !env[0])
+      return;
+   if (!strcmp(env, "0") || !strcmp(env, "off")) {
+      g_pwr_kind = KGSL_PWR_KIND_OFF;
+      return;
+   }
+   if (!strcmp(env, "always")) {
+      g_pwr_always = true;
+      return;
+   }
+   if (!strcmp(env, "max"))
+      return;
+   if (!strncmp(env, "perc:", 5)) {
+      unsigned v = (unsigned)atoi(env + 5);
+      g_pwr_kind = KGSL_PWR_KIND_PERC;
+      if (v < (unsigned)KGSL_CONSTRAINT_PWR_PERC_MIN)
+         v = KGSL_CONSTRAINT_PWR_PERC_MIN;
+      if (v > (unsigned)KGSL_CONSTRAINT_PWR_PERC_MAX)
+         v = KGSL_CONSTRAINT_PWR_PERC_MAX;
+      g_pwr_perc = v;
+      return;
+   }
+   if (!strcmp(env, "perc")) {
+      g_pwr_kind = KGSL_PWR_KIND_PERC;
+      return;
+   }
+   drm_log("NCTX_PWR_CONSTRAINT=%s unrecognised; using rate+PWR_MAX", env);
+}
+
+static int
+kgsl_pwr_set(int fd, uint32_t ctx_id, unsigned type, unsigned level)
+{
+   struct kgsl_device_constraint_pwrlevel pwr = { .level = level };
+   struct kgsl_device_constraint c = {
+      .type = type,
+      .context_id = ctx_id,
+      .data = &pwr,
+      .size = type == KGSL_CONSTRAINT_NONE ? 0 : sizeof(pwr),
+   };
+   struct kgsl_device_getproperty req = {
+      .type = KGSL_PROP_PWR_CONSTRAINT,
+      .value = &c,
+      .sizebytes = sizeof(c),
+   };
+   if (type == KGSL_CONSTRAINT_NONE) {
+      c.data = NULL;
+      c.size = 0;
+   }
+   return kgsl_ioctl(fd, IOCTL_KGSL_SETPROPERTY, &req);
+}
+
+static void
+kgsl_pwr_apply(int fd, uint32_t ctx_id)
+{
+   int ret;
+
+   if (g_pwr_kind == KGSL_PWR_KIND_OFF)
+      return;
+
+   if (g_pwr_kind == KGSL_PWR_KIND_PERC && g_pwr_perc_ok) {
+      ret = kgsl_pwr_set(fd, ctx_id, KGSL_CONSTRAINT_PWRLEVEL, g_pwr_perc);
+      if (ret == 0) {
+         if (!g_pwr_applied)
+            drm_log("PWR_CONSTRAINT perc:%u on ctx %u", g_pwr_perc, ctx_id);
+         g_pwr_applied = true;
+         g_pwr_last_ctx = ctx_id;
+         g_pwr_last_fd = fd;
+         return;
+      }
+      drm_log("PWR_PERC %u rejected (%s); falling back to PWR_MAX",
+              g_pwr_perc, strerror(errno));
+      g_pwr_perc_ok = false;
+   }
+
+   ret = kgsl_pwr_set(fd, ctx_id, KGSL_CONSTRAINT_PWRLEVEL,
+                      KGSL_CONSTRAINT_PWR_MAX);
+   if (ret == 0) {
+      if (!g_pwr_applied)
+         drm_log("PWR_CONSTRAINT PWR_MAX on ctx %u", ctx_id);
+      g_pwr_applied = true;
+      g_pwr_kind = KGSL_PWR_KIND_MAX;
+      g_pwr_last_ctx = ctx_id;
+      g_pwr_last_fd = fd;
+      return;
+   }
+   drm_log("PWR_CONSTRAINT failed (%s); disabling", strerror(errno));
+   g_pwr_kind = KGSL_PWR_KIND_OFF;
+}
+
+static void
+kgsl_pwr_clear(void)
+{
+   if (!g_pwr_applied || g_pwr_last_fd < 0)
+      return;
+   (void)kgsl_pwr_set(g_pwr_last_fd, g_pwr_last_ctx, KGSL_CONSTRAINT_NONE, 0);
+   g_pwr_applied = false;
+}
+
+/* Process-wide 250 ms GPU_COMMAND window.  Returns whether this cmdbatch
+ * should carry KGSL_CMDBATCH_PWR_CONSTRAINT. */
+static bool
+kgsl_pwr_on_submit(int fd, uint32_t ctx_id)
+{
+   uint64_t now, hold_ns, elapsed;
+   uint32_t rate;
+   bool want_hot, was_hot;
+
+   pthread_once(&g_pwr_once, kgsl_pwr_init_once);
+   if (g_pwr_kind == KGSL_PWR_KIND_OFF)
+      return false;
+
+   mtx_lock(&g_pwr_mutex);
+   now = kgsl_now_ns();
+   if (g_pwr_always) {
+      kgsl_pwr_apply(fd, ctx_id);
+      mtx_unlock(&g_pwr_mutex);
+      return g_pwr_applied;
+   }
+
+   if (!g_pwr_win_start_ns)
+      g_pwr_win_start_ns = now;
+   g_pwr_win_subs++;
+   elapsed = now - g_pwr_win_start_ns;
+   if (elapsed >= KGSL_PWR_WIN_NS) {
+      rate = (uint32_t)((g_pwr_win_subs * 1000000000ull) / elapsed);
+      g_pwr_win_start_ns = now;
+      g_pwr_win_subs = 0;
+   } else if (elapsed > 0) {
+      rate = (uint32_t)((g_pwr_win_subs * 1000000000ull) / elapsed);
+   } else {
+      rate = 0;
+   }
+
+   was_hot = g_pwr_hot;
+   if (rate >= g_pwr_enter) {
+      g_pwr_last_hot_ns = now;
+      want_hot = true;
+   } else {
+      hold_ns = (uint64_t)g_pwr_hold_ms * 1000000ull;
+      want_hot = g_pwr_hot && g_pwr_last_hot_ns &&
+                 (now - g_pwr_last_hot_ns) < hold_ns;
+   }
+
+   if (want_hot && !was_hot)
+      drm_log("PWR hot ctx %u rate=%u/s", ctx_id, rate);
+   else if (!want_hot && was_hot)
+      drm_log("PWR cold ctx %u rate=%u/s", ctx_id, rate);
+   g_pwr_hot = want_hot;
+
+   if (want_hot)
+      kgsl_pwr_apply(fd, ctx_id);
+   else
+      kgsl_pwr_clear();
+
+   mtx_unlock(&g_pwr_mutex);
+   return g_pwr_applied && g_pwr_hot;
 }
 
 /* Guest turnip allocates every BO from the VA range returned by GET_PARAM.
@@ -1340,16 +1575,25 @@ kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *
     * USER_GENERATED_TS so KGSL takes the timestamp from us.  Adding TYPE_VK /
     * PER_CONTEXT_TS / a priority band made DRAWCTXT_CREATE return EINVAL.
     */
+   /* PWR_CONSTRAINT lets SETPROPERTY(KGSL_PROP_PWR_CONSTRAINT) stick to this
+    * drawctxt.  TYPE_VK / PER_CONTEXT_TS already EINVAL on this device; if
+    * this bit is also rejected, retry without it -- SETPROPERTY may still
+    * work, and if it does not we disable the feature after the first fail. */
+   const uint32_t base_flags = KGSL_CONTEXT_SAVE_GMEM |
+                               KGSL_CONTEXT_NO_GMEM_ALLOC |
+                               KGSL_CONTEXT_PREAMBLE |
+                               KGSL_CONTEXT_USER_GENERATED_TS;
    struct kgsl_drawctxt_create req = {
-      .flags = KGSL_CONTEXT_SAVE_GMEM |
-               KGSL_CONTEXT_NO_GMEM_ALLOC |
-               KGSL_CONTEXT_PREAMBLE |
-               KGSL_CONTEXT_USER_GENERATED_TS,
+      .flags = base_flags | KGSL_CONTEXT_PWR_CONSTRAINT,
    };
 
    if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
-      drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
-      return -errno;
+      req.flags = base_flags;
+      req.drawctxt_id = 0;
+      if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
+         drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
+         return -errno;
+      }
    }
 
    *out_id = req.drawctxt_id;
@@ -2027,11 +2271,15 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 
    int ret = 0;
    unsigned submitted = 0;
+   /* Rate window is process-wide (DWM+MC share the Graphics ring).  The
+    * cmdbatch flag is what makes a stored SETPROPERTY floor take effect. */
+   const bool pwr_flag = kgsl_pwr_on_submit(dctx->fd, req->queue_id);
    for (unsigned chunk = 0; chunk < chunk_count; chunk++) {
       unsigned first = chunk * KGSL_GPU_COMMAND_MAX_IBS;
       unsigned count = MIN2(n - first, KGSL_GPU_COMMAND_MAX_IBS);
       struct kgsl_gpu_command cmd = {
-         .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
+         .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST |
+                  (pwr_flag ? KGSL_CMDBATCH_PWR_CONSTRAINT : 0),
          .cmdlist = (uintptr_t)&kcmds[first],
          .cmdsize = sizeof(struct kgsl_command_object),
          .numcmds = count,

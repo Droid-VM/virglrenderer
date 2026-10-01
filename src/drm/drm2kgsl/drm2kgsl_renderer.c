@@ -2258,7 +2258,10 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       first_timestamp = timestamps->last_host_timestamp + 1;
    }
 
-   const unsigned chunk_count = (n - 1) / KGSL_GPU_COMMAND_MAX_IBS + 1;
+   /* Filtering can leave no IBs. Preserve the empty KGSL marker submit
+    * without underflowing n - 1 and generating out-of-bounds chunks. */
+   const unsigned chunk_count =
+      n ? (n - 1) / KGSL_GPU_COMMAND_MAX_IBS + 1 : 1;
    uint64_t final_timestamp64 = (uint64_t)first_timestamp + chunk_count - 1;
    if (final_timestamp64 > UINT32_MAX) {
       drm_err("KGSL timestamp range exhausted queue=%u fence=%u chunks=%u",

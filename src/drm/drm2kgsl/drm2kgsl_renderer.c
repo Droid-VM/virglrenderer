@@ -379,6 +379,7 @@ DEFINE_CAST(drm_object, kgsl_object)
  * KGSL submissions, so keep the final host timestamp for every guest fence. */
 struct kgsl_queue_timestamp_map {
    uint32_t last_host_timestamp;
+   uint32_t last_fault_count;
    uint32_t *guest_fences;
    uint32_t *host_timestamps;
    size_t count;
@@ -508,6 +509,9 @@ struct kgsl_context {
 
    /* Maps submitqueue-id to the host timestamp sequence used for KGSL. */
    struct hash_table *sq_to_timestamp_table;
+
+   /* Cumulative faults in this guest context, including closed queues. */
+   uint64_t fault_count;
 
    struct drm_timeline timelines[];
 };
@@ -1534,6 +1538,42 @@ kgsl_ccmd_nop(UNUSED struct drm_context *dctx, UNUSED struct vdrm_ccmd_req *hdr)
    return 0;
 }
 
+static int
+kgsl_query_faults(struct kgsl_context *kctx, uint64_t *value)
+{
+   /* KGSL can force-retire a faulted drawobj and replay later submissions.
+    * A later userspace fence write therefore does not prove fault-free
+    * execution. Query only this guest's owned contexts, never global sysfs
+    * counters (which also include unrelated Android applications).
+    * Called on the serialized command path, like queue create/close. */
+   hash_table_foreach(kctx->sq_to_timestamp_table, entry) {
+      struct kgsl_queue_timestamp_map *map = entry->data;
+      struct kgsl_context_property_fault faults = { 0 };
+      struct kgsl_context_property property = {
+         .data = (uintptr_t)&faults,
+         .size = sizeof(faults),
+         .type = KGSL_CONTEXT_PROP_FAULTS,
+         .contextid = (uintptr_t)entry->key,
+      };
+      int ret = kgsl_getprop(kctx->base.fd, KGSL_PROP_CONTEXT_PROPERTY,
+                            &property, sizeof(property));
+      if (ret)
+         return -errno;
+
+      uint32_t count = (uint32_t)faults.faults;
+      if (count != map->last_fault_count) {
+         kctx->fault_count += (uint32_t)(count - map->last_fault_count);
+         map->last_fault_count = count;
+         drm_err("GPU fault queue=%u timestamp=%u count=%u",
+                 property.contextid, faults.timestamp, count);
+      }
+   }
+   if (kctx->shmem)
+      kctx->shmem->global_faults = (uint32_t)kctx->fault_count;
+   *value = kctx->fault_count;
+   return 0;
+}
+
 /* Map an MSM_PARAM_* to the value the guest expects, from cached KGSL props. */
 static uint64_t
 kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
@@ -1552,7 +1592,6 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
       /* Best-effort GPU timestamp; not all guests query this. */
       return 0;
    }
-   case MSM_PARAM_FAULTS:      return 0;
    default:
       drm_dbg("unhandled MSM_PARAM %u", param);
       return 0;
@@ -1646,8 +1685,14 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    switch (iocnr) {
    case DRM_MSM_GET_PARAM: {
       struct drm_msm_param *p = (void *)payload;
-      p->value = kgsl_msm_param(kctx, p->param);
-      rsp->ret = 0;
+      if (p->param == MSM_PARAM_FAULTS) {
+         uint64_t value = 0;
+         rsp->ret = kgsl_query_faults(kctx, &value);
+         p->value = value;
+      } else {
+         p->value = kgsl_msm_param(kctx, p->param);
+         rsp->ret = 0;
+      }
       break;
    }
    case DRM_MSM_SET_PARAM:
@@ -1689,6 +1734,10 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    }
    case DRM_MSM_SUBMITQUEUE_CLOSE: {
       uint32_t id = *(uint32_t *)payload;
+      uint64_t ignored;
+      int fault_ret = kgsl_query_faults(kctx, &ignored);
+      if (fault_ret && kctx->shmem)
+         kctx->shmem->async_error++;
       kgsl_drawctxt_destroy(kctx, id);
       _mesa_hash_table_remove_key(kctx->sq_to_ring_idx_table,
                                   (void *)(uintptr_t)id);

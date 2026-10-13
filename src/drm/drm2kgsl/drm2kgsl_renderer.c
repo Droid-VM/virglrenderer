@@ -129,6 +129,12 @@ static unsigned g_nr_timelines;
  * even looks at the command list.  Keep this local to the backend because the
  * value is a KGSL kernel ABI limit, not part of the msm wire protocol. */
 #define KGSL_GPU_COMMAND_MAX_IBS 2000u
+/* A830 can fault when a large indirect HFI IB list is followed by another
+ * submission before it retires. This also reproduces with standalone KGSL
+ * CP_MEM_WRITE/NOP IBs, without a guest or renderer. Keep its IB descriptors
+ * inline: (1024-byte HFI message - 32-byte hfi_submit_cmd) / 12-byte IB = 82.
+ * Split asynchronously and retain the final chunk's GPU completion point. */
+#define KGSL_A830_GPU_COMMAND_MAX_IBS 82u
 
 /* Guest seqno 0 maps to KGSL timestamp 1 because timestamp 0 is reserved. */
 #define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
@@ -2307,10 +2313,14 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       first_timestamp = timestamps->last_host_timestamp + 1;
    }
 
+   const unsigned max_ibs = g_chip_id == KGSL_A830_CHIP_ID
+                               ? KGSL_A830_GPU_COMMAND_MAX_IBS
+                               : KGSL_GPU_COMMAND_MAX_IBS;
+
    /* Filtering can leave no IBs. Preserve the empty KGSL marker submit
     * without underflowing n - 1 and generating out-of-bounds chunks. */
    const unsigned chunk_count =
-      n ? (n - 1) / KGSL_GPU_COMMAND_MAX_IBS + 1 : 1;
+      n ? (n - 1) / max_ibs + 1 : 1;
    uint64_t final_timestamp64 = (uint64_t)first_timestamp + chunk_count - 1;
    if (final_timestamp64 > UINT32_MAX) {
       drm_err("KGSL timestamp range exhausted queue=%u fence=%u chunks=%u",
@@ -2327,8 +2337,8 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     * cmdbatch flag is what makes a stored SETPROPERTY floor take effect. */
    const bool pwr_flag = kgsl_pwr_on_submit(dctx->fd, req->queue_id);
    for (unsigned chunk = 0; chunk < chunk_count; chunk++) {
-      unsigned first = chunk * KGSL_GPU_COMMAND_MAX_IBS;
-      unsigned count = MIN2(n - first, KGSL_GPU_COMMAND_MAX_IBS);
+      unsigned first = chunk * max_ibs;
+      unsigned count = MIN2(n - first, max_ibs);
       struct kgsl_gpu_command cmd = {
          .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST |
                   (pwr_flag ? KGSL_CMDBATCH_PWR_CONSTRAINT : 0),
@@ -2350,8 +2360,8 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
               "chunk=%u/%u submitted=%u", strerror(errno), req->queue_id,
               req->fence, n, submitted, chunk_count, submitted);
       if (submitted < chunk_count) {
-         unsigned first = submitted * KGSL_GPU_COMMAND_MAX_IBS;
-         unsigned count = MIN2(n - first, KGSL_GPU_COMMAND_MAX_IBS);
+         unsigned first = submitted * max_ibs;
+         unsigned count = MIN2(n - first, max_ibs);
          drm_err("GPU_COMMAND failed chunk range: [%u, %u)", first,
                  first + count);
       }

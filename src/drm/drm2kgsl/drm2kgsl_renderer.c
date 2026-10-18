@@ -1934,15 +1934,20 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (!rsp)
       return -ENOMEM;
 
-   /* Non-blocking poll (timeout 0): the guest polls if not yet signaled, so we
-    * never stall the single-threaded host.  KGSL returns 0 when the GPU has
-    * passed the timestamp, or -ETIMEDOUT / -EDEADLK otherwise; both are
-    * reported verbatim.
+   /* Bounded poll.  The guest polls when the fence is not yet signaled, so this
+    * must not stall the single-threaded host -- but a timeout of 0 does *not*
+    * mean "non-blocking" to KGSL: it means "wait indefinitely".  Whenever the
+    * fence was not yet retired the ioctl therefore never returned, no further
+    * CCMD was ever published, and the guest VM froze (observed as
+    * "CCMD enter WAIT_FENCE" without a matching handler_done).  A small positive
+    * timeout keeps the wait bounded; KGSL returns 0 once the GPU has passed the
+    * timestamp, or -ETIMEDOUT / -EDEADLK otherwise, both reported verbatim so
+    * the guest can poll again.
     */
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
       .timestamp = KGSL_GUEST_TS(req->fence),
-      .timeout = 0,
+      .timeout = 1,
    };
 
    rsp->ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait)

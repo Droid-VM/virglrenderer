@@ -344,6 +344,16 @@ struct kgsl_context {
     * process environment is modified later. */
    bool use_wait_timestamp;
 
+   /* WAIT_FENCE fast-path state. The handler queries the retired timestamp
+    * instead of sleeping in WAITTIMESTAMP_CTXTID; if this kernel does not
+    * implement that query we must not re-issue a failing ioctl on every guest
+    * poll (~250/s), so the failure is latched here and the bounded fallback is
+    * used for the rest of the context's life. */
+   bool wait_fence_readts_unsupported;
+   uint64_t wait_fence_readts_calls;
+   uint64_t wait_fence_readts_ready;
+   uint64_t wait_fence_fallback_calls;
+
    struct msm_shmem *shmem;
 
    /* The per-context VBO that owns the whole guest VA range. */
@@ -1934,19 +1944,73 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (!rsp)
       return -ENOMEM;
 
-   /* Bounded poll.  The guest polls when the fence is not yet signaled, so this
-    * must not stall the single-threaded host -- but a timeout of 0 does *not*
-    * mean "non-blocking" to KGSL: it means "wait indefinitely".  Whenever the
-    * fence was not yet retired the ioctl therefore never returned, no further
-    * CCMD was ever published, and the guest VM froze (observed as
-    * "CCMD enter WAIT_FENCE" without a matching handler_done).  A small positive
-    * timeout keeps the wait bounded; KGSL returns 0 once the GPU has passed the
-    * timestamp, or -ETIMEDOUT / -EDEADLK otherwise, both reported verbatim so
-    * the guest can poll again.
+   /* Never stall the single-threaded host: the guest polls if the fence is not
+    * yet signaled, so this handler must always return promptly.
+    *
+    * DroidVM_F: timeout 0 is NOT a non-blocking poll here -- KGSL treats a zero
+    * timeout as "wait indefinitely", which is exactly what we observed on the
+    * tablet: a WAIT_FENCE ccmd entered the dispatcher and never came back
+    * (round-trip probe: "CCMD enter WAIT_FENCE ... n=49" with no matching
+    * handler_done), wedging the guest VM.
+    *
+    * DroidVM_F2 (this change): even a 1ms timeout costs the host real time --
+    * the guest polls WAIT_FENCE ~250x/s, and the ioctl's own tail in the probe
+    * was p99 = max = 8004us, i.e. it does not honour 1ms on this kernel.  Under
+    * bursty submission (measured up to 2895 submits/s) that turns into seconds
+    * of host backlog, which the guest then waits out as multi-second stalls.
+    *
+    * So query first: KGSL_TIMESTAMP_RETIRED via READTIMESTAMP_CTXTID is a plain
+    * read (no wait) and tells us exactly whether the GPU passed the timestamp,
+    * which is the same condition WAITTIMESTAMP waits for.  Not retired => report
+    * -ETIMEDOUT immediately (guest re-polls after its backoff, same semantics as
+    * before) instead of sleeping in the kernel.  If the kernel rejects that
+    * ioctl we cache the failure once and keep the old bounded path, so this can
+    * never make the machine worse than it was.
     */
+   const uint32_t ts = KGSL_GUEST_TS(req->fence);
+
+   if (!kctx->wait_fence_readts_unsupported) {
+      struct kgsl_cmdstream_readtimestamp_ctxtid read = {
+         .context_id = req->queue_id,
+         .type = KGSL_TIMESTAMP_RETIRED,
+         .timestamp = 0,
+      };
+
+      if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &read)) {
+         kctx->wait_fence_readts_calls++;
+
+         if (read.timestamp >= ts) {
+            kctx->wait_fence_readts_ready++;
+            rsp->ret = 0;
+         } else {
+            rsp->ret = -ETIMEDOUT;
+         }
+
+         if ((kctx->wait_fence_readts_calls & 4095) == 0) {
+            drm_log("wait_fence: nonblocking readts calls=%" PRIu64 " ready=%" PRIu64
+                    " notready=%" PRIu64 " (guest re-polls; host never sleeps)",
+                    kctx->wait_fence_readts_calls, kctx->wait_fence_readts_ready,
+                    kctx->wait_fence_readts_calls - kctx->wait_fence_readts_ready);
+         }
+
+         return 0;
+      }
+
+      kctx->wait_fence_readts_unsupported = true;
+      drm_log("wait_fence: READTIMESTAMP_CTXTID unavailable (%s); "
+              "falling back to the bounded 1ms WAITTIMESTAMP path",
+              strerror(errno));
+   }
+
+   kctx->wait_fence_fallback_calls++;
+   if ((kctx->wait_fence_fallback_calls & 1023) == 0) {
+      drm_log("wait_fence: bounded fallback in use, calls=%" PRIu64,
+              kctx->wait_fence_fallback_calls);
+   }
+
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
-      .timestamp = KGSL_GUEST_TS(req->fence),
+      .timestamp = ts,
       .timeout = 1,
    };
 

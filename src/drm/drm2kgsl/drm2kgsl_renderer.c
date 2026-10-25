@@ -377,6 +377,14 @@ struct kgsl_context {
     * and is reported rather than silently dropping an fd. */
    int pending_guest_fd;
 
+   /* The guest hands a guest-allocated BO's pages back to its own allocator once the resource
+    * is gone (an iPadOS guest, whose context names start "xnu:"; NCTX_UNBIND_FREED for any).
+    * A stale VBO range of such a BO maps pages the guest has since given to something else, and
+    * a GPU access through it lands there silently, so this context unbinds a freed BO's ranges
+    * and clears its slice when it goes (see kgsl_renderer_free_object).  Off for other guests:
+    * the no-unbind rule below stays theirs. */
+   bool unbind_freed;
+
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
 
@@ -1152,6 +1160,14 @@ kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
    /* obj->map aliases host_map for our memfd BOs -- only free a distinct one. */
    if (obj->map && obj->map != obj->host_map)
       munmap(obj->map, obj->blob_size);
+
+   /* A guest-allocated BO in a context that unbinds them: every range of it in this context's
+    * slice goes before the free (an unbind names its child, so a BO bound since over part of the
+    * range keeps its own), and a later access through a stale VA reads KGSL's zero page instead
+    * of pages the guest reused.  The guest has waited for this context's submissions first. */
+   if (kctx->unbind_freed && obj->guest_alloc)
+      kgsl_vbo_op(kctx, obj->mem_id, kctx->va_slice_base, kctx->va_slice_size,
+                  KGSL_GPUMEM_RANGE_OP_UNBIND);
 
    kgsl_free_gpuobj(dctx->fd, obj->mem_id); /* releases the useraddr pin first */
 
@@ -2477,6 +2493,12 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
       kctx->shmem_arena_backed = false;
    }
 
+   /* A context that unbinds freed BOs leaves nothing bound in its slice either: an unbind of
+    * child 0 clears the whole range, whatever it maps (ranges of BOs it moved or imported), so
+    * the next context to claim the slice starts from the zero page. */
+   if (kctx->unbind_freed && kctx->va_slice_idx >= 0)
+      kgsl_vbo_op(kctx, 0, kctx->va_slice_base, kctx->va_slice_size, KGSL_GPUMEM_RANGE_OP_UNBIND);
+
    drm_context_deinit(dctx); /* frees remaining objects via free_object */
 
 
@@ -2537,7 +2559,7 @@ kgsl_alloc_vbo(int fd, uint32_t *out_id, uint64_t *out_base, uint64_t *out_size)
 }
 
 struct virgl_context *
-drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
+drm2kgsl_renderer_create(int fd, size_t debug_len, const char *debug_name)
 {
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG context-create pid=%d", getpid());
@@ -2551,6 +2573,10 @@ drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *deb
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
+   kctx->unbind_freed = getenv("NCTX_UNBIND_FREED") ||
+      (debug_name && debug_len >= 4 && !strncmp(debug_name, "xnu:", 4));
+   drm_log("context %.*s: unbind freed guest BOs %s", (int)(debug_name ? debug_len : 0),
+           debug_name ? debug_name : "", kctx->unbind_freed ? "on" : "off");
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
                     " mode=%s",

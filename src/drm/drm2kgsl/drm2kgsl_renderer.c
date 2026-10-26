@@ -378,11 +378,15 @@ struct kgsl_context {
    int pending_guest_fd;
 
    /* The guest hands a guest-allocated BO's pages back to its own allocator once the resource
-    * is gone (an iPadOS guest, whose context names start "xnu:"; NCTX_UNBIND_FREED for any).
-    * A stale VBO range of such a BO maps pages the guest has since given to something else, and
-    * a GPU access through it lands there silently, so this context unbinds a freed BO's ranges
-    * and clears its slice when it goes (see kgsl_renderer_free_object).  Off for other guests:
-    * the no-unbind rule below stays theirs. */
+    * is gone, so a stale VBO range of such a BO maps pages the guest has since given to something
+    * else, and a GPU access through it would land there silently.  This context therefore unbinds
+    * a freed guest-allocated BO's ranges and clears its slice when it goes (see
+    * kgsl_renderer_free_object).  That is safe because a guest releases such a resource only once
+    * its submissions are done with it: Linux turnip closes a freed BO's handle after the queue's
+    * fence at the free (its zombie VMAs), freedreno passes its BOs to EXECBUFFER so the kernel
+    * holds them until the fence, and the iPadOS driver keeps a closed resource until the
+    * submissions made before the close finish.  Host-allocated BOs keep the no-unbind rule below.
+    * NCTX_KEEP_FREED_RANGES=1 leaves freed guest BOs bound as well (the earlier behavior). */
    bool unbind_freed;
 
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
@@ -2573,10 +2577,10 @@ drm2kgsl_renderer_create(int fd, size_t debug_len, const char *debug_name)
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
-   kctx->unbind_freed = getenv("NCTX_UNBIND_FREED") ||
-      (debug_name && debug_len >= 4 && !strncmp(debug_name, "xnu:", 4));
-   drm_log("context %.*s: unbind freed guest BOs %s", (int)(debug_name ? debug_len : 0),
-           debug_name ? debug_name : "", kctx->unbind_freed ? "on" : "off");
+   kctx->unbind_freed = !getenv("NCTX_KEEP_FREED_RANGES");
+   if (!kctx->unbind_freed)
+      drm_log("context %.*s: freed guest BOs stay bound (NCTX_KEEP_FREED_RANGES)",
+              (int)(debug_name ? debug_len : 0), debug_name ? debug_name : "");
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
                     " mode=%s",

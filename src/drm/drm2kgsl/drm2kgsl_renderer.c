@@ -1236,19 +1236,34 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
  */
 #define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
 
+/* The KGSL priority of a submitqueue's msm priority (0 highest, g_nr_timelines of them): the lowest -- every queue's when
+ * there is one priority, and turnip's medium and low when there are more -- keeps the kernel's default (8, the third of four
+ * ringbuffers); a higher one takes the second ringbuffer (KGSL 4 or 5), which preempts the default's, and never the first, the
+ * system compositor's. KGSL has 16 priorities, 0 highest, four to a ringbuffer.
+ */
+static uint32_t
+kgsl_priority_flags(uint32_t prio)
+{
+   if (prio + 1 >= g_nr_timelines)
+      return KGSL_CONTEXT_PRIORITY_UNDEF;
+   return ((4 + MIN2(prio, 1)) << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK;
+}
+
 static int
-kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *out_id)
+kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, uint32_t *out_id)
 {
    /* Mirror the flags turnip's own KGSL backend uses (proven on this device);
     * the guest submits its own fence seqno (MSM_SUBMIT_FENCE_SN_IN), so add
     * USER_GENERATED_TS so KGSL takes the timestamp from us.  Adding TYPE_VK /
-    * PER_CONTEXT_TS / a priority band made DRAWCTXT_CREATE return EINVAL.
+    * PER_CONTEXT_TS made DRAWCTXT_CREATE return EINVAL; a priority (bits 12-15)
+    * is taken with these flags.
     */
    struct kgsl_drawctxt_create req = {
       .flags = KGSL_CONTEXT_SAVE_GMEM |
                KGSL_CONTEXT_NO_GMEM_ALLOC |
                KGSL_CONTEXT_PREAMBLE |
-               KGSL_CONTEXT_USER_GENERATED_TS,
+               KGSL_CONTEXT_USER_GENERATED_TS |
+               kgsl_priority_flags(prio),
    };
 
    if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
@@ -2727,10 +2742,13 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOMEM;
    }
 
-   /* KGSL supports a single priority band per drawctxt here; expose one ring.
-    * (Priorities are encoded in the drawctxt flags but map to one timeline.)
+   /* One priority, one ring (each priority is a ring, as msm's are), unless the host offers more: DRM2KGSL_PRIORITIES=2 or 3
+    * gives the guest that many submitqueue priorities, the lowest the kernel's default and the others above it
+    * (kgsl_priority_flags). Opt-in: a guest made for one ring is unchanged without it.
     */
-   g_nr_timelines = 1;
+   uint64_t priorities = 1;
+   kgsl_parse_u64_env("DRM2KGSL_PRIORITIES", &priorities);
+   g_nr_timelines = (unsigned)CLAMP(priorities, 1, 3);
 
    /* Advertise a recent drm/msm uabi so the guest turnip enables the modern
     * code paths (userspace IOVA, FENCE_SN_IN).  There is no real msm kernel

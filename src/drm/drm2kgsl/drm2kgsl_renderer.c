@@ -2745,6 +2745,9 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    /* One priority, one ring (each priority is a ring, as msm's are), unless the host offers more: DRM2KGSL_PRIORITIES=2 or 3
     * gives the guest that many submitqueue priorities, the lowest the kernel's default and the others above it
     * (kgsl_priority_flags). Opt-in: a guest made for one ring is unchanged without it.
+    * Measured on an SM8650 (Adreno 750) with the iPadOS guest's render server raised: the second ringbuffer preempts an app's
+    * GMEM pass about 200 times a second, and the save and restore cost more than the wait it saves (GFXBench ALU 2 onscreen 84
+    * -> 45 fps). Leave it unset unless the guest's high-priority work does not interrupt binned passes.
     */
    uint64_t priorities = 1;
    kgsl_parse_u64_env("DRM2KGSL_PRIORITIES", &priorities);

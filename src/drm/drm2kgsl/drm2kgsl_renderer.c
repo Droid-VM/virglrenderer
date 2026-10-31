@@ -45,6 +45,7 @@
  *     submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -1376,14 +1377,109 @@ kgsl_set_pwr_constraint(int fd, uint32_t drawctxt_id, bool on)
    return true;
 }
 
+/* sched_setattr's argument (linux/sched/types.h, which bionic does not export). */
+struct kgsl_sched_attr {
+   uint32_t size, sched_policy;
+   uint64_t sched_flags;
+   int32_t sched_nice;
+   uint32_t sched_priority;
+   uint64_t sched_runtime, sched_deadline, sched_period;
+   uint32_t sched_util_min, sched_util_max;
+};
+#define KGSL_SCHED_FLAG_KEEP_ALL       0x18   /* SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS */
+#define KGSL_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+
+/* The VMM's vCPU threads (crosvm_vcpu*) while any constrained queue animates (kgsl_constraint_update): their utilization clamp
+ * raised to DRM2KGSL_VCPU_UCLAMP_MIN (default 1024, the most; 0, never), back to 0 when the last stops. The host's schedutil picks
+ * a core's frequency from the utilization of what runs on it, and a guest compositor's frame -- a short run of each of several
+ * threads in turn, one stage after another -- kept each vCPU 20-34% busy through page swipes: the host ran them at 2.2-2.7 GHz of
+ * 3.0-3.1 while one stage of a frame (SpringBoard's scroll layout) took 15-30 ms. The clamp is the CPU's counterpart of the GPU's
+ * power constraint: the guest's deadline, told to the host's governor only while frames are due. An A/B within one boot: the file
+ * DRM2KGSL_VCPU_UCLAMP_FILE names (default /data/local/tmp/drm2kgsl-vcpu-uclamp), where it holds a number, overrides the value
+ * at each start of an animation. */
+static uint32_t
+kgsl_vcpu_uclamp_value(void)
+{
+   static uint64_t value = 1024;
+   static const char *file;
+   if (!file) {
+      kgsl_parse_u64_env("DRM2KGSL_VCPU_UCLAMP_MIN", &value);
+      file = getenv("DRM2KGSL_VCPU_UCLAMP_FILE");
+      if (!file)
+         file = "/data/local/tmp/drm2kgsl-vcpu-uclamp";
+   }
+   uint64_t chosen = value;
+   int fd = open(file, O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char text[16] = {0};
+      char *end;
+      if (read(fd, text, sizeof(text) - 1) > 0) {
+         const unsigned long long parsed = strtoull(text, &end, 0);
+         if (end != text)
+            chosen = parsed;
+      }
+      close(fd);
+   }
+   return (uint32_t)MIN2(chosen, 1024);
+}
+
+static void
+kgsl_vcpu_animating(int delta)
+{
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static int animating;
+   static uint32_t applied;   /* the clamp the vCPU threads carry */
+   pthread_mutex_lock(&lock);
+   const bool was = animating > 0;
+   animating = MAX2(animating + delta, 0);
+   const bool now = animating > 0;
+   const uint32_t value = was != now && now ? kgsl_vcpu_uclamp_value() : 0;
+   if (was != now && value != applied) {
+      unsigned threads = 0, set = 0;
+      DIR *tasks = opendir("/proc/self/task");
+      if (tasks) {
+         for (struct dirent *task; (task = readdir(tasks));) {
+            if (task->d_name[0] == '.')
+               continue;
+            char path[64], comm[32] = {0};
+            snprintf(path, sizeof(path), "/proc/self/task/%s/comm", task->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+               continue;
+            ssize_t n = read(fd, comm, sizeof(comm) - 1);
+            close(fd);
+            if (n <= 0 || strncmp(comm, "crosvm_vcpu", 11))
+               continue;
+            struct kgsl_sched_attr attr = {
+               .size = sizeof(attr),
+               .sched_flags = KGSL_SCHED_FLAG_KEEP_ALL | KGSL_SCHED_FLAG_UTIL_CLAMP_MIN,
+               .sched_util_min = value,
+            };
+            threads++;
+            if (!syscall(__NR_sched_setattr, atoi(task->d_name), &attr, 0))
+               set++;
+         }
+         closedir(tasks);
+      }
+      applied = value;
+      static uint32_t logged;
+      if (p_atomic_inc_return(&logged) <= 16 || set != threads)
+         _drm_log(VIRGL_LOG_LEVEL_WARNING, "vCPU uclamp.min %u: %u of %u threads (%s)\n", (unsigned)value,
+                  set, threads, set == threads ? "ok" : strerror(errno));
+   }
+   pthread_mutex_unlock(&lock);
+}
+
 /* A constrained queue's submission: its context's constraint set or cleared as its rate rises above or falls below the
- * threshold (kgsl_constraint_now), an ioctl only where that changes. */
+ * threshold (kgsl_constraint_now), an ioctl only where that changes; the vCPUs' clamp follows (kgsl_vcpu_animating). */
 static void
 kgsl_constraint_update(struct kgsl_context *kctx, uint32_t drawctxt_id)
 {
    const bool want = kgsl_constraint_now(kctx);
-   if (want != kctx->constraint_on && kgsl_set_pwr_constraint(kctx->base.fd, drawctxt_id, want))
+   if (want != kctx->constraint_on && kgsl_set_pwr_constraint(kctx->base.fd, drawctxt_id, want)) {
       kctx->constraint_on = want;
+      kgsl_vcpu_animating(want ? 1 : -1);
+   }
 }
 
 static int
@@ -2666,6 +2762,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
    _mesa_hash_table_destroy(kctx->sq_to_ring_idx_table, NULL);
 
+   if (kctx->constraint_on)
+      kgsl_vcpu_animating(-1);
    free(kctx);
 }
 

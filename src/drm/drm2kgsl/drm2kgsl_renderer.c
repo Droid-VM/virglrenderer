@@ -429,6 +429,12 @@ struct kgsl_context {
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
 
+   /* When the context's last submissions to a constrained queue were made (CLOCK_MONOTONIC ns, a ring): whether the queue is
+    * producing frames at a rate that its constraint is for (kgsl_constraint_now). */
+   uint64_t constrained_submits[8];
+   unsigned constrained_next;
+   bool constraint_on;   /* the constrained queue's KGSL context has its constraint set now (kgsl_constraint_update) */
+
    struct drm_timeline timelines[];
 };
 DEFINE_CAST(drm_context, kgsl_context)
@@ -1286,8 +1292,102 @@ kgsl_priority_flags(uint32_t prio)
    return ((4 + MIN2(prio, 1)) << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK;
 }
 
+/* A submitqueue whose work has a deadline -- a compositor's frames, which must be done within the display's next refresh or
+ * two. The guest asks with DRM2KGSL_SUBMITQUEUE_DEADLINE in the queue's flags (this protocol's own, beyond msm's), as a
+ * guest driver does for a queue made at high or realtime global priority. Its KGSL context carries a power constraint at the
+ * GPU's highest level (KGSL_PROP_PWR_CONSTRAINT) while the queue produces frames at an animation's rate, and none otherwise
+ * (kgsl_constraint_update); the context is made with KGSL_CONTEXT_PWR_CONSTRAINT, so KGSL applies whatever constraint it has to
+ * each of its submissions -- runs the GPU at full clock while that submission runs -- and its governor decides again once the
+ * constraint expires. (KGSL_CMDBATCH_PWR_CONSTRAINT on a submission alone is not honored on this hardware-scheduled GPU,
+ * Adreno 840: no constraint was set.) The governor alone looks only at how busy the
+ * GPU was: an iPadOS guest at 2048x2732 kept it 55-65% busy, so a third of the compositor's frame passes ran at 160 MHz, its
+ * main pass 4.5 ms there and 1.5 ms at 1200 MHz, and frames missed the 120 Hz deadline with the GPU idle between them.
+ * DRM2KGSL_PWR_CONSTRAINT (read once): unset, the queues that ask; 0, none; "all", every queue (a measurement). */
+#define DRM2KGSL_SUBMITQUEUE_DEADLINE 0x80000000u
+#define KGSL_RING_IDX_CONSTRAINED 0x100u
+
+static bool
+kgsl_queue_constrained(uint32_t queue_flags)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *env = getenv("DRM2KGSL_PWR_CONSTRAINT");
+      mode = !env ? 1 : !strcmp(env, "all") ? 2 : strcmp(env, "0") ? 1 : 0;
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "DRM2KGSL_PWR_CONSTRAINT: %s\n",
+               mode == 2 ? "every queue" : mode ? "queues that ask" : "off");
+   }
+   return mode == 2 || (mode == 1 && (queue_flags & DRM2KGSL_SUBMITQUEUE_DEADLINE));
+}
+
+/* Whether a constrained queue should have its constraint now: while it submits at DRM2KGSL_PWR_CONSTRAINT_MIN_RATE a second
+ * or more (default 60; 0, always), measured as that many tenths of it within the last 100 ms (six), and until it falls below
+ * half of that (three: hysteresis, so a frame late by a refresh does not drop it). A deadline queue that draws now and then -- a compositor at an idle screen, updating a clock 13 times a
+ * second -- has the slack to run at the governor's clock: asked every time, its constraint held the GPU at 1200 MHz through an
+ * idle home screen at 1% load. During an animation (a page swipe: 100 frames a second, two submissions each) it asks. */
+static bool
+kgsl_constraint_now(struct kgsl_context *kctx)
+{
+   static uint64_t min_rate = 60;
+   static bool read;
+   if (!read) {
+      kgsl_parse_u64_env("DRM2KGSL_PWR_CONSTRAINT_MIN_RATE", &min_rate);
+      read = true;
+   }
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+   const unsigned n = ARRAY_SIZE(kctx->constrained_submits);
+   kctx->constrained_submits[kctx->constrained_next++ % n] = now;
+   if (!min_rate)
+      return true;
+   /* The sixth most recent submission, this one counted: six within 100 ms is 60 a second (three, 30, to keep it). */
+   unsigned count = (unsigned)MIN2(min_rate / 10, (uint64_t)n);
+   if (kctx->constraint_on)
+      count = MAX2(count / 2, 2u);
+   if (count < 2)
+      return true;
+   const uint64_t then = kctx->constrained_submits[(kctx->constrained_next - count) % n];
+   return then && now - then <= 100000000ull;
+}
+
+/* The context's power constraint: the GPU's highest level while a submission that asks for it runs. */
+static bool
+kgsl_set_pwr_constraint(int fd, uint32_t drawctxt_id, bool on)
+{
+   struct kgsl_device_constraint_pwrlevel level = { .level = KGSL_CONSTRAINT_PWR_MAX };
+   struct kgsl_device_constraint constraint = {
+      .type = on ? KGSL_CONSTRAINT_PWRLEVEL : KGSL_CONSTRAINT_NONE,
+      .context_id = drawctxt_id,
+      .data = &level,
+      .size = sizeof(level),
+   };
+   struct kgsl_device_getproperty prop = {
+      .type = KGSL_PROP_PWR_CONSTRAINT,
+      .value = &constraint,
+      .sizebytes = sizeof(constraint),
+   };
+   if (kgsl_ioctl(fd, IOCTL_KGSL_SETPROPERTY, &prop)) {
+      drm_err("PWR_CONSTRAINT on context %u failed: %s", drawctxt_id, strerror(errno));
+      return false;
+   }
+   static uint32_t logged;
+   if (p_atomic_inc_return(&logged) <= 16)
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: power constraint %s\n", drawctxt_id, on ? "at the highest level" : "off");
+   return true;
+}
+
+/* A constrained queue's submission: its context's constraint set or cleared as its rate rises above or falls below the
+ * threshold (kgsl_constraint_now), an ioctl only where that changes. */
+static void
+kgsl_constraint_update(struct kgsl_context *kctx, uint32_t drawctxt_id)
+{
+   const bool want = kgsl_constraint_now(kctx);
+   if (want != kctx->constraint_on && kgsl_set_pwr_constraint(kctx->base.fd, drawctxt_id, want))
+      kctx->constraint_on = want;
+}
+
 static int
-kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, uint32_t *out_id)
+kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, bool constrained, uint32_t *out_id)
 {
    /* Mirror the flags turnip's own KGSL backend uses (proven on this device);
     * the guest submits its own fence seqno (MSM_SUBMIT_FENCE_SN_IN), so add
@@ -1300,6 +1400,7 @@ kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, uint32_t *out_id)
                KGSL_CONTEXT_NO_GMEM_ALLOC |
                KGSL_CONTEXT_PREAMBLE |
                KGSL_CONTEXT_USER_GENERATED_TS |
+               (constrained ? KGSL_CONTEXT_PWR_CONSTRAINT : 0) |
                kgsl_priority_flags(prio),
    };
 
@@ -1369,10 +1470,14 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    case DRM_MSM_SUBMITQUEUE_NEW: {
       struct drm_msm_submitqueue *q = (void *)payload;
       uint32_t id;
-      rsp->ret = kgsl_drawctxt_create(kctx, q->prio, &id);
+      bool constrained = kgsl_queue_constrained(q->flags);
+      rsp->ret = kgsl_drawctxt_create(kctx, q->prio, constrained, &id);
       if (!rsp->ret) {
          q->id = id;
-         unsigned ring_idx = MIN2(q->prio, g_nr_timelines - 1) + 1;
+         if (constrained)
+            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: constrained while it submits at an animation's rate\n", id);
+         unsigned ring_idx = (MIN2(q->prio, g_nr_timelines - 1) + 1) |
+                             (constrained ? KGSL_RING_IDX_CONSTRAINED : 0);
          _mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
                                  (void *)(uintptr_t)id,
                                  (void *)(uintptr_t)ring_idx);
@@ -1925,7 +2030,9 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       free(kcmds);
       return -EINVAL;
    }
-   unsigned ring_idx = (uintptr_t)entry->data;
+   unsigned ring_idx = (uintptr_t)entry->data & ~KGSL_RING_IDX_CONSTRAINED;
+   if ((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED)
+      kgsl_constraint_update(kctx, req->queue_id);
 
    struct kgsl_gpu_command cmd = {
       .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,

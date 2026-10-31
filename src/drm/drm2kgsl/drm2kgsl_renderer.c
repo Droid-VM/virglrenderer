@@ -190,6 +190,43 @@ kgsl_diag_enabled(void)
    return g_kgsl_diag.enabled;
 }
 
+/* The KGSL flags a guest's memory is imported with: its cache mode, and KGSL_MEMFLAGS_IOCOHERENT, by
+ * which every GPU access to it snoops the CPUs' caches. DRM2KGSL_NONCOHERENT (an A/B switch, read once):
+ *   unset or 0: coherent always, as before;
+ *   1: never -- a measurement of what coherence costs the GPU only: CPU writes a guest keeps in a
+ *      cached mapping may then be missed, and the GPU's writes read stale;
+ *   2: only where the mapping is cached (MSM_BO_CACHED*, or a cached map_info), as Android's own KGSL
+ *      clients import: a write-combined mapping holds nothing in a cache for the GPU to miss.
+ * Either only for objects of DRM2KGSL_NONCOHERENT_MIN_KB or more (default 4096: render targets and large
+ * textures), so the command streams and small buffers a guest's CPU writes stay coherent and the GPU
+ * never runs commands a cache still holds.
+ * An iPadOS guest's 2048x2732 frame took 5-6 ms of GPU time whatever the GPU clock (160 MHz 6.6 ms,
+ * 1050 MHz 4.7) and the bus level, its frame target 22 MB of coherent guest pages. */
+static bool kgsl_parse_u64_env(const char *name, uint64_t *value);
+
+static uint32_t
+kgsl_guest_memflags(bool cached, uint64_t size)
+{
+   static int mode = -1;
+   static uint64_t min_kb = 4096;
+   if (mode < 0) {
+      const char *env = getenv("DRM2KGSL_NONCOHERENT");
+      kgsl_parse_u64_env("DRM2KGSL_NONCOHERENT_MIN_KB", &min_kb);
+      mode = env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+      if (mode)
+         _drm_log(VIRGL_LOG_LEVEL_WARNING, "DRM2KGSL_NONCOHERENT=%d from %" PRIu64 " KiB\n", mode, min_kb);
+   }
+   const bool coherent = mode == 0 || size < (min_kb << 10) || (mode == 2 && cached);
+   /* The first few objects imported without coherence, for a log that shows the switch took (the
+    * default log level drops drm_log's). */
+   static uint32_t logged;
+   if (!coherent && p_atomic_inc_return(&logged) <= 8)
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "non-coherent import: %" PRIu64 " KiB, %s\n", size >> 10,
+               cached ? "cached" : "write-combined");
+   return (coherent ? KGSL_MEMFLAGS_IOCOHERENT : 0) |
+      ((cached ? KGSL_CACHEMODE_WRITEBACK : KGSL_CACHEMODE_WRITECOMBINE) << KGSL_CACHEMODE_SHIFT);
+}
+
 /* WAITTIMESTAMP_CTXTID is slower than the sync_file path on Adreno 830.
  * Keep the optimization enabled for other GPUs, while allowing explicit A/B
  * overrides without changing the default behavior for existing devices. */
@@ -2054,10 +2091,7 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
          return;
       }
 
-      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
-         ((res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED)
-             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
-             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+      uint32_t kgsl_flags = kgsl_guest_memflags(res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED, size);
 
       if (!kgsl_blob_arena_retain(offset, size))
          return;
@@ -2312,10 +2346,7 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
       int gfd = kctx->pending_guest_fd;
       kctx->pending_guest_fd = -1;
 
-      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
-         ((obj->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED))
-             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
-             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+      uint32_t kgsl_flags = kgsl_guest_memflags(obj->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED), obj->blob_size);
 
       uint32_t mem_id = kgsl_import_dmabuf(dctx->fd, gfd, kgsl_flags);
       if (!mem_id) {

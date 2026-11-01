@@ -106,6 +106,7 @@
 static const uint64_t vbo_size_ladder[] = {
    0x10000000000ull, /* 1 TiB   */
    0x04000000000ull, /* 256 GiB */
+   0x03000000000ull, /* 192 GiB */
    0x02000000000ull, /* 128 GiB */
    0x01000000000ull, /* 64 GiB  */
    0x00400000000ull, /* 16 GiB  */
@@ -321,11 +322,17 @@ static struct {
  * a larger VA range yields more concurrent contexts rather than a fixed 32.
  * We carve as many slices as fit at KGSL_VA_SLICE_MIN (turnip treats va_size as
  * this context's entire GPU VA budget, so a slice must not shrink below it),
- * capped by the used-bitmask width (KGSL_VA_MAX_SLICES), then spread the whole
- * VBO evenly across them.  A 64GB VBO -> 32 x 2GB; a 128GB VBO -> 64 x 2GB; a
- * 256GB VBO -> 64 x 4GB (bitmask-capped); a 16GB VBO auto-drops to 8 x 2GB
- * instead of starving each context. */
+ * capped by KGSL_VA_SLICES, then spread the whole VBO evenly across them.  A
+ * 64GB VBO -> 32 x 2GB; a 128GB VBO -> 32 x 4GB; a 256GB VBO -> 32 x 8GB; a 16GB
+ * VBO auto-drops to 8 x 2GB instead of starving each context.
+ *
+ * 32 slices, not the bitmask's 64: a context's slice is all the GPU address space
+ * its process gets, and a compositor maps every client's surfaces into its own.
+ * An iPadOS render server at 2048x2732 held 1.8 of a 2GB slice at an idle home
+ * screen, and the next BO its turnip made found no range: the device was lost.
+ * A guest runs 5-15 GPU contexts at once; 32 leaves room and doubles the slice. */
 #define KGSL_VA_MAX_SLICES 64
+#define KGSL_VA_SLICES     32
 #define KGSL_VA_SLICE_MIN  (2ull << 30)
 static pthread_mutex_t g_va_slices_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_va_slices_used; /* bitmask; bit i = slice i in use */
@@ -3021,13 +3028,13 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOTSUP;
    }
 
-   /* Derive slice geometry from the VBO KGSL actually granted.  Aim for the
-    * full KGSL_VA_MAX_SLICES bitmask width, but keep each slice >=
+   /* Derive slice geometry from the VBO KGSL actually granted.  Aim for
+    * KGSL_VA_SLICES slices, but keep each slice >=
     * KGSL_VA_SLICE_MIN so a small VBO trades context count for a usable
     * per-context VA budget rather than handing turnip a slice too small to
     * allocate into. */
    {
-      unsigned want = KGSL_VA_MAX_SLICES;
+      unsigned want = KGSL_VA_SLICES;
       uint64_t slice = g_va_size / want;
       if (slice < KGSL_VA_SLICE_MIN) {
          slice = KGSL_VA_SLICE_MIN;

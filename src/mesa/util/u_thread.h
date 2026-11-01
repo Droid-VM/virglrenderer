@@ -49,6 +49,7 @@
 
 #if DETECT_OS_LINUX
 #include <sched.h>
+#include <unistd.h>
 #elif defined(_WIN32) && !defined(__CYGWIN__) && _WIN32_WINNT >= 0x0600
 #include <windows.h>
 #endif
@@ -111,11 +112,29 @@ static inline thrd_t u_thread_create(int (*routine)(void *), void *param)
    sigset_t saved_set, new_set;
    int ret;
 
+#if DETECT_OS_LINUX
+   /* DroidVM: the thread takes the process's CPUs, not those of the thread that made it. A VMM
+    * makes contexts, and with them their fence threads, on the vCPU thread that handled the
+    * guest's request, and a thread inherits its creator's affinity: every kgsl-sync and
+    * vrend-sync thread was pinned to the core of the vCPU that happened to create the context,
+    * where it waited for that vCPU to leave the guest before it could signal a fence. The
+    * creating thread widens its own set for the call and narrows it back; it stays on its core
+    * throughout (the core is in both sets). */
+   cpu_set_t own_cpus, process_cpus;
+   const bool widened = sched_getaffinity(0, sizeof(own_cpus), &own_cpus) == 0 &&
+                        sched_getaffinity(getpid(), sizeof(process_cpus), &process_cpus) == 0 &&
+                        !CPU_EQUAL(&own_cpus, &process_cpus) &&
+                        sched_setaffinity(0, sizeof(process_cpus), &process_cpus) == 0;
+#endif
    sigfillset(&new_set);
    sigdelset(&new_set, SIGSYS);
    pthread_sigmask(SIG_BLOCK, &new_set, &saved_set);
    ret = thrd_create( &thread, routine, param );
    pthread_sigmask(SIG_SETMASK, &saved_set, NULL);
+#if DETECT_OS_LINUX
+   if (widened)
+      sched_setaffinity(0, sizeof(own_cpus), &own_cpus);
+#endif
 #else
    int ret;
    ret = thrd_create( &thread, routine, param );

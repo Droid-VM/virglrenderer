@@ -46,6 +46,7 @@
  *     completed submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -106,6 +107,7 @@
 static const uint64_t vbo_size_ladder[] = {
    0x10000000000ull, /* 1 TiB   */
    0x04000000000ull, /* 256 GiB */
+   0x03000000000ull, /* 192 GiB */
    0x02000000000ull, /* 128 GiB */
    0x01000000000ull, /* 64 GiB  */
    0x00400000000ull, /* 16 GiB  */
@@ -233,6 +235,43 @@ kgsl_diag_enabled(void)
    return g_kgsl_diag.enabled;
 }
 
+/* The KGSL flags a guest's memory is imported with: its cache mode, and KGSL_MEMFLAGS_IOCOHERENT, by
+ * which every GPU access to it snoops the CPUs' caches. DRM2KGSL_NONCOHERENT (an A/B switch, read once):
+ *   unset or 0: coherent always, as before;
+ *   1: never -- a measurement of what coherence costs the GPU only: CPU writes a guest keeps in a
+ *      cached mapping may then be missed, and the GPU's writes read stale;
+ *   2: only where the mapping is cached (MSM_BO_CACHED*, or a cached map_info), as Android's own KGSL
+ *      clients import: a write-combined mapping holds nothing in a cache for the GPU to miss.
+ * Either only for objects of DRM2KGSL_NONCOHERENT_MIN_KB or more (default 4096: render targets and large
+ * textures), so the command streams and small buffers a guest's CPU writes stay coherent and the GPU
+ * never runs commands a cache still holds.
+ * An iPadOS guest's 2048x2732 frame took 5-6 ms of GPU time whatever the GPU clock (160 MHz 6.6 ms,
+ * 1050 MHz 4.7) and the bus level, its frame target 22 MB of coherent guest pages. */
+static bool kgsl_parse_u64_env(const char *name, uint64_t *value);
+
+static uint32_t
+kgsl_guest_memflags(bool cached, uint64_t size)
+{
+   static int mode = -1;
+   static uint64_t min_kb = 4096;
+   if (mode < 0) {
+      const char *env = getenv("DRM2KGSL_NONCOHERENT");
+      kgsl_parse_u64_env("DRM2KGSL_NONCOHERENT_MIN_KB", &min_kb);
+      mode = env && (env[0] == '1' || env[0] == '2') ? env[0] - '0' : 0;
+      if (mode)
+         _drm_log(VIRGL_LOG_LEVEL_WARNING, "DRM2KGSL_NONCOHERENT=%d from %" PRIu64 " KiB\n", mode, min_kb);
+   }
+   const bool coherent = mode == 0 || size < (min_kb << 10) || (mode == 2 && cached);
+   /* The first few objects imported without coherence, for a log that shows the switch took (the
+    * default log level drops drm_log's). */
+   static uint32_t logged;
+   if (!coherent && p_atomic_inc_return(&logged) <= 8)
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "non-coherent import: %" PRIu64 " KiB, %s\n", size >> 10,
+               cached ? "cached" : "write-combined");
+   return (coherent ? KGSL_MEMFLAGS_IOCOHERENT : 0) |
+      ((cached ? KGSL_CACHEMODE_WRITEBACK : KGSL_CACHEMODE_WRITECOMBINE) << KGSL_CACHEMODE_SHIFT);
+}
+
 /* WAITTIMESTAMP_CTXTID is slower than the sync_file path on Adreno 830.
  * Keep the optimization enabled for other GPUs, while allowing explicit A/B
  * overrides without changing the default behavior for existing devices. */
@@ -326,11 +365,17 @@ static struct {
  * a larger VA range yields more concurrent contexts rather than a fixed 32.
  * We carve as many slices as fit at KGSL_VA_SLICE_MIN (turnip treats va_size as
  * this context's entire GPU VA budget, so a slice must not shrink below it),
- * capped by the used-bitmask width (KGSL_VA_MAX_SLICES), then spread the whole
- * VBO evenly across them.  A 64GB VBO -> 32 x 2GB; a 128GB VBO -> 64 x 2GB; a
- * 256GB VBO -> 64 x 4GB (bitmask-capped); a 16GB VBO auto-drops to 8 x 2GB
- * instead of starving each context. */
+ * capped by KGSL_VA_SLICES, then spread the whole VBO evenly across them.  A
+ * 64GB VBO -> 32 x 2GB; a 128GB VBO -> 32 x 4GB; a 256GB VBO -> 32 x 8GB; a 16GB
+ * VBO auto-drops to 8 x 2GB instead of starving each context.
+ *
+ * 32 slices, not the bitmask's 64: a context's slice is all the GPU address space
+ * its process gets, and a compositor maps every client's surfaces into its own.
+ * An iPadOS render server at 2048x2732 held 1.8 of a 2GB slice at an idle home
+ * screen, and the next BO its turnip made found no range: the device was lost.
+ * A guest runs 5-15 GPU contexts at once; 32 leaves room and doubles the slice. */
 #define KGSL_VA_MAX_SLICES 64
+#define KGSL_VA_SLICES     32
 #define KGSL_VA_SLICE_MIN  (2ull << 30)
 static pthread_mutex_t g_va_slices_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_va_slices_used; /* bitmask; bit i = slice i in use */
@@ -510,6 +555,18 @@ struct kgsl_context {
     * and is reported rather than silently dropping an fd. */
    int pending_guest_fd;
 
+   /* The guest hands a guest-allocated BO's pages back to its own allocator once the resource
+    * is gone, so a stale VBO range of such a BO maps pages the guest has since given to something
+    * else, and a GPU access through it would land there silently.  This context therefore unbinds
+    * a freed guest-allocated BO's ranges and clears its slice when it goes (see
+    * kgsl_renderer_free_object).  That is safe because a guest releases such a resource only once
+    * its submissions are done with it: Linux turnip closes a freed BO's handle after the queue's
+    * fence at the free (its zombie VMAs), freedreno passes its BOs to EXECBUFFER so the kernel
+    * holds them until the fence, and the iPadOS driver keeps a closed resource until the
+    * submissions made before the close finish.  Host-allocated BOs keep the no-unbind rule below.
+    * NCTX_KEEP_FREED_RANGES=1 leaves freed guest BOs bound as well (the earlier behavior). */
+   bool unbind_freed;
+
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
 
@@ -518,6 +575,12 @@ struct kgsl_context {
 
    /* Cumulative faults in this guest context, including closed queues. */
    uint64_t fault_count;
+
+   /* When the context's last submissions to a constrained queue were made (CLOCK_MONOTONIC ns, a ring): whether the queue is
+    * producing frames at a rate that its constraint is for (kgsl_constraint_now). */
+   uint64_t constrained_submits[8];
+   unsigned constrained_next;
+   bool constraint_on;   /* the constrained queue's KGSL context has its constraint set now (kgsl_constraint_update) */
 
    struct drm_timeline timelines[];
 };
@@ -1516,6 +1579,14 @@ kgsl_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
    if (obj->map && obj->map != obj->host_map)
       munmap(obj->map, obj->blob_size);
 
+   /* A guest-allocated BO in a context that unbinds them: every range of it in this context's
+    * slice goes before the free (an unbind names its child, so a BO bound since over part of the
+    * range keeps its own), and a later access through a stale VA reads KGSL's zero page instead
+    * of pages the guest reused.  The guest has waited for this context's submissions first. */
+   if (kctx->unbind_freed && obj->guest_alloc)
+      kgsl_vbo_op(kctx, obj->mem_id, kctx->va_slice_base, kctx->va_slice_size,
+                  KGSL_GPUMEM_RANGE_OP_UNBIND);
+
    kgsl_free_gpuobj(dctx->fd, obj->mem_id); /* releases the useraddr pin first */
 
    if (obj->host_map)
@@ -1612,13 +1683,216 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
  * the post-fault marker, not a timestamp rejection -- but ts=0 remains a
  * reserved value worth staying off of. Verified neutral on A830.)
  */
+/* The KGSL priority of a submitqueue's msm priority (0 highest, g_nr_timelines of them): the lowest -- every queue's when
+ * there is one priority, and turnip's medium and low when there are more -- keeps the kernel's default (8, the third of four
+ * ringbuffers); a higher one takes the second ringbuffer (KGSL 4 or 5), which preempts the default's, and never the first, the
+ * system compositor's. KGSL has 16 priorities, 0 highest, four to a ringbuffer.
+ */
+static uint32_t
+kgsl_priority_flags(uint32_t prio)
+{
+   if (prio + 1 >= g_nr_timelines)
+      return KGSL_CONTEXT_PRIORITY_UNDEF;
+   return ((4 + MIN2(prio, 1)) << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK;
+}
+
+/* A submitqueue whose work has a deadline -- a compositor's frames, which must be done within the display's next refresh or
+ * two. The guest asks with DRM2KGSL_SUBMITQUEUE_DEADLINE in the queue's flags (this protocol's own, beyond msm's), as a
+ * guest driver does for a queue made at high or realtime global priority. Its KGSL context carries a power constraint at the
+ * GPU's highest level (KGSL_PROP_PWR_CONSTRAINT) while the queue produces frames at an animation's rate, and none otherwise
+ * (kgsl_constraint_update); the context is made with KGSL_CONTEXT_PWR_CONSTRAINT, so KGSL applies whatever constraint it has to
+ * each of its submissions -- runs the GPU at full clock while that submission runs -- and its governor decides again once the
+ * constraint expires. (KGSL_CMDBATCH_PWR_CONSTRAINT on a submission alone is not honored on this hardware-scheduled GPU,
+ * Adreno 840: no constraint was set.) The governor alone looks only at how busy the
+ * GPU was: an iPadOS guest at 2048x2732 kept it 55-65% busy, so a third of the compositor's frame passes ran at 160 MHz, its
+ * main pass 4.5 ms there and 1.5 ms at 1200 MHz, and frames missed the 120 Hz deadline with the GPU idle between them.
+ * DRM2KGSL_PWR_CONSTRAINT (read once): unset, the queues that ask; 0, none; "all", every queue (a measurement). */
+#define DRM2KGSL_SUBMITQUEUE_DEADLINE 0x80000000u
+#define KGSL_RING_IDX_CONSTRAINED 0x100u
+
+static bool
+kgsl_queue_constrained(uint32_t queue_flags)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *env = getenv("DRM2KGSL_PWR_CONSTRAINT");
+      mode = !env ? 1 : !strcmp(env, "all") ? 2 : strcmp(env, "0") ? 1 : 0;
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "DRM2KGSL_PWR_CONSTRAINT: %s\n",
+               mode == 2 ? "every queue" : mode ? "queues that ask" : "off");
+   }
+   return mode == 2 || (mode == 1 && (queue_flags & DRM2KGSL_SUBMITQUEUE_DEADLINE));
+}
+
+/* Whether a constrained queue should have its constraint now: while it submits at DRM2KGSL_PWR_CONSTRAINT_MIN_RATE a second
+ * or more (default 60; 0, always), measured as that many tenths of it within the last 100 ms (six), and until it falls below
+ * half of that (three: hysteresis, so a frame late by a refresh does not drop it). A deadline queue that draws now and then -- a compositor at an idle screen, updating a clock 13 times a
+ * second -- has the slack to run at the governor's clock: asked every time, its constraint held the GPU at 1200 MHz through an
+ * idle home screen at 1% load. During an animation (a page swipe: 100 frames a second, two submissions each) it asks. */
+static bool
+kgsl_constraint_now(struct kgsl_context *kctx)
+{
+   static uint64_t min_rate = 60;
+   static bool read;
+   if (!read) {
+      kgsl_parse_u64_env("DRM2KGSL_PWR_CONSTRAINT_MIN_RATE", &min_rate);
+      read = true;
+   }
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+   const unsigned n = ARRAY_SIZE(kctx->constrained_submits);
+   kctx->constrained_submits[kctx->constrained_next++ % n] = now;
+   if (!min_rate)
+      return true;
+   /* The sixth most recent submission, this one counted: six within 100 ms is 60 a second (three, 30, to keep it). */
+   unsigned count = (unsigned)MIN2(min_rate / 10, (uint64_t)n);
+   if (kctx->constraint_on)
+      count = MAX2(count / 2, 2u);
+   if (count < 2)
+      return true;
+   const uint64_t then = kctx->constrained_submits[(kctx->constrained_next - count) % n];
+   return then && now - then <= 100000000ull;
+}
+
+/* The context's power constraint: the GPU's highest level while a submission that asks for it runs. */
+static bool
+kgsl_set_pwr_constraint(int fd, uint32_t drawctxt_id, bool on)
+{
+   struct kgsl_device_constraint_pwrlevel level = { .level = KGSL_CONSTRAINT_PWR_MAX };
+   struct kgsl_device_constraint constraint = {
+      .type = on ? KGSL_CONSTRAINT_PWRLEVEL : KGSL_CONSTRAINT_NONE,
+      .context_id = drawctxt_id,
+      .data = &level,
+      .size = sizeof(level),
+   };
+   struct kgsl_device_getproperty prop = {
+      .type = KGSL_PROP_PWR_CONSTRAINT,
+      .value = &constraint,
+      .sizebytes = sizeof(constraint),
+   };
+   if (kgsl_ioctl(fd, IOCTL_KGSL_SETPROPERTY, &prop)) {
+      drm_err("PWR_CONSTRAINT on context %u failed: %s", drawctxt_id, strerror(errno));
+      return false;
+   }
+   static uint32_t logged;
+   if (p_atomic_inc_return(&logged) <= 16)
+      _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: power constraint %s\n", drawctxt_id, on ? "at the highest level" : "off");
+   return true;
+}
+
+/* sched_setattr's argument (linux/sched/types.h, which bionic does not export). */
+struct kgsl_sched_attr {
+   uint32_t size, sched_policy;
+   uint64_t sched_flags;
+   int32_t sched_nice;
+   uint32_t sched_priority;
+   uint64_t sched_runtime, sched_deadline, sched_period;
+   uint32_t sched_util_min, sched_util_max;
+};
+#define KGSL_SCHED_FLAG_KEEP_ALL       0x18   /* SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS */
+#define KGSL_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+
+/* The VMM's vCPU threads (crosvm_vcpu*) while any constrained queue animates (kgsl_constraint_update): their utilization clamp
+ * raised to DRM2KGSL_VCPU_UCLAMP_MIN (default 1024, the most; 0, never), back to 0 when the last stops. The host's schedutil picks
+ * a core's frequency from the utilization of what runs on it, and a guest compositor's frame -- a short run of each of several
+ * threads in turn, one stage after another -- kept each vCPU 20-34% busy through page swipes: the host ran them at 2.2-2.7 GHz of
+ * 3.0-3.1 while one stage of a frame (SpringBoard's scroll layout) took 15-30 ms. The clamp is the CPU's counterpart of the GPU's
+ * power constraint: the guest's deadline, told to the host's governor only while frames are due. An A/B within one boot: the file
+ * DRM2KGSL_VCPU_UCLAMP_FILE names (default /data/local/tmp/drm2kgsl-vcpu-uclamp), where it holds a number, overrides the value
+ * at each start of an animation. */
+static uint32_t
+kgsl_vcpu_uclamp_value(void)
+{
+   static uint64_t value = 1024;
+   static const char *file;
+   if (!file) {
+      kgsl_parse_u64_env("DRM2KGSL_VCPU_UCLAMP_MIN", &value);
+      file = getenv("DRM2KGSL_VCPU_UCLAMP_FILE");
+      if (!file)
+         file = "/data/local/tmp/drm2kgsl-vcpu-uclamp";
+   }
+   uint64_t chosen = value;
+   int fd = open(file, O_RDONLY | O_CLOEXEC);
+   if (fd >= 0) {
+      char text[16] = {0};
+      char *end;
+      if (read(fd, text, sizeof(text) - 1) > 0) {
+         const unsigned long long parsed = strtoull(text, &end, 0);
+         if (end != text)
+            chosen = parsed;
+      }
+      close(fd);
+   }
+   return (uint32_t)MIN2(chosen, 1024);
+}
+
+static void
+kgsl_vcpu_animating(int delta)
+{
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static int animating;
+   static uint32_t applied;   /* the clamp the vCPU threads carry */
+   pthread_mutex_lock(&lock);
+   const bool was = animating > 0;
+   animating = MAX2(animating + delta, 0);
+   const bool now = animating > 0;
+   const uint32_t value = was != now && now ? kgsl_vcpu_uclamp_value() : 0;
+   if (was != now && value != applied) {
+      unsigned threads = 0, set = 0;
+      DIR *tasks = opendir("/proc/self/task");
+      if (tasks) {
+         for (struct dirent *task; (task = readdir(tasks));) {
+            if (task->d_name[0] == '.')
+               continue;
+            char path[64], comm[32] = {0};
+            snprintf(path, sizeof(path), "/proc/self/task/%s/comm", task->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+               continue;
+            ssize_t n = read(fd, comm, sizeof(comm) - 1);
+            close(fd);
+            if (n <= 0 || strncmp(comm, "crosvm_vcpu", 11))
+               continue;
+            struct kgsl_sched_attr attr = {
+               .size = sizeof(attr),
+               .sched_flags = KGSL_SCHED_FLAG_KEEP_ALL | KGSL_SCHED_FLAG_UTIL_CLAMP_MIN,
+               .sched_util_min = value,
+            };
+            threads++;
+            if (!syscall(__NR_sched_setattr, atoi(task->d_name), &attr, 0))
+               set++;
+         }
+         closedir(tasks);
+      }
+      applied = value;
+      static uint32_t logged;
+      if (p_atomic_inc_return(&logged) <= 16 || set != threads)
+         _drm_log(VIRGL_LOG_LEVEL_WARNING, "vCPU uclamp.min %u: %u of %u threads (%s)\n", (unsigned)value,
+                  set, threads, set == threads ? "ok" : strerror(errno));
+   }
+   pthread_mutex_unlock(&lock);
+}
+
+/* A constrained queue's submission: its context's constraint set or cleared as its rate rises above or falls below the
+ * threshold (kgsl_constraint_now), an ioctl only where that changes; the vCPUs' clamp follows (kgsl_vcpu_animating). */
+static void
+kgsl_constraint_update(struct kgsl_context *kctx, uint32_t drawctxt_id)
+{
+   const bool want = kgsl_constraint_now(kctx);
+   if (want != kctx->constraint_on && kgsl_set_pwr_constraint(kctx->base.fd, drawctxt_id, want)) {
+      kctx->constraint_on = want;
+      kgsl_vcpu_animating(want ? 1 : -1);
+   }
+}
+
 static int
-kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *out_id)
+kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, bool constrained, uint32_t *out_id)
 {
    /* Mirror the flags turnip's own KGSL backend uses (proven on this device);
     * the guest submits its own fence seqno (MSM_SUBMIT_FENCE_SN_IN), so add
     * USER_GENERATED_TS so KGSL takes the timestamp from us.  Adding TYPE_VK /
-    * PER_CONTEXT_TS / a priority band made DRAWCTXT_CREATE return EINVAL.
+    * PER_CONTEXT_TS made DRAWCTXT_CREATE return EINVAL; a priority (bits 12-15)
+    * is taken with these flags.
     */
    /* PWR_CONSTRAINT lets SETPROPERTY(KGSL_PROP_PWR_CONSTRAINT) stick to this
     * drawctxt.  TYPE_VK / PER_CONTEXT_TS already EINVAL on this device; if
@@ -1629,11 +1903,11 @@ kgsl_drawctxt_create(struct kgsl_context *kctx, UNUSED uint32_t prio, uint32_t *
                                KGSL_CONTEXT_PREAMBLE |
                                KGSL_CONTEXT_USER_GENERATED_TS;
    struct kgsl_drawctxt_create req = {
-      .flags = base_flags | KGSL_CONTEXT_PWR_CONSTRAINT,
+      .flags = base_flags | KGSL_CONTEXT_PWR_CONSTRAINT | kgsl_priority_flags(prio),
    };
 
    if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
-      req.flags = base_flags;
+      req.flags = base_flags | kgsl_priority_flags(prio);
       req.drawctxt_id = 0;
       if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
          drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
@@ -1708,7 +1982,8 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    case DRM_MSM_SUBMITQUEUE_NEW: {
       struct drm_msm_submitqueue *q = (void *)payload;
       uint32_t id;
-      rsp->ret = kgsl_drawctxt_create(kctx, q->prio, &id);
+      bool constrained = kgsl_queue_constrained(q->flags);
+      rsp->ret = kgsl_drawctxt_create(kctx, q->prio, constrained, &id);
       if (!rsp->ret) {
          struct kgsl_queue_timestamp_map *timestamps =
             calloc(1, sizeof(*timestamps));
@@ -1719,7 +1994,10 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
          }
 
          q->id = id;
-         unsigned ring_idx = MIN2(q->prio, g_nr_timelines - 1) + 1;
+         if (constrained)
+            _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: constrained while it submits at an animation's rate\n", id);
+         unsigned ring_idx = (MIN2(q->prio, g_nr_timelines - 1) + 1) |
+                             (constrained ? KGSL_RING_IDX_CONSTRAINED : 0);
          if (!_mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
                                       (void *)(uintptr_t)id,
                                       (void *)(uintptr_t)ring_idx) ||
@@ -2279,7 +2557,9 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       free(kcmds);
       return -EINVAL;
    }
-   unsigned ring_idx = (uintptr_t)entry->data;
+   unsigned ring_idx = (uintptr_t)entry->data & ~KGSL_RING_IDX_CONSTRAINED;
+   if ((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED)
+      kgsl_constraint_update(kctx, req->queue_id);
 
    struct hash_entry *timestamp_entry = _mesa_hash_table_search(
       kctx->sq_to_timestamp_table, (void *)(uintptr_t)req->queue_id);
@@ -2334,8 +2614,12 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    int ret = 0;
    unsigned submitted = 0;
    /* Rate window is process-wide (DWM+MC share the Graphics ring).  The
-    * cmdbatch flag is what makes a stored SETPROPERTY floor take effect. */
-   const bool pwr_flag = kgsl_pwr_on_submit(dctx->fd, req->queue_id);
+    * cmdbatch flag is what makes a stored SETPROPERTY floor take effect.
+    * A deadline queue (KGSL_RING_IDX_CONSTRAINED) has its own constraint,
+    * kgsl_constraint_update's, which this floor's clear would undo; it is
+    * left out of the rate window. */
+   const bool pwr_flag = !((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED) &&
+                         kgsl_pwr_on_submit(dctx->fd, req->queue_id);
    for (unsigned chunk = 0; chunk < chunk_count; chunk++) {
       unsigned first = chunk * max_ibs;
       unsigned count = MIN2(n - first, max_ibs);
@@ -2531,10 +2815,7 @@ kgsl_renderer_attach_resource(struct virgl_context *vctx, struct virgl_resource 
          return;
       }
 
-      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
-         ((res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED)
-             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
-             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+      uint32_t kgsl_flags = kgsl_guest_memflags(res->map_info == VIRGL_RENDERER_MAP_CACHE_CACHED, size);
 
       if (!kgsl_blob_arena_retain(offset, size))
          return;
@@ -2789,10 +3070,7 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
       int gfd = kctx->pending_guest_fd;
       kctx->pending_guest_fd = -1;
 
-      uint32_t kgsl_flags = KGSL_MEMFLAGS_IOCOHERENT |
-         ((obj->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED))
-             ? (KGSL_CACHEMODE_WRITEBACK << KGSL_CACHEMODE_SHIFT)
-             : (KGSL_CACHEMODE_WRITECOMBINE << KGSL_CACHEMODE_SHIFT));
+      uint32_t kgsl_flags = kgsl_guest_memflags(obj->flags & (MSM_BO_CACHED_COHERENT | MSM_BO_CACHED), obj->blob_size);
 
       uint32_t mem_id = kgsl_import_dmabuf(dctx->fd, gfd, kgsl_flags);
       if (!mem_id) {
@@ -2989,6 +3267,12 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
       kctx->shmem_arena_backed = false;
    }
 
+   /* A context that unbinds freed BOs leaves nothing bound in its slice either: an unbind of
+    * child 0 clears the whole range, whatever it maps (ranges of BOs it moved or imported), so
+    * the next context to claim the slice starts from the zero page. */
+   if (kctx->unbind_freed && kctx->va_slice_idx >= 0)
+      kgsl_vbo_op(kctx, 0, kctx->va_slice_base, kctx->va_slice_size, KGSL_GPUMEM_RANGE_OP_UNBIND);
+
    drm_context_deinit(dctx); /* frees remaining objects via free_object */
 
 
@@ -3001,6 +3285,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
    _mesa_hash_table_destroy(kctx->sq_to_timestamp_table,
                             kgsl_queue_timestamp_map_delete);
 
+   if (kctx->constraint_on)
+      kgsl_vcpu_animating(-1);
    free(kctx);
 }
 
@@ -3051,7 +3337,7 @@ kgsl_alloc_vbo(int fd, uint32_t *out_id, uint64_t *out_base, uint64_t *out_size)
 }
 
 struct virgl_context *
-drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
+drm2kgsl_renderer_create(int fd, size_t debug_len, const char *debug_name)
 {
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG context-create pid=%d", getpid());
@@ -3067,6 +3353,10 @@ drm2kgsl_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *deb
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
    kctx->dma_heap_fd = -1;
    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
+   kctx->unbind_freed = !getenv("NCTX_KEEP_FREED_RANGES");
+   if (!kctx->unbind_freed)
+      drm_log("context %.*s: freed guest BOs stay bound (NCTX_KEEP_FREED_RANGES)",
+              (int)(debug_name ? debug_len : 0), debug_name ? debug_name : "");
    if (kgsl_diag_enabled())
       kgsl_diag_log("KGSL_DIAG sync-mode gpu_id=%u chip_id=0x%" PRIx64
                     " mode=%s",
@@ -3225,10 +3515,16 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOMEM;
    }
 
-   /* KGSL supports a single priority band per drawctxt here; expose one ring.
-    * (Priorities are encoded in the drawctxt flags but map to one timeline.)
+   /* One priority, one ring (each priority is a ring, as msm's are), unless the host offers more: DRM2KGSL_PRIORITIES=2 or 3
+    * gives the guest that many submitqueue priorities, the lowest the kernel's default and the others above it
+    * (kgsl_priority_flags). Opt-in: a guest made for one ring is unchanged without it.
+    * Measured on an SM8650 (Adreno 750) with the iPadOS guest's render server raised to the second ringbuffer: the GPU clock
+    * stayed at its lowest (231 MHz, the governor seeing 63-68% busy) and GFXBench ALU 2 onscreen fell from 95-98 to 43-48 fps;
+    * unset, the clock went to 422-578 MHz. Why the governor held is not known. Leave it unset.
     */
-   g_nr_timelines = 1;
+   uint64_t priorities = 1;
+   kgsl_parse_u64_env("DRM2KGSL_PRIORITIES", &priorities);
+   g_nr_timelines = (unsigned)CLAMP(priorities, 1, 3);
 
    /* Advertise a recent drm/msm uabi so the guest turnip enables the modern
     * code paths (userspace IOVA, FENCE_SN_IN).  There is no real msm kernel
@@ -3262,13 +3558,13 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOTSUP;
    }
 
-   /* Derive slice geometry from the VBO KGSL actually granted.  Aim for the
-    * full KGSL_VA_MAX_SLICES bitmask width, but keep each slice >=
+   /* Derive slice geometry from the VBO KGSL actually granted.  Aim for
+    * KGSL_VA_SLICES slices, but keep each slice >=
     * KGSL_VA_SLICE_MIN so a small VBO trades context count for a usable
     * per-context VA budget rather than handing turnip a slice too small to
     * allocate into. */
    {
-      unsigned want = KGSL_VA_MAX_SLICES;
+      unsigned want = KGSL_VA_SLICES;
       uint64_t slice = g_va_size / want;
       if (slice < KGSL_VA_SLICE_MIN) {
          slice = KGSL_VA_SLICE_MIN;

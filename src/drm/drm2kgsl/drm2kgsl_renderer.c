@@ -443,6 +443,11 @@ struct kgsl_context {
    unsigned constrained_next;
    bool constraint_on;   /* the constrained queue's KGSL context has its constraint set now (kgsl_constraint_update) */
 
+   /* Whether the guest asked for its fault count (MSM_PARAM_FAULTS): then this context's GPU resets count in the shmem's
+    * global_faults (kgsl_note_reset). A guest that reads global_faults from the shmem alone (Linux turnip) never asks, and keeps
+    * seeing 0 there. */
+   bool report_resets;
+
    struct drm_timeline timelines[];
 };
 DEFINE_CAST(drm_context, kgsl_context)
@@ -1270,11 +1275,30 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
       /* Best-effort GPU timestamp; not all guests query this. */
       return 0;
    }
-   case MSM_PARAM_FAULTS:      return 0;
+   case MSM_PARAM_FAULTS:
+      kctx->report_resets = true;
+      return kctx->shmem ? kctx->shmem->global_faults : 0;
    default:
       drm_dbg("unhandled MSM_PARAM %u", param);
       return 0;
    }
+}
+
+/* Count a GPU reset KGSL blamed on a queue's context since the last submission (KGSL_PROP_GPU_RESET_STAT, which clears it) in the
+ * shmem's global_faults, as msm counts a context's faults for MSM_PARAM_FAULTS; an innocent context's reset does not count, as
+ * turnip's KGSL backend has it. Nothing else tells a guest: KGSL skips a reset context's later work and still retires its
+ * timestamps, so each fence after it signals at once with nothing drawn (an iPadOS guest on an Adreno 840 ran GFXBench Aztec at
+ * 1300 fps after one CP fault, and reported it). */
+static void
+kgsl_note_reset(struct kgsl_context *kctx, uint32_t drawctxt_id)
+{
+   uint32_t status = drawctxt_id;
+   if (kgsl_getprop(kctx->base.fd, KGSL_PROP_GPU_RESET_STAT, &status, sizeof(status)) ||
+       status == KGSL_CTX_STAT_NO_ERROR || status == KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT)
+      return;
+   kctx->shmem->global_faults++;
+   drm_err("queue %u: the GPU was reset with this context %s (fault %u of the context)", drawctxt_id,
+           status == KGSL_CTX_STAT_GUILTY_CONTEXT_RESET_EXT ? "guilty" : "involved", kctx->shmem->global_faults);
 }
 
 /* KGSL timestamp for a guest fence seqno. Guest seqnos start at 0, which is
@@ -2136,6 +2160,8 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    unsigned ring_idx = (uintptr_t)entry->data & ~KGSL_RING_IDX_CONSTRAINED;
    if ((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED)
       kgsl_constraint_update(kctx, req->queue_id);
+   if (kctx->report_resets && kctx->shmem)
+      kgsl_note_reset(kctx, req->queue_id);
 
    struct kgsl_gpu_command cmd = {
       .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,

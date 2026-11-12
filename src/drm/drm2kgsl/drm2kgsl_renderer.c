@@ -119,6 +119,7 @@ static const uint64_t vbo_size_ladder[] = {
 static uint64_t g_va_start;
 static uint64_t g_va_size;
 static uint64_t g_chip_id;
+static unsigned kgsl_retire_delay_ms(void);
 static uint32_t g_gpu_id;
 static uint32_t g_gmem_size;
 static uint64_t g_gmem_base;
@@ -447,6 +448,16 @@ struct kgsl_context {
     * global_faults (kgsl_note_reset). A guest that reads global_faults from the shmem alone (Linux turnip) never asks, and keeps
     * seeing 0 there. */
    bool report_resets;
+
+   /* NCTX_STREAM_CHECK (diagnostic): the command streams of the last submissions as they were when submitted -- each
+    * command and the indirect buffers it calls, one level -- to tell a stream the guest changed while the GPU had not
+    * retired it (kgsl_stream_check_verify). */
+   struct kgsl_stream_rec {
+      uint32_t ts, queue;      /* ts 0: free */
+      unsigned n;
+      struct { uint64_t iova; uint32_t size; uint8_t *copy; } r[48];
+   } stream_recs[24];
+   unsigned stream_next;
 
    struct drm_timeline timelines[];
 };
@@ -1977,6 +1988,139 @@ kgsl_scan_reg_to_mem_addresses(struct drm_context *dctx, uint64_t ib_iova,
  * at the guest iova; the guest-assigned seqno is passed through as the KGSL
  * user-generated timestamp.
  */
+/* What the check has seen: ranges kept and ranges it could not read, submissions verified while pending and found
+ * unchanged, verified after they had retired (no answer), and found changed while pending. */
+static uint64_t g_sc_kept, g_sc_unreadable, g_sc_pending_same, g_sc_retired, g_sc_retired_changed, g_sc_changed, g_sc_submits;
+
+static bool
+kgsl_stream_check_enabled(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("NCTX_STREAM_CHECK") || access("/data/local/tmp/nctx-stream-check", F_OK) == 0;
+   return on;
+}
+
+/* The host's view of [iova, iova + size) of the guest's GPU address space, or NULL. */
+static const uint8_t *
+kgsl_stream_ptr(struct drm_context *dctx, struct kgsl_context *kctx, uint64_t iova, uint32_t size)
+{
+   hash_table_foreach(dctx->resource_table, ent) {
+      struct kgsl_object *o = (struct kgsl_object *)ent->data;
+      if (o->iova && iova >= o->iova && iova + size <= o->iova + o->blob_size) {
+         if (kgsl_map_object(kctx, o))
+            return NULL;
+         return (const uint8_t *)o->map + (iova - o->iova);
+      }
+   }
+   return NULL;
+}
+
+static void
+kgsl_stream_rec_free(struct kgsl_stream_rec *rec)
+{
+   for (unsigned i = 0; i < rec->n; i++)
+      free(rec->r[i].copy);
+   memset(rec, 0, sizeof(*rec));
+}
+
+/* Every kept submission: a range that no longer reads as it did while KGSL has not retired the submission's timestamp was
+ * changed under the GPU, which is reported with the first words that differ; a retired submission is dropped. */
+static void
+kgsl_stream_check_verify(struct drm_context *dctx, struct kgsl_context *kctx)
+{
+   for (unsigned k = 0; k < ARRAY_SIZE(kctx->stream_recs); k++) {
+      struct kgsl_stream_rec *rec = &kctx->stream_recs[k];
+      if (!rec->ts)
+         continue;
+      int changed = -1;
+      uint32_t at = 0, was = 0, is = 0;
+      for (unsigned i = 0; i < rec->n && changed < 0; i++) {
+         const uint8_t *now = kgsl_stream_ptr(dctx, kctx, rec->r[i].iova, rec->r[i].size);
+         if (!now) {
+            changed = (int)i; at = UINT32_MAX;
+            break;
+         }
+         if (memcmp(now, rec->r[i].copy, rec->r[i].size)) {
+            for (uint32_t w = 0; w + 4 <= rec->r[i].size; w += 4) {
+               if (memcmp(now + w, rec->r[i].copy + w, 4)) {
+                  at = w; memcpy(&was, rec->r[i].copy + w, 4); memcpy(&is, now + w, 4);
+                  break;
+               }
+            }
+            changed = (int)i;
+         }
+      }
+      struct kgsl_device_waittimestamp_ctxtid wait = {
+         .context_id = rec->queue, .timestamp = rec->ts, .timeout = 0,
+      };
+      bool retired = kgsl_ioctl(dctx->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait) == 0;
+      if (changed >= 0 && !retired)
+         drm_err("STREAM-CHECK ctx-slice=%d queue=%u ts=%u NOT RETIRED: range %d of %u at 0x%" PRIx64 "+0x%x %s"
+                 " (offset 0x%x was %08x is %08x)", kctx->va_slice_idx, rec->queue, rec->ts, changed, rec->n,
+                 rec->r[changed].iova, rec->r[changed].size, at == UINT32_MAX ? "is no longer mapped" : "changed",
+                 at, was, is);
+      if (changed >= 0 && !retired)
+         g_sc_changed++;
+      else if (retired && changed >= 0)
+         g_sc_retired_changed++;
+      else if (retired)
+         g_sc_retired++;
+      else
+         g_sc_pending_same++;
+      if (retired || changed >= 0)
+         kgsl_stream_rec_free(rec);
+   }
+}
+
+static void
+kgsl_stream_rec_add(struct drm_context *dctx, struct kgsl_context *kctx, struct kgsl_stream_rec *rec,
+                    uint64_t iova, uint32_t size)
+{
+   if (rec->n == ARRAY_SIZE(rec->r) || !size || size > (1u << 20))
+      return;
+   const uint8_t *now = kgsl_stream_ptr(dctx, kctx, iova, size);
+   if (!now) {
+      g_sc_unreadable++;
+      return;
+   }
+   g_sc_kept++;
+   uint8_t *copy = malloc(size);
+   if (!copy)
+      return;
+   memcpy(copy, now, size);
+   rec->r[rec->n].iova = iova; rec->r[rec->n].size = size; rec->r[rec->n].copy = copy;
+   rec->n++;
+}
+
+/* Keeps the submission's commands, and the indirect buffers each calls (CP_INDIRECT_BUFFER, one level), as they are now. */
+static void
+kgsl_stream_check_record(struct drm_context *dctx, struct kgsl_context *kctx, uint32_t queue, uint32_t ts,
+                         const struct kgsl_command_object *cmds, unsigned n)
+{
+   struct kgsl_stream_rec *rec = &kctx->stream_recs[kctx->stream_next++ % ARRAY_SIZE(kctx->stream_recs)];
+   kgsl_stream_rec_free(rec);
+   rec->ts = ts; rec->queue = queue;
+   if (++g_sc_submits % 1000 == 1)
+      drm_err("STREAM-CHECK stats: %" PRIu64 " submissions, ranges kept %" PRIu64 " unreadable %" PRIu64
+              ", checks pending-unchanged %" PRIu64 " retired-unchanged %" PRIu64 " retired-changed %" PRIu64
+              " changed-while-pending %" PRIu64,
+              g_sc_submits, g_sc_kept, g_sc_unreadable, g_sc_pending_same, g_sc_retired, g_sc_retired_changed, g_sc_changed);
+   for (unsigned i = 0; i < n; i++) {
+      kgsl_stream_rec_add(dctx, kctx, rec, cmds[i].gpuaddr, (uint32_t)cmds[i].size);
+      const uint32_t *ib = (const uint32_t *)kgsl_stream_ptr(dctx, kctx, cmds[i].gpuaddr, (uint32_t)cmds[i].size);
+      if (!ib)
+         continue;
+      for (uint32_t w = 0; w + 3 < cmds[i].size / 4; w++) {
+         if ((ib[w] >> 28) != 0x7 || ((ib[w] >> 16) & 0x7f) != 0x3f)
+            continue;
+         kgsl_stream_rec_add(dctx, kctx, rec, (uint64_t)ib[w + 1] | ((uint64_t)ib[w + 2] << 32),
+                             (ib[w + 3] & 0xfffff) * 4);
+         w += 3;
+      }
+   }
+}
+
 static int
 kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 {
@@ -2163,6 +2307,11 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (kctx->report_resets && kctx->shmem)
       kgsl_note_reset(kctx, req->queue_id);
 
+   if (kgsl_stream_check_enabled()) {
+      kgsl_stream_check_verify(dctx, kctx);
+      kgsl_stream_check_record(dctx, kctx, req->queue_id, KGSL_GUEST_TS(req->fence), kcmds, n);
+   }
+
    struct kgsl_gpu_command cmd = {
       .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
       .cmdlist = (uintptr_t)kcmds,
@@ -2247,6 +2396,9 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
     * passed the timestamp, or -ETIMEDOUT / -EDEADLK otherwise; both are
     * reported verbatim.
     */
+   if (kgsl_stream_check_enabled())
+      kgsl_stream_check_verify(dctx, kctx);
+
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
       .timestamp = KGSL_GUEST_TS(req->fence),
@@ -2256,6 +2408,19 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    rsp->ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait)
                  ? -errno
                  : 0;
+   if (rsp->ret == 0 && kgsl_retire_delay_ms()) {
+      /* Retired for KGSL: for the guest only once the delay has passed since this poll first saw it. */
+      static uint32_t seen_ts, seen_queue;
+      static uint64_t seen_ns;
+      struct timespec now_ts;
+      clock_gettime(CLOCK_MONOTONIC, &now_ts);
+      uint64_t now = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC + now_ts.tv_nsec;
+      if (seen_ts != wait.timestamp || seen_queue != wait.context_id) {
+         seen_ts = wait.timestamp; seen_queue = wait.context_id; seen_ns = now;
+      }
+      if (now - seen_ns < (uint64_t)kgsl_retire_delay_ms() * 1000000ull)
+         rsp->ret = -ETIMEDOUT;
+   }
    return 0;
 }
 
@@ -2675,6 +2840,29 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
    return 0;
 }
 
+/* NCTX_RETIRE_DELAY_MS, or the number in /data/local/tmp/nctx-retire-delay-ms (diagnostic): the guest hears that a timestamp
+ * retired this many milliseconds after KGSL says so -- whether what the guest does on completion (reusing the memory the
+ * submission read) comes too early for a GPU that had not quite finished. */
+static unsigned
+kgsl_retire_delay_ms(void)
+{
+   static int ms = -1;
+   if (ms < 0) {
+      const char *text = getenv("NCTX_RETIRE_DELAY_MS");
+      ms = text ? atoi(text) : 0;
+      FILE *f = fopen("/data/local/tmp/nctx-retire-delay-ms", "r");
+      if (f) {
+         if (fscanf(f, "%d", &ms) != 1)
+            ms = 0;
+         fclose(f);
+      }
+      if (ms < 0 || ms > 1000)
+         ms = 0;
+      drm_err("RETIRE-DELAY %d ms", ms);
+   }
+   return (unsigned)ms;
+}
+
 /* drm_timeline wait_timestamp hook: block the per-context sync thread until the
  * GPU retires (ctx_id, timestamp), bypassing TIMESTAMP_EVENT(FENCE)+sync_file.
  * arg is the KGSL device fd.  Chunked timeout keeps drm_timeline_fini responsive
@@ -2715,8 +2903,11 @@ kgsl_timeline_wait_timestamp(void *arg, uint32_t ctx_id, uint32_t timestamp)
       }
    }
 
-   if (ret == 0)
+   if (ret == 0) {
+      if (kgsl_retire_delay_ms())
+         usleep(kgsl_retire_delay_ms() * 1000);
       return 0; /* retired */
+   }
    return saved_errno == ETIMEDOUT ? ETIMEDOUT : (saved_errno ? saved_errno : -1);
 }
 

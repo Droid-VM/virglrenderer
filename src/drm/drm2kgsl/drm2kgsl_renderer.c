@@ -126,8 +126,8 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
-/* KGSL reports Adreno 830 as the canonical FD chip id below.  The fuse byte
- * is stripped during probe, so this also covers revisions such as 0x44050001.
+/* The Adreno 830's chip id without its fuse byte (KGSL reports revisions such as
+ * 0x44050001): compared with that byte masked off.
  */
 #define KGSL_A830_CHIP_ID UINT64_C(0x44050000)
 
@@ -239,7 +239,7 @@ kgsl_use_wait_timestamp(void)
       return false;
    if (getenv("NCTX_WAITTS"))
       return true;
-   return g_chip_id != KGSL_A830_CHIP_ID;
+   return (g_chip_id & ~UINT64_C(0xff)) != KGSL_A830_CHIP_ID;
 }
 
 static void
@@ -2967,13 +2967,12 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
       return -ENOTSUP;
    }
 
-   /* freedreno's device table keys chip_id with the low (fuse/patch) byte 0 --
-    * e.g. Adreno 830 is FD830 = 0x44050000 -- but KGSL reports the actual fuse
-    * revision (e.g. 0x44050001).  fd_dev_info() needs an exact match (or a 0xff
-    * patch wildcard the table doesn't carry), so strip the fuse byte to hit the
-    * canonical entry; otherwise the guest enumerates zero devices.
+   /* The chip id as KGSL gives it, fuse byte and all. It used to go to the guest with its last byte zeroed (the
+    * device table of the guest's Mesa then had no entry for the Adreno 840's 0x44050a31, only "patch level 0"
+    * ones added for this host); the tables have the real ids now -- 0x43051401, 0x44050001, 0x44050a31 -- and that
+    * byte is what tells an Adreno 840 of 2 slices (0x44050a21) from one of 3, which are different device entries.
     */
-   g_chip_id = devinfo.chip_id & ~UINT64_C(0xff);
+   g_chip_id = devinfo.chip_id;
    /* Some vendor KGSL builds leave devinfo.gpu_id at zero.  Keep the
     * chip-id-derived value exposed through the guest capset for compatibility;
     * the A830 fence policy below matches the canonical chip id directly. */

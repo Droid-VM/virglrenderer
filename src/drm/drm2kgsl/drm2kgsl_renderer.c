@@ -1322,17 +1322,28 @@ kgsl_note_reset(struct kgsl_context *kctx, uint32_t drawctxt_id)
  */
 #define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
 
-/* The KGSL priority of a submitqueue's msm priority (0 highest, g_nr_timelines of them): the lowest -- every queue's when
- * there is one priority, and turnip's medium and low when there are more -- keeps the kernel's default (8, the third of four
- * ringbuffers); a higher one takes the second ringbuffer (KGSL 4 or 5), which preempts the default's, and never the first, the
- * system compositor's. KGSL has 16 priorities, 0 highest, four to a ringbuffer.
+/* The KGSL priority of a submitqueue's msm priority (0 highest, g_nr_timelines of them). KGSL has 16 priorities, 0 highest,
+ * four to a ringbuffer; the kernel's default is 8, the third ringbuffer. With one guest priority every queue keeps the default.
+ * With more, the guest's higher ones keep the default and its lowest -- turnip's medium and low -- takes the fourth
+ * ringbuffer (12), which the default's preempts: a guest compositor's frames still come before the guest's applications'.
+ *
+ * A guest queue is never put in the second ringbuffer (KGSL 4-7), where the higher ones went before. Android's own UI renders
+ * there with the vendor driver (launcher and system UI at 4), and a guest context at 5 beside them had its tile memory passes
+ * broken whenever they drew: within one ringbuffer the vendor contexts' work comes in between a guest pass's bins and nothing
+ * keeps the guest's tile memory, while between ringbuffers KGSL preempts with a save and a restore. The vendor driver leaves
+ * surfaces whole in tile memory (the launcher's page while it scrolls, 1536 wide), so an iPadOS guest's render server, which
+ * loads and stores its 2048x2732 framebuffer through tile memory, got that rectangle zeroed -- (0,0)-(1536,2400) -- and 32x8
+ * blocks of what it had drawn stored elsewhere, in one of its two framebuffers: a part of the screen flickering at every other
+ * frame, after any Android animation (leaving and entering the VM's display was enough). Measured on an Adreno 840 with the
+ * guest forced to tile memory: at KGSL 5, 9 to 16 of 16 re-entries left such a frame and 24 launcher page swipes did; at the
+ * default, 0 of 24 and none after 64 swipes. KGSL's preemption switch does not change it (it is not that preemption).
  */
 static uint32_t
 kgsl_priority_flags(uint32_t prio)
 {
-   if (prio + 1 >= g_nr_timelines)
+   if (g_nr_timelines <= 1 || prio + 1 < g_nr_timelines)
       return KGSL_CONTEXT_PRIORITY_UNDEF;
-   return ((4 + MIN2(prio, 1)) << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK;
+   return (12 << KGSL_CONTEXT_PRIORITY_SHIFT) & KGSL_CONTEXT_PRIORITY_MASK;
 }
 
 /* A submitqueue whose work has a deadline -- a compositor's frames, which must be done within the display's next refresh or
@@ -3202,7 +3213,7 @@ drm2kgsl_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
    }
 
    /* One priority, one ring (each priority is a ring, as msm's are), unless the host offers more: DRM2KGSL_PRIORITIES=2 or 3
-    * gives the guest that many submitqueue priorities, the lowest the kernel's default and the others above it
+    * gives the guest that many submitqueue priorities, the higher ones the kernel's default and the lowest below it
     * (kgsl_priority_flags). Opt-in: a guest made for one ring is unchanged without it.
     * Measured on an SM8650 (Adreno 750) with the iPadOS guest's render server raised to the second ringbuffer: the GPU clock
     * stayed at its lowest (231 MHz, the governor seeing 63-68% busy) and GFXBench ALU 2 onscreen fell from 95-98 to 43-48 fps;

@@ -455,9 +455,12 @@ struct kgsl_context {
    struct kgsl_stream_rec {
       uint32_t ts, queue;      /* ts 0: free */
       unsigned n;
-      struct { uint64_t iova; uint32_t size; uint8_t *copy; } r[48];
+      bool retired, dumped;    /* retired: kept until its slot is taken again, for the dump of a later hang */
+      uint64_t submit_ns;
+      struct { uint64_t iova; uint32_t size; uint8_t *copy; bool ib1; } r[48];
    } stream_recs[24];
    unsigned stream_next;
+   unsigned stream_fault_gen;   /* the host's GPU fault count this context last saw (kgsl_fault_generation) */
 
    struct drm_timeline timelines[];
 };
@@ -2035,14 +2038,109 @@ kgsl_stream_rec_free(struct kgsl_stream_rec *rec)
    memset(rec, 0, sizeof(*rec));
 }
 
+static uint64_t
+kgsl_stream_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec;
+}
+
+/* The host's count of GPU faults (the second number of the device's gpufaults file), read at most every 50 ms: KGSL
+ * recovers from a hang within a second or so and then calls the stuck submission retired, so its change is the one sign
+ * of a hang a context can still see afterwards. 0 when the file cannot be read. */
+static unsigned
+kgsl_fault_generation(void)
+{
+   static uint64_t read_ns;
+   static unsigned count;
+   uint64_t now = kgsl_stream_now_ns();
+   if (read_ns && now - read_ns < 50 * 1000000ull)
+      return count;
+   read_ns = now;
+   FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpufaults", "r");
+   if (f) {
+      unsigned a = 0, b = 0;
+      if (fscanf(f, "%u %u", &a, &b) == 2)
+         count = b;
+      fclose(f);
+   }
+   return count;
+}
+
+/* A submission that KGSL has not retired two seconds after it was handed over is a hang: the context's kept submissions,
+ * oldest first -- the stuck one, those behind it and the retired ones before it whose slots are not taken yet -- go to
+ * /data/local/tmp/nctx-hang-<slice>-<queue>-<ts>.bin as kgslcap records ('S' queue ts, 'B' address size bytes for every
+ * range, 'I' address dwords for each command of the submission), which cap2rd.py turns into a capture cffdump reads. */
+static void
+kgsl_stream_dump(struct kgsl_context *kctx, const struct kgsl_stream_rec *stuck)
+{
+   static unsigned dumps;
+   if (dumps >= 40)
+      return;
+   char path[128];
+   snprintf(path, sizeof(path), "/data/local/tmp/nctx-hang-%d-%u-%u.bin", kctx->va_slice_idx, stuck->queue, stuck->ts);
+   FILE *f = fopen(path, "wb");
+   if (!f) {
+      drm_err("STREAM-HANG ctx-slice=%d queue=%u ts=%u: cannot write %s", kctx->va_slice_idx, stuck->queue, stuck->ts, path);
+      return;
+   }
+   dumps++;
+   unsigned order[ARRAY_SIZE(kctx->stream_recs)], n = 0;
+   for (unsigned k = 0; k < ARRAY_SIZE(kctx->stream_recs); k++)
+      if (kctx->stream_recs[k].ts)
+         order[n++] = k;
+   for (unsigned i = 1; i < n; i++)
+      for (unsigned j = i; j > 0 && kctx->stream_recs[order[j]].submit_ns < kctx->stream_recs[order[j - 1]].submit_ns; j--) {
+         unsigned t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+      }
+   for (unsigned i = 0; i < n; i++) {
+      struct kgsl_stream_rec *rec = &kctx->stream_recs[order[i]];
+      rec->dumped = true;
+      fputc('S', f); fwrite(&rec->queue, 4, 1, f); fwrite(&rec->ts, 4, 1, f);
+      for (unsigned r = 0; r < rec->n; r++) {
+         fputc('B', f); fwrite(&rec->r[r].iova, 8, 1, f); fwrite(&rec->r[r].size, 4, 1, f);
+         fwrite(rec->r[r].copy, 1, rec->r[r].size, f);
+      }
+      for (unsigned r = 0; r < rec->n; r++) {
+         if (!rec->r[r].ib1)
+            continue;
+         uint32_t dwords = rec->r[r].size / 4;
+         fputc('I', f); fwrite(&rec->r[r].iova, 8, 1, f); fwrite(&dwords, 4, 1, f);
+      }
+      drm_err("STREAM-HANG ctx-slice=%d queue=%u ts=%u %s, %u ranges, handed over %" PRIu64 " ms ago", kctx->va_slice_idx,
+              rec->queue, rec->ts, rec->retired ? "retired" : "PENDING", rec->n,
+              (kgsl_stream_now_ns() - rec->submit_ns) / 1000000);
+   }
+   fclose(f);
+   drm_err("STREAM-HANG wrote %s (%u submissions)", path, n);
+}
+
 /* Every kept submission: a range that no longer reads as it did while KGSL has not retired the submission's timestamp was
- * changed under the GPU, which is reported with the first words that differ; a retired submission is dropped. */
+ * changed under the GPU, which is reported with the first words that differ; a retired submission is kept, marked, until
+ * its slot is taken again. One still pending after two seconds is dumped with the others (kgsl_stream_dump). */
 static void
 kgsl_stream_check_verify(struct drm_context *dctx, struct kgsl_context *kctx)
 {
+   /* The host counted a GPU fault since this context last looked: what it holds is written out, whoever hung. */
+   unsigned gen = kgsl_fault_generation();
+   if (gen != kctx->stream_fault_gen) {
+      bool first = !kctx->stream_fault_gen;
+      kctx->stream_fault_gen = gen;
+      if (!first) {
+         const struct kgsl_stream_rec *newest = NULL;
+         for (unsigned k = 0; k < ARRAY_SIZE(kctx->stream_recs); k++) {
+            const struct kgsl_stream_rec *rec = &kctx->stream_recs[k];
+            if (rec->ts && !rec->dumped && (!newest || rec->submit_ns > newest->submit_ns))
+               newest = rec;
+         }
+         if (newest)
+            kgsl_stream_dump(kctx, newest);
+      }
+   }
    for (unsigned k = 0; k < ARRAY_SIZE(kctx->stream_recs); k++) {
       struct kgsl_stream_rec *rec = &kctx->stream_recs[k];
-      if (!rec->ts)
+      if (!rec->ts || rec->retired)
          continue;
       int changed = -1;
       uint32_t at = 0, was = 0, is = 0;
@@ -2079,14 +2177,18 @@ kgsl_stream_check_verify(struct drm_context *dctx, struct kgsl_context *kctx)
          g_sc_retired++;
       else
          g_sc_pending_same++;
-      if (retired || changed >= 0)
+      if (changed >= 0)
          kgsl_stream_rec_free(rec);
+      else if (retired)
+         rec->retired = true;
+      else if (!rec->dumped && kgsl_stream_now_ns() - rec->submit_ns > 2 * NSEC_PER_SEC)
+         kgsl_stream_dump(kctx, rec);
    }
 }
 
 static void
 kgsl_stream_rec_add(struct drm_context *dctx, struct kgsl_context *kctx, struct kgsl_stream_rec *rec,
-                    uint64_t iova, uint32_t size)
+                    uint64_t iova, uint32_t size, bool ib1)
 {
    if (rec->n == ARRAY_SIZE(rec->r) || !size || size > (1u << 20))
       return;
@@ -2100,7 +2202,7 @@ kgsl_stream_rec_add(struct drm_context *dctx, struct kgsl_context *kctx, struct 
    if (!copy)
       return;
    memcpy(copy, now, size);
-   rec->r[rec->n].iova = iova; rec->r[rec->n].size = size; rec->r[rec->n].copy = copy;
+   rec->r[rec->n].iova = iova; rec->r[rec->n].size = size; rec->r[rec->n].copy = copy; rec->r[rec->n].ib1 = ib1;
    rec->n++;
 }
 
@@ -2109,16 +2211,24 @@ static void
 kgsl_stream_check_record(struct drm_context *dctx, struct kgsl_context *kctx, uint32_t queue, uint32_t ts,
                          const struct kgsl_command_object *cmds, unsigned n)
 {
-   struct kgsl_stream_rec *rec = &kctx->stream_recs[kctx->stream_next++ % ARRAY_SIZE(kctx->stream_recs)];
+   /* The next slot that holds nothing pending: a submission KGSL has not retired keeps its copy (a hang's dump needs it). */
+   struct kgsl_stream_rec *rec = NULL;
+   for (unsigned tries = 0; tries < ARRAY_SIZE(kctx->stream_recs) && !rec; tries++) {
+      struct kgsl_stream_rec *slot = &kctx->stream_recs[kctx->stream_next++ % ARRAY_SIZE(kctx->stream_recs)];
+      if (!slot->ts || slot->retired)
+         rec = slot;
+   }
+   if (!rec)
+      return;
    kgsl_stream_rec_free(rec);
-   rec->ts = ts; rec->queue = queue;
+   rec->ts = ts; rec->queue = queue; rec->submit_ns = kgsl_stream_now_ns();
    if (++g_sc_submits % 1000 == 1)
       drm_err("STREAM-CHECK stats: %" PRIu64 " submissions, ranges kept %" PRIu64 " unreadable %" PRIu64
               ", checks pending-unchanged %" PRIu64 " retired-unchanged %" PRIu64 " retired-changed %" PRIu64
               " changed-while-pending %" PRIu64,
               g_sc_submits, g_sc_kept, g_sc_unreadable, g_sc_pending_same, g_sc_retired, g_sc_retired_changed, g_sc_changed);
    for (unsigned i = 0; i < n; i++) {
-      kgsl_stream_rec_add(dctx, kctx, rec, cmds[i].gpuaddr, (uint32_t)cmds[i].size);
+      kgsl_stream_rec_add(dctx, kctx, rec, cmds[i].gpuaddr, (uint32_t)cmds[i].size, true);
       const uint32_t *ib = (const uint32_t *)kgsl_stream_ptr(dctx, kctx, cmds[i].gpuaddr, (uint32_t)cmds[i].size);
       if (!ib)
          continue;
@@ -2126,7 +2236,7 @@ kgsl_stream_check_record(struct drm_context *dctx, struct kgsl_context *kctx, ui
          if ((ib[w] >> 28) != 0x7 || ((ib[w] >> 16) & 0x7f) != 0x3f)
             continue;
          kgsl_stream_rec_add(dctx, kctx, rec, (uint64_t)ib[w + 1] | ((uint64_t)ib[w + 2] << 32),
-                             (ib[w + 3] & 0xfffff) * 4);
+                             (ib[w + 3] & 0xfffff) * 4, false);
          w += 3;
       }
    }
@@ -2999,6 +3109,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
 
    if (kctx->constraint_on)
       kgsl_vcpu_animating(-1);
+   for (unsigned k = 0; k < ARRAY_SIZE(kctx->stream_recs); k++)
+      kgsl_stream_rec_free(&kctx->stream_recs[k]);
    free(kctx);
 }
 

@@ -85,6 +85,9 @@ struct vrend_resource {
    /* IOV pointing to shared guest memory storage for this resource. */
    const struct iovec *iov;
    uint32_t num_iovs;
+   /* Layout of a linear blob staged through guest backing instead of EGL. */
+   uint32_t linear_blob_stride;
+   uint32_t linear_blob_offset;
    uint64_t mipmap_offsets[VR_MAX_TEXTURE_2D_LEVELS];
    void *gbm_bo, *egl_image;
    void *aux_plane_egl_image[VIRGL_GBM_MAX_PLANES];
@@ -484,7 +487,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
 void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
                                 uint32_t *max_size);
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_destroy_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 void vrend_renderer_set_sub_ctx(struct vrend_context *ctx, int sub_ctx_id);
 
@@ -551,6 +554,8 @@ int vrend_renderer_resource_map(struct pipe_resource *pres, void **map, uint64_t
 
 int vrend_renderer_resource_unmap(struct pipe_resource *pres);
 
+int vrend_renderer_get_resource_layout(struct vrend_context *ctx,
+                                       uint32_t out_handle, uint32_t target_handle);
 void vrend_renderer_get_meminfo(struct vrend_context *ctx, uint32_t res_handle);
 
 void vrend_context_emit_string_marker(struct vrend_context *ctx, GLsizei length, const char * message);

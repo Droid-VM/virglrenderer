@@ -55,6 +55,9 @@ int virgl_egl_get_fourcc_for_texture(struct virgl_egl *egl, uint32_t tex_id, uin
 
 int virgl_egl_get_fd_for_texture(struct virgl_egl *egl, uint32_t tex_id, int *fd);
 
+struct virgl_resource_layout;
+int virgl_egl_get_resource_layout(struct virgl_egl *egl, uint32_t tex_id,
+                                   struct virgl_resource_layout *layout);
 int virgl_egl_get_fd_for_texture2(struct virgl_egl *egl, uint32_t tex_id, int *fd, int *stride,
                                   int *offset);
 
@@ -67,6 +70,7 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
                                   const uint32_t *plane_offsets);
+bool virgl_egl_supports_dmabuf_import(struct virgl_egl *egl);
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);
 
 void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo);

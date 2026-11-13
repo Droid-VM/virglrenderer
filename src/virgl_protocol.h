@@ -129,6 +129,9 @@ enum virgl_context_cmd {
    VIRGL_CCMD_ENCODE_BITSTREAM,
    VIRGL_CCMD_END_FRAME,
 
+   VIRGL_CCMD_RESERVED_62 = 62,
+   /* Windows WDDM private protocol, shared with VirglGetResourceLayout. */
+   VIRGL_CCMD_GET_RESOURCE_LAYOUT = 63,
    VIRGL_MAX_COMMANDS
 };
 
@@ -753,5 +756,18 @@ enum vrend_tweak_type {
 #define VIRGL_END_FRAME_MIN_SIZE            2
 #define VIRGL_END_FRAME_CDC_HANDLE          1
 #define VIRGL_END_FRAME_TGT_HANDLE          2
+
+/* WDDM opcode 63 response, written to the attached output buffer. */
+struct virgl_resource_layout_plane {
+   uint64_t offset;
+   uint32_t stride;
+   uint32_t size;
+};
+struct virgl_resource_layout {
+   uint64_t modifier;
+   uint32_t num_planes;
+   uint32_t reserved;
+   struct virgl_resource_layout_plane planes[4];
+};
 
 #endif

@@ -4446,7 +4446,6 @@ void vrend_clear(struct vrend_context *ctx,
             colorf[i] = vrend_color_encode_as_srgb(colorf[i]);
       }
    }
-
    if (buffers & PIPE_CLEAR_COLOR) {
       if (sub_ctx->nr_cbufs && sub_ctx->surf[0] && vrend_format_is_emulated_alpha(sub_ctx->surf[0]->format)) {
          glClearColor(colorf[3], 0.0, 0.0, 0.0);
@@ -7145,7 +7144,12 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
          break;
    }
 
-   vrend_clicbs->make_current(gl_context);
+   if (!gl_context)
+      return ENOMEM;
+   if (vrend_clicbs->make_current(gl_context)) {
+      vrend_clicbs->destroy_gl_context(gl_context);
+      return EINVAL;
+   }
    gl_ver = epoxy_gl_version();
 
    /* enable error output as early as possible */
@@ -7237,6 +7241,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    /* create 0 context */
    vrend_state.ctx0 = vrend_create_context(0, strlen("HOST"), "HOST");
+   if (!vrend_state.ctx0)
+      return ENOMEM;
 
    vrend_state.eventfd = -1;
    if (flags & VREND_USE_THREAD_SYNC) {
@@ -7368,6 +7374,9 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
 
 void vrend_destroy_context(struct vrend_context *ctx)
 {
+   if (!ctx)
+      return;
+
    bool switch_0 = (ctx == vrend_state.current_ctx);
    struct vrend_context *cur = vrend_state.current_ctx;
    struct vrend_sub_context *sub, *tmp;
@@ -7439,6 +7448,8 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
 #endif
 
    grctx->res_hash = vrend_ctx_resource_init_table();
+   if (!grctx->res_hash)
+      goto fail;
    list_inithead(&grctx->untyped_resources);
 
    grctx->shader_cfg.max_shader_patch_varyings = vrend_state.max_shader_patch_varyings;
@@ -7457,15 +7468,29 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
    grctx->shader_cfg.has_nopersective = has_feature(feat_shader_noperspective_interpolation);
    grctx->shader_cfg.has_texture_shadow_lod = has_feature(feat_texture_shadow_lod);
 
-   vrend_renderer_create_sub_ctx(grctx, 0);
+   if (vrend_renderer_create_sub_ctx(grctx, 0))
+      goto fail;
    vrend_renderer_set_sub_ctx(grctx, 0);
 
    grctx->shader_cfg.glsl_version = vrender_get_glsl_version();
+   if (!grctx->shader_cfg.glsl_version) {
+      vrend_destroy_context(grctx);
+      return NULL;
+   }
 
    if (!grctx->ctx_id)
       grctx->fence_retire = vrend_clicbs->ctx0_fence_retire;
 
    return grctx;
+
+fail:
+#ifdef ENABLE_VIDEO
+   vrend_video_destroy_context(grctx->video);
+#endif
+   if (grctx->res_hash)
+      vrend_ctx_resource_fini_table(grctx->res_hash);
+   FREE(grctx);
+   return NULL;
 }
 
 static int check_resource_valid(const struct vrend_renderer_resource_create_args *args,
@@ -9139,11 +9164,25 @@ int vrend_renderer_transfer_iov(struct vrend_context *ctx,
                                 int transfer_mode)
 {
    struct vrend_resource *res;
+   struct vrend_transfer_info linear_info;
 
    res = vrend_renderer_ctx_res_lookup(ctx, dst_handle);
    if (!res) {
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
       return EINVAL;
+   }
+
+   /* KMD's implicit transfers address a rectangle of the published blob layout,
+    * not a tightly packed rectangle starting at byte zero of the allocation. */
+   if (res->linear_blob_stride && !info->iovec && !info->stride && !info->offset) {
+      if (!info->box || info->level != 0 || info->box->z != 0 || info->box->depth != 1 ||
+          !check_transfer_bounds(res, info))
+         return EINVAL;
+      linear_info = *info;
+      linear_info.stride = res->linear_blob_stride;
+      linear_info.offset = res->linear_blob_offset +
+         (uint64_t)info->box->y * res->linear_blob_stride + (uint64_t)info->box->x * 4;
+      info = &linear_info;
    }
 
    if (!check_transfer_iovec(res, info)) {
@@ -11075,9 +11114,13 @@ static int vrender_get_glsl_version(void)
 {
    int major_local = 0, minor_local = 0;
    const GLubyte *version_str;
-   ASSERTED int c;
+   int c;
 
    version_str = glGetString(GL_SHADING_LANGUAGE_VERSION);
+   if (!version_str) {
+      vrend_printf("GLSL version unavailable for current context\n");
+      return 0;
+   }
    if (vrend_state.use_gles) {
       c = sscanf((const char *)version_str, "%*s %*s %*s %*s %i.%i",
                   &major_local, &minor_local);
@@ -11085,7 +11128,10 @@ static int vrender_get_glsl_version(void)
       c = sscanf((const char *)version_str, "%i.%i",
                   &major_local, &minor_local);
    }
-   assert(c == 2);
+   if (c != 2) {
+      vrend_printf("Invalid GLSL version string: %s\n", version_str);
+      return 0;
+   }
 
    return (major_local * 100) + minor_local;
 }
@@ -12057,7 +12103,7 @@ void vrend_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
    }
 }
 
-void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+int vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
 {
    struct vrend_sub_context *sub;
    struct virgl_gl_ctx_param ctx_params;
@@ -12065,20 +12111,29 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
 
    LIST_FOR_EACH_ENTRY(sub, &ctx->sub_ctxs, head) {
       if (sub->sub_ctx_id == sub_ctx_id) {
-         return;
+         return 0;
       }
    }
 
    sub = CALLOC_STRUCT(vrend_sub_context);
    if (!sub)
-      return;
+      return ENOMEM;
 
    ctx_params.shared = (ctx->ctx_id == 0 && sub_ctx_id == 0) ? false : true;
    ctx_params.major_ver = vrend_state.gl_major_ver;
    ctx_params.minor_ver = vrend_state.gl_minor_ver;
    sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
+   if (!sub->gl_context) {
+      vrend_printf("Failed to create GL context %d sub %d\n", ctx->ctx_id, sub_ctx_id);
+      FREE(sub);
+      return ENOMEM;
+   }
    sub->parent = ctx;
-   vrend_clicbs->make_current(sub->gl_context);
+   if (vrend_clicbs->make_current(sub->gl_context)) {
+      vrend_clicbs->destroy_gl_context(sub->gl_context);
+      FREE(sub);
+      return EINVAL;
+   }
 
    /* enable if vrend_renderer_init function has done it as well */
    if (has_feature(feat_debug_cb)) {
@@ -12124,6 +12179,7 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
       ctx->sub0 = sub;
 
    vrend_set_tweak_from_env(&ctx->sub->tweaks);
+   return 0;
 }
 
 unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)
@@ -12309,6 +12365,34 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
       uint32_t drm_format;
       int ret;
 
+      /* Android EGL may have no Linux DMA-BUF import extension. Only linear
+       * packed color blobs with guest backing can use the existing explicit
+       * transfer/Blt path; optimal/UBWC layouts must never be read as rows. */
+      if (!virgl_egl_supports_dmabuf_import(egl) && res->iov && res->iov_count > 0 &&
+          args->modifier == 0 && args->plane_count == 1 && args->width && args->height &&
+          (args->format == VIRGL_FORMAT_B8G8R8A8_UNORM ||
+           args->format == VIRGL_FORMAT_B8G8R8X8_UNORM ||
+           args->format == VIRGL_FORMAT_R8G8B8A8_UNORM ||
+           args->format == VIRGL_FORMAT_R8G8B8X8_UNORM)) {
+         const uint64_t row_bytes = (uint64_t)args->width * 4;
+         const uint64_t end = args->plane_offsets[0] +
+            (uint64_t)(args->height - 1) * args->plane_strides[0] + row_bytes;
+         if (row_bytes > args->plane_strides[0] || args->plane_strides[0] % 4 ||
+             end > UINT32_MAX || (uint64_t)args->plane_strides[0] * args->height > UINT32_MAX ||
+             end > res->map_size ||
+             end > vrend_get_iovec_size(res->iov, res->iov_count))
+            return EINVAL;
+         gr = (struct vrend_resource *)vrend_renderer_resource_create(&create_args, NULL);
+         if (!gr)
+            return ENOMEM;
+         gr->linear_blob_stride = args->plane_strides[0];
+         gr->linear_blob_offset = args->plane_offsets[0];
+         vrend_pipe_resource_attach_iov(&gr->base, res->iov, res->iov_count, NULL);
+         res->pipe_resource = &gr->base;
+         vrend_ctx_resource_insert(ctx->res_hash, res_id, gr);
+         return 0;
+      }
+
       if (res->fd_type != VIRGL_RESOURCE_FD_DMABUF)
          return EINVAL;
 
@@ -12337,7 +12421,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                                   args->plane_strides,
                                                   args->plane_offsets);
       if (!gr->egl_image) {
-         vrend_printf("%s: failed to create egl image\n", __func__);
+         virgl_error("%s: failed to create egl image ctx=%d res=%u\n", __func__, ctx->ctx_id, res_id);
          FREE(gr);
          return EINVAL;
       }
@@ -12478,6 +12562,67 @@ int vrend_renderer_export_ctx0_fence(uint32_t fence_id, int* out_fd) {
    (void)out_fd;
 #endif
    return -EINVAL;
+}
+
+int vrend_renderer_get_resource_layout(struct vrend_context *ctx,
+                                       uint32_t out_handle, uint32_t target_handle)
+{
+   struct vrend_resource *out = vrend_renderer_ctx_res_lookup(ctx, out_handle);
+   struct vrend_resource *target = vrend_renderer_ctx_res_lookup(ctx, target_handle);
+   struct virgl_resource_layout layout = {0};
+   _Static_assert(sizeof(layout) == 80, "WDDM resource layout ABI");
+   if (!out || !target || out == target || out->base.target != PIPE_BUFFER ||
+       !out->iov || out->base.width0 < sizeof(layout) ||
+       vrend_get_iovec_size(out->iov, out->num_iovs) < sizeof(layout))
+      return EINVAL;
+   int ret = ENOTSUP;
+#ifdef ENABLE_MINIGBM_ALLOCATION
+   if (target->gbm_bo) {
+      int planes = gbm_bo_get_plane_count(target->gbm_bo);
+      uint64_t modifier = gbm_bo_get_modifier(target->gbm_bo);
+      if (planes > 0 && planes <= 4 && modifier != DRM_FORMAT_MOD_INVALID) {
+         layout.modifier = modifier;
+         layout.num_planes = planes;
+         ret = 0;
+         for (int i = 0; i < planes; i++) {
+            layout.planes[i].offset = gbm_bo_get_offset(target->gbm_bo, i);
+            layout.planes[i].stride = gbm_bo_get_stride_for_plane(target->gbm_bo, i);
+            layout.planes[i].size = gbm_bo_get_plane_size(target->gbm_bo, i);
+            if (!layout.planes[i].stride || !layout.planes[i].size)
+               ret = EINVAL;
+         }
+      }
+   } else
+#endif
+   {
+#ifdef HAVE_EPOXY_EGL_H
+      if (target->target == GL_TEXTURE_2D && target->base.last_level == 0 &&
+          target->base.depth0 == 1 && target->base.array_size == 1 &&
+          target->base.nr_samples == 0)
+         ret = virgl_egl_get_resource_layout(egl, target->id, &layout);
+#endif
+   }
+   /* Android EGL/minigbm may not expose DMA-BUF layout for scanout textures. */
+   if (ret == ENOTSUP && (target->base.bind & VIRGL_BIND_SCANOUT) &&
+       target->base.target == PIPE_TEXTURE_2D && target->base.nr_samples == 0) {
+      layout.modifier = 0;
+      layout.num_planes = 1;
+      layout.planes[0].offset = 0;
+      layout.planes[0].stride = target->base.width0 * 4;
+      layout.planes[0].size = layout.planes[0].stride * target->base.height0;
+      ret = layout.planes[0].stride && layout.planes[0].size ? 0 : EINVAL;
+   }
+   // Bound bring-up diagnostics even if DWM recreates devices repeatedly.
+   static unsigned log_count;
+   if (log_count++ < 64)
+      vrend_printf("WDDM-LAYOUT out=%u target=%u format=%u bind=0x%x storage=0x%x ret=%d modifier=0x%llx planes=%u stride=%u size=%u\n",
+                   out_handle, target_handle, target->base.format, target->base.bind,
+                   target->storage_bits, ret, (unsigned long long)layout.modifier,
+                   layout.num_planes, layout.planes[0].stride, layout.planes[0].size);
+   if (ret)
+      return ret;
+   vrend_write_to_iovec(out->iov, out->num_iovs, 0, (const char *)&layout, sizeof(layout));
+   return 0;
 }
 
 void vrend_renderer_get_meminfo(struct vrend_context *ctx, uint32_t res_handle)

@@ -39,6 +39,7 @@
 
 #include "util/u_memory.h"
 #include "virgl_hw.h"
+#include "virgl_protocol.h"
 #include "virgl_util.h"
 #include "virglrenderer.h"
 #include "vrend_winsys.h"
@@ -448,6 +449,10 @@ virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct
                              egl->egl_conf,
                              vparams->shared ? eglGetCurrentContext() : EGL_NO_CONTEXT,
                              ctx_att);
+   if (egl_ctx == EGL_NO_CONTEXT && vparams->shared)
+      vrend_printf("Failed to create shared EGL context %d.%d: %s\n",
+                   vparams->major_ver, vparams->minor_ver,
+                   virgl_egl_error_string(eglGetError()));
    return (virgl_renderer_gl_context)egl_ctx;
 }
 
@@ -501,6 +506,49 @@ int virgl_egl_get_fourcc_for_texture(struct virgl_egl *egl, uint32_t tex_id, uin
  fallback:
    ret = virgl_gbm_convert_format(&format, &gbm_format);
    *fourcc = (int)gbm_format;
+   return ret;
+}
+
+int virgl_egl_get_resource_layout(struct virgl_egl *egl, uint32_t tex_id,
+                                   struct virgl_resource_layout *layout)
+{
+   if (!egl || !has_bit(egl->extension_bits, EGL_MESA_IMAGE_DMA_BUF_EXPORT))
+      return ENOTSUP;
+
+   EGLImageKHR image = eglCreateImageKHR(egl->egl_display, eglGetCurrentContext(),
+                                        EGL_GL_TEXTURE_2D_KHR,
+                                        (EGLClientBuffer)(uintptr_t)tex_id, NULL);
+   if (image == EGL_NO_IMAGE_KHR)
+      return EINVAL;
+   int ret = EINVAL;
+   EGLint fourcc = 0, planes = 0;
+   EGLuint64KHR modifier = DRM_FORMAT_MOD_INVALID;
+   int fd = -1;
+   EGLint stride = 0, offset = 0;
+   if (!eglExportDMABUFImageQueryMESA(egl->egl_display, image, &fourcc, &planes, &modifier))
+      goto out;
+   // Only single-plane exports have an unambiguous plane extent here.
+   // Never infer a linear layout from width or return an unknown modifier.
+   if (planes != 1 || !fourcc || modifier == DRM_FORMAT_MOD_INVALID) {
+      ret = ENOTSUP;
+      goto out;
+   }
+   if (!eglExportDMABUFImageMESA(egl->egl_display, image, &fd, &stride, &offset))
+      goto out;
+   if (fd < 0 || stride <= 0 || offset < 0)
+      goto out;
+   off_t size = lseek(fd, 0, SEEK_END);
+   if (size <= offset || (uint64_t)(size - offset) > UINT32_MAX)
+      goto out;
+   *layout = (struct virgl_resource_layout) {
+      .modifier = modifier, .num_planes = 1,
+      .planes = {{ .offset = offset, .stride = stride, .size = size - offset }},
+   };
+   ret = 0;
+out:
+   if (fd >= 0)
+      close(fd);
+   eglDestroyImageKHR(egl->egl_display, image);
    return ret;
 }
 
@@ -575,6 +623,11 @@ bool virgl_has_egl_khr_gl_colorspace(struct virgl_egl *egl)
    return has_bit(egl->extension_bits, EGL_KHR_GL_COLORSPACE);
 }
 
+bool virgl_egl_supports_dmabuf_import(struct virgl_egl *egl)
+{
+   return egl && has_bit(egl->extension_bits, EGL_EXT_IMAGE_DMA_BUF_IMPORT);
+}
+
 void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t width,
                                   uint32_t height,
@@ -629,11 +682,15 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
    attrs[count++] = EGL_NONE;
    assert(count <= ARRAY_SIZE(attrs));
 
-   return (void *)eglCreateImageKHR(egl->egl_display,
+   void *image = (void *)eglCreateImageKHR(egl->egl_display,
                                     EGL_NO_CONTEXT,
                                     EGL_LINUX_DMA_BUF_EXT,
                                     (EGLClientBuffer)NULL,
                                     attrs);
+   if (!image)
+      virgl_error("DMA-BUF EGL import failed error=0x%x format=0x%x size=%ux%u modifier=0x%" PRIx64 "\n",
+                  eglGetError(), drm_format, width, height, drm_modifier);
+   return image;
 }
 
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image)

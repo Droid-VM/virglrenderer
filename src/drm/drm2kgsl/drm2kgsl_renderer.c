@@ -38,11 +38,12 @@
  *     existing share66 GuestAccept path exactly like gfxstream today.
  *
  *  3) Fence seqno.  The msm protocol has the guest assign the submit seqno
- *     (MSM_SUBMIT_FENCE_SN_IN).  KGSL normally assigns its own timestamp, but
- *     KGSL_CONTEXT_USER_GENERATED_TS lets us pass the guest seqno straight
- *     through as the KGSL timestamp, so the two timelines stay identical.  A
- *     sync_file fd for the vdrm ring fence is obtained from the completed
- *     submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
+ *     (MSM_SUBMIT_FENCE_SN_IN).  KGSL normally assigns its own timestamp, and
+ *     its user-generated timestamp mode requires strictly increasing values.
+ *     A large guest submit may therefore be split into several KGSL submits;
+ *     a per-submitqueue map translates each guest fence to the final host
+ *     timestamp.  A sync_file fd for the vdrm ring fence is obtained from the
+ *     completed submit via TIMESTAMP_EVENT(FENCE) and fed to drm_timeline.
  */
 
 #include <dirent.h>
@@ -127,13 +128,55 @@ static uint32_t g_highest_bank_bit;
 static uint64_t g_uche_trap_base;
 static unsigned g_nr_timelines;
 
+/* KGSL rejects a GPU_COMMAND with more than this many IB objects before it
+ * even looks at the command list.  Keep this local to the backend because the
+ * value is a KGSL kernel ABI limit, not part of the msm wire protocol. */
+#define KGSL_GPU_COMMAND_MAX_IBS 2000u
+/* A830 can fault when a large indirect HFI IB list is followed by another
+ * submission before it retires. This also reproduces with standalone KGSL
+ * CP_MEM_WRITE/NOP IBs, without a guest or renderer. Keep its IB descriptors
+ * inline: (1024-byte HFI message - 32-byte hfi_submit_cmd) / 12-byte IB = 82.
+ * Split asynchronously and retain the final chunk's GPU completion point. */
+#define KGSL_A830_GPU_COMMAND_MAX_IBS 82u
+
+/* Guest seqno 0 maps to KGSL timestamp 1 because timestamp 0 is reserved. */
+#define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
+
+/*
+ * Power constraint.  msm-adreno-tz / GMU treat virtio IBs as idle, so a
+ * native-game-style KGSL_PROP_PWR_CONSTRAINT floor is required.  This kernel
+ * rejects PWR_PERC_* and accepts PWR_MAX.
+ *
+ * Do not vote MAX on every GPU_COMMAND: guest DWM presents every vsync
+ * (~70-120/s) and would pin turbo for the whole session.  A process-wide
+ * 250 ms window of GPU_COMMAND rate decides (DWM and MC share the
+ * Graphics ring, so queue ordinals cannot split them):
+ *   >= enter (default 130/s) -> SETPROPERTY MAX
+ *   hold_ms (default 400) below enter -> CONSTRAINT_NONE
+ * Idle desktop is DWM-only (~70-120/s).  MC+DWM was ~210/s.  After MC
+ * exits the window falls back to DWM and the hold expires.
+ * NCTX_PWR_CONSTRAINT:
+ *   unset / max            -> rate hysteresis + PWR_MAX
+ *   always                 -> every submit MAX (old pin-the-clock behaviour)
+ *   perc / perc:N          -> same hysteresis, PWR_PERC N (falls back)
+ *   0 / off                -> disabled
+ * NCTX_PWR_ENTER, NCTX_PWR_HOLD_MS override the thresholds.
+ */
+#define KGSL_PWR_KIND_OFF     0
+#define KGSL_PWR_KIND_PERC    1
+#define KGSL_PWR_KIND_MAX     2
+#define KGSL_PWR_PERC_DEFAULT 80u
+#define KGSL_PWR_WIN_NS       (250ull * 1000000ull)
+#define KGSL_PWR_ENTER_DEFAULT 130u
+#define KGSL_PWR_HOLD_MS_DEFAULT 400u
+
 /* The Adreno 830's chip id without its fuse byte (KGSL reports revisions such as
  * 0x44050001): compared with that byte masked off.
  */
 #define KGSL_A830_CHIP_ID UINT64_C(0x44050000)
 
-/* Aggregate tracing for the host-side arena and fence paths.  It is enabled by
- * default; set CROSVM_DRM2KGSL_DIAG=0 to disable it.  Counters are process-wide
+/* Aggregate tracing for the host-side arena and fence paths.  Set
+ * CROSVM_DRM2KGSL_DIAG=1 to enable it.  Counters are process-wide
  * because the arena is shared by all KGSL contexts in the renderer process. */
 struct kgsl_diag_stats {
    uint64_t attach_calls;
@@ -181,7 +224,7 @@ static void
 kgsl_diag_init_once(void)
 {
    const char *env = getenv("CROSVM_DRM2KGSL_DIAG");
-   g_kgsl_diag.enabled = !env || strcmp(env, "0") != 0;
+   g_kgsl_diag.enabled = env && strcmp(env, "1") == 0;
    if (g_kgsl_diag.enabled)
       kgsl_diag_log("KGSL_DIAG enabled");
 }
@@ -383,6 +426,96 @@ struct kgsl_object {
 };
 DEFINE_CAST(drm_object, kgsl_object)
 
+/* KGSL contexts use user-generated timestamps, while the msm protocol exposes
+ * its own per-submit fence sequence.  A large guest submit may need several
+ * KGSL submissions, so keep the final host timestamp for every guest fence. */
+struct kgsl_queue_timestamp_map {
+   uint32_t last_host_timestamp;
+   uint32_t last_fault_count;
+   uint32_t *guest_fences;
+   uint32_t *host_timestamps;
+   size_t count;
+   size_t capacity;
+};
+
+static void
+kgsl_queue_timestamp_map_free(struct kgsl_queue_timestamp_map *map)
+{
+   if (!map)
+      return;
+   free(map->guest_fences);
+   free(map->host_timestamps);
+   free(map);
+}
+
+static void
+kgsl_queue_timestamp_map_delete(struct hash_entry *entry)
+{
+   kgsl_queue_timestamp_map_free(entry->data);
+}
+
+static bool
+kgsl_queue_timestamp_map_reserve(struct kgsl_queue_timestamp_map *map)
+{
+   if (map->count < map->capacity)
+      return true;
+
+   size_t new_capacity = map->capacity ? map->capacity * 2 : 64;
+   size_t bytes = size_mul(new_capacity, sizeof(*map->guest_fences));
+   if (new_capacity < map->capacity || bytes == SIZE_MAX ||
+       size_mul(new_capacity, sizeof(*map->host_timestamps)) == SIZE_MAX)
+      return false;
+
+   uint32_t *guest = realloc(map->guest_fences,
+                             new_capacity * sizeof(*map->guest_fences));
+   uint32_t *host = realloc(map->host_timestamps,
+                            new_capacity * sizeof(*map->host_timestamps));
+   if (!guest || !host) {
+      /* Keep the original arrays usable if either allocation failed. */
+      if (guest)
+         map->guest_fences = guest;
+      if (host)
+         map->host_timestamps = host;
+      return false;
+   }
+
+   map->guest_fences = guest;
+   map->host_timestamps = host;
+   map->capacity = new_capacity;
+   return true;
+}
+
+static bool
+kgsl_queue_timestamp_map_append(struct kgsl_queue_timestamp_map *map,
+                                 uint32_t guest_fence,
+                                 uint32_t host_timestamp)
+{
+   if (!kgsl_queue_timestamp_map_reserve(map))
+      return false;
+
+   map->guest_fences[map->count] = guest_fence;
+   map->host_timestamps[map->count] = host_timestamp;
+   map->count++;
+   map->last_host_timestamp = host_timestamp;
+   return true;
+}
+
+static bool
+kgsl_queue_timestamp_map_lookup(const struct kgsl_queue_timestamp_map *map,
+                                uint32_t guest_fence,
+                                uint32_t *host_timestamp)
+{
+   /* Fence values are normally monotonic.  Search backwards so a repeated
+    * value (from a malformed guest) resolves to the newest submission. */
+   for (size_t i = map->count; i > 0; i--) {
+      if (map->guest_fences[i - 1] == guest_fence) {
+         *host_timestamp = map->host_timestamps[i - 1];
+         return true;
+      }
+   }
+   return false;
+}
+
 struct kgsl_context {
    struct drm_context base;
 
@@ -438,6 +571,12 @@ struct kgsl_context {
    /* Maps submitqueue-id (== KGSL drawctxt id) to ring_idx. */
    struct hash_table *sq_to_ring_idx_table;
 
+   /* Maps submitqueue-id to the host timestamp sequence used for KGSL. */
+   struct hash_table *sq_to_timestamp_table;
+
+   /* Cumulative faults in this guest context, including closed queues. */
+   uint64_t fault_count;
+
    /* When the context's last submissions to a constrained queue were made (CLOCK_MONOTONIC ns, a ring): whether the queue is
     * producing frames at a rate that its constraint is for (kgsl_constraint_now). */
    uint64_t constrained_submits[8];
@@ -466,6 +605,23 @@ struct kgsl_context {
 };
 DEFINE_CAST(drm_context, kgsl_context)
 
+static uint32_t
+kgsl_queue_timestamp(const struct kgsl_context *kctx, uint32_t queue_id,
+                     uint32_t guest_fence)
+{
+   struct hash_entry *entry = _mesa_hash_table_search(
+      kctx->sq_to_timestamp_table, (void *)(uintptr_t)queue_id);
+   uint32_t host_timestamp;
+
+   if (entry && kgsl_queue_timestamp_map_lookup(entry->data, guest_fence,
+                                                 &host_timestamp))
+      return host_timestamp;
+
+   /* Preserve the old behavior for a fence submitted before its map entry was
+    * recorded, and for queues created by an older in-process caller. */
+   return KGSL_GUEST_TS(guest_fence);
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Low-level KGSL helpers
@@ -480,6 +636,213 @@ kgsl_ioctl(int fd, unsigned long request, void *arg)
       ret = ioctl(fd, request, arg);
    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
    return ret;
+}
+
+/* Process-wide: SETPROPERTY of a perc level that this kernel rejects is
+ * remembered so later submits skip the failing flavour. */
+static pthread_once_t g_pwr_once = PTHREAD_ONCE_INIT;
+static mtx_t g_pwr_mutex;
+static int g_pwr_kind = KGSL_PWR_KIND_MAX;
+static unsigned g_pwr_perc = KGSL_PWR_PERC_DEFAULT;
+static bool g_pwr_perc_ok = true;
+static bool g_pwr_always;
+static unsigned g_pwr_enter = KGSL_PWR_ENTER_DEFAULT;
+static unsigned g_pwr_hold_ms = KGSL_PWR_HOLD_MS_DEFAULT;
+static uint64_t g_pwr_win_start_ns;
+static uint32_t g_pwr_win_subs;
+static uint64_t g_pwr_last_hot_ns;
+static bool g_pwr_hot;
+static bool g_pwr_applied;
+static uint32_t g_pwr_last_ctx;
+static int g_pwr_last_fd = -1;
+
+static uint64_t
+kgsl_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static unsigned
+kgsl_env_uint(const char *name, unsigned def)
+{
+   const char *e = getenv(name);
+   if (!e || !e[0])
+      return def;
+   return (unsigned)atoi(e);
+}
+
+static void
+kgsl_pwr_init_once(void)
+{
+   const char *env = getenv("NCTX_PWR_CONSTRAINT");
+   mtx_init(&g_pwr_mutex, mtx_plain);
+   g_pwr_kind = KGSL_PWR_KIND_MAX;
+   g_pwr_perc = KGSL_PWR_PERC_DEFAULT;
+   g_pwr_always = false;
+   g_pwr_enter = kgsl_env_uint("NCTX_PWR_ENTER", KGSL_PWR_ENTER_DEFAULT);
+   g_pwr_hold_ms = kgsl_env_uint("NCTX_PWR_HOLD_MS", KGSL_PWR_HOLD_MS_DEFAULT);
+   if (g_pwr_enter < 1)
+      g_pwr_enter = 1;
+   if (g_pwr_hold_ms < 50)
+      g_pwr_hold_ms = 50;
+   if (!env || !env[0])
+      return;
+   if (!strcmp(env, "0") || !strcmp(env, "off")) {
+      g_pwr_kind = KGSL_PWR_KIND_OFF;
+      return;
+   }
+   if (!strcmp(env, "always")) {
+      g_pwr_always = true;
+      return;
+   }
+   if (!strcmp(env, "max"))
+      return;
+   if (!strncmp(env, "perc:", 5)) {
+      unsigned v = (unsigned)atoi(env + 5);
+      g_pwr_kind = KGSL_PWR_KIND_PERC;
+      if (v < (unsigned)KGSL_CONSTRAINT_PWR_PERC_MIN)
+         v = KGSL_CONSTRAINT_PWR_PERC_MIN;
+      if (v > (unsigned)KGSL_CONSTRAINT_PWR_PERC_MAX)
+         v = KGSL_CONSTRAINT_PWR_PERC_MAX;
+      g_pwr_perc = v;
+      return;
+   }
+   if (!strcmp(env, "perc")) {
+      g_pwr_kind = KGSL_PWR_KIND_PERC;
+      return;
+   }
+   drm_log("NCTX_PWR_CONSTRAINT=%s unrecognised; using rate+PWR_MAX", env);
+}
+
+static int
+kgsl_pwr_set(int fd, uint32_t ctx_id, unsigned type, unsigned level)
+{
+   struct kgsl_device_constraint_pwrlevel pwr = { .level = level };
+   struct kgsl_device_constraint c = {
+      .type = type,
+      .context_id = ctx_id,
+      .data = &pwr,
+      .size = type == KGSL_CONSTRAINT_NONE ? 0 : sizeof(pwr),
+   };
+   struct kgsl_device_getproperty req = {
+      .type = KGSL_PROP_PWR_CONSTRAINT,
+      .value = &c,
+      .sizebytes = sizeof(c),
+   };
+   if (type == KGSL_CONSTRAINT_NONE) {
+      c.data = NULL;
+      c.size = 0;
+   }
+   return kgsl_ioctl(fd, IOCTL_KGSL_SETPROPERTY, &req);
+}
+
+static void
+kgsl_pwr_apply(int fd, uint32_t ctx_id)
+{
+   int ret;
+
+   if (g_pwr_kind == KGSL_PWR_KIND_OFF)
+      return;
+
+   if (g_pwr_kind == KGSL_PWR_KIND_PERC && g_pwr_perc_ok) {
+      ret = kgsl_pwr_set(fd, ctx_id, KGSL_CONSTRAINT_PWRLEVEL, g_pwr_perc);
+      if (ret == 0) {
+         if (!g_pwr_applied)
+            drm_log("PWR_CONSTRAINT perc:%u on ctx %u", g_pwr_perc, ctx_id);
+         g_pwr_applied = true;
+         g_pwr_last_ctx = ctx_id;
+         g_pwr_last_fd = fd;
+         return;
+      }
+      drm_log("PWR_PERC %u rejected (%s); falling back to PWR_MAX",
+              g_pwr_perc, strerror(errno));
+      g_pwr_perc_ok = false;
+   }
+
+   ret = kgsl_pwr_set(fd, ctx_id, KGSL_CONSTRAINT_PWRLEVEL,
+                      KGSL_CONSTRAINT_PWR_MAX);
+   if (ret == 0) {
+      if (!g_pwr_applied)
+         drm_log("PWR_CONSTRAINT PWR_MAX on ctx %u", ctx_id);
+      g_pwr_applied = true;
+      g_pwr_kind = KGSL_PWR_KIND_MAX;
+      g_pwr_last_ctx = ctx_id;
+      g_pwr_last_fd = fd;
+      return;
+   }
+   drm_log("PWR_CONSTRAINT failed (%s); disabling", strerror(errno));
+   g_pwr_kind = KGSL_PWR_KIND_OFF;
+}
+
+static void
+kgsl_pwr_clear(void)
+{
+   if (!g_pwr_applied || g_pwr_last_fd < 0)
+      return;
+   (void)kgsl_pwr_set(g_pwr_last_fd, g_pwr_last_ctx, KGSL_CONSTRAINT_NONE, 0);
+   g_pwr_applied = false;
+}
+
+/* Process-wide 250 ms GPU_COMMAND window.  Returns whether this cmdbatch
+ * should carry KGSL_CMDBATCH_PWR_CONSTRAINT. */
+static bool
+kgsl_pwr_on_submit(int fd, uint32_t ctx_id)
+{
+   uint64_t now, hold_ns, elapsed;
+   uint32_t rate;
+   bool want_hot, was_hot;
+
+   pthread_once(&g_pwr_once, kgsl_pwr_init_once);
+   if (g_pwr_kind == KGSL_PWR_KIND_OFF)
+      return false;
+
+   mtx_lock(&g_pwr_mutex);
+   now = kgsl_now_ns();
+   if (g_pwr_always) {
+      kgsl_pwr_apply(fd, ctx_id);
+      mtx_unlock(&g_pwr_mutex);
+      return g_pwr_applied;
+   }
+
+   if (!g_pwr_win_start_ns)
+      g_pwr_win_start_ns = now;
+   g_pwr_win_subs++;
+   elapsed = now - g_pwr_win_start_ns;
+   if (elapsed >= KGSL_PWR_WIN_NS) {
+      rate = (uint32_t)((g_pwr_win_subs * 1000000000ull) / elapsed);
+      g_pwr_win_start_ns = now;
+      g_pwr_win_subs = 0;
+   } else if (elapsed > 0) {
+      rate = (uint32_t)((g_pwr_win_subs * 1000000000ull) / elapsed);
+   } else {
+      rate = 0;
+   }
+
+   was_hot = g_pwr_hot;
+   if (rate >= g_pwr_enter) {
+      g_pwr_last_hot_ns = now;
+      want_hot = true;
+   } else {
+      hold_ns = (uint64_t)g_pwr_hold_ms * 1000000ull;
+      want_hot = g_pwr_hot && g_pwr_last_hot_ns &&
+                 (now - g_pwr_last_hot_ns) < hold_ns;
+   }
+
+   if (want_hot && !was_hot)
+      drm_log("PWR hot ctx %u rate=%u/s", ctx_id, rate);
+   else if (!want_hot && was_hot)
+      drm_log("PWR cold ctx %u rate=%u/s", ctx_id, rate);
+   g_pwr_hot = want_hot;
+
+   if (want_hot)
+      kgsl_pwr_apply(fd, ctx_id);
+   else
+      kgsl_pwr_clear();
+
+   mtx_unlock(&g_pwr_mutex);
+   return g_pwr_applied && g_pwr_hot;
 }
 
 /* Guest turnip allocates every BO from the VA range returned by GET_PARAM.
@@ -1271,6 +1634,42 @@ kgsl_ccmd_nop(UNUSED struct drm_context *dctx, UNUSED struct vdrm_ccmd_req *hdr)
    return 0;
 }
 
+static int
+kgsl_query_faults(struct kgsl_context *kctx, uint64_t *value)
+{
+   /* KGSL can force-retire a faulted drawobj and replay later submissions.
+    * A later userspace fence write therefore does not prove fault-free
+    * execution. Query only this guest's owned contexts, never global sysfs
+    * counters (which also include unrelated Android applications).
+    * Called on the serialized command path, like queue create/close. */
+   hash_table_foreach(kctx->sq_to_timestamp_table, entry) {
+      struct kgsl_queue_timestamp_map *map = entry->data;
+      struct kgsl_context_property_fault faults = { 0 };
+      struct kgsl_context_property property = {
+         .data = (uintptr_t)&faults,
+         .size = sizeof(faults),
+         .type = KGSL_CONTEXT_PROP_FAULTS,
+         .contextid = (uintptr_t)entry->key,
+      };
+      int ret = kgsl_getprop(kctx->base.fd, KGSL_PROP_CONTEXT_PROPERTY,
+                            &property, sizeof(property));
+      if (ret)
+         return -errno;
+
+      uint32_t count = (uint32_t)faults.faults;
+      if (count != map->last_fault_count) {
+         kctx->fault_count += (uint32_t)(count - map->last_fault_count);
+         map->last_fault_count = count;
+         drm_err("GPU fault queue=%u timestamp=%u count=%u",
+                 property.contextid, faults.timestamp, count);
+      }
+   }
+   if (kctx->shmem)
+      kctx->shmem->global_faults = (uint32_t)kctx->fault_count;
+   *value = kctx->fault_count;
+   return 0;
+}
+
 /* Map an MSM_PARAM_* to the value the guest expects, from cached KGSL props. */
 static uint64_t
 kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
@@ -1289,9 +1688,6 @@ kgsl_msm_param(struct kgsl_context *kctx, uint32_t param)
       /* Best-effort GPU timestamp; not all guests query this. */
       return 0;
    }
-   case MSM_PARAM_FAULTS:
-      kctx->report_resets = true;
-      return kctx->shmem ? kctx->shmem->global_faults : 0;
    default:
       drm_dbg("unhandled MSM_PARAM %u", param);
       return 0;
@@ -1310,7 +1706,9 @@ kgsl_note_reset(struct kgsl_context *kctx, uint32_t drawctxt_id)
    if (kgsl_getprop(kctx->base.fd, KGSL_PROP_GPU_RESET_STAT, &status, sizeof(status)) ||
        status == KGSL_CTX_STAT_NO_ERROR || status == KGSL_CTX_STAT_INNOCENT_CONTEXT_RESET_EXT)
       return;
-   kctx->shmem->global_faults++;
+   /* in fault_count, which kgsl_query_faults also adds to and writes to global_faults whole */
+   kctx->fault_count++;
+   kctx->shmem->global_faults = (uint32_t)kctx->fault_count;
    drm_err("queue %u: the GPU was reset with this context %s (fault %u of the context)", drawctxt_id,
            status == KGSL_CTX_STAT_GUILTY_CONTEXT_RESET_EXT ? "guilty" : "involved", kctx->shmem->global_faults);
 }
@@ -1323,8 +1721,6 @@ kgsl_note_reset(struct kgsl_context *kctx, uint32_t drawctxt_id)
  * the post-fault marker, not a timestamp rejection -- but ts=0 remains a
  * reserved value worth staying off of. Verified neutral on A830.)
  */
-#define KGSL_GUEST_TS(seqno) ((uint32_t)(seqno) + 1u)
-
 /* The KGSL priority of a submitqueue's msm priority (0 highest, g_nr_timelines of them). KGSL has 16 priorities, 0 highest,
  * four to a ringbuffer; the kernel's default is 8, the third ringbuffer. With one guest priority every queue keeps the default.
  * With more, the guest's higher ones keep the default and its lowest -- turnip's medium and low -- takes the fourth
@@ -1547,18 +1943,25 @@ kgsl_drawctxt_create(struct kgsl_context *kctx, uint32_t prio, bool constrained,
     * PER_CONTEXT_TS made DRAWCTXT_CREATE return EINVAL; a priority (bits 12-15)
     * is taken with these flags.
     */
+   /* PWR_CONSTRAINT lets SETPROPERTY(KGSL_PROP_PWR_CONSTRAINT) stick to this
+    * drawctxt.  TYPE_VK / PER_CONTEXT_TS already EINVAL on this device; if
+    * this bit is also rejected, retry without it -- SETPROPERTY may still
+    * work, and if it does not we disable the feature after the first fail. */
+   const uint32_t base_flags = KGSL_CONTEXT_SAVE_GMEM |
+                               KGSL_CONTEXT_NO_GMEM_ALLOC |
+                               KGSL_CONTEXT_PREAMBLE |
+                               KGSL_CONTEXT_USER_GENERATED_TS;
    struct kgsl_drawctxt_create req = {
-      .flags = KGSL_CONTEXT_SAVE_GMEM |
-               KGSL_CONTEXT_NO_GMEM_ALLOC |
-               KGSL_CONTEXT_PREAMBLE |
-               KGSL_CONTEXT_USER_GENERATED_TS |
-               (constrained ? KGSL_CONTEXT_PWR_CONSTRAINT : 0) |
-               kgsl_priority_flags(prio),
+      .flags = base_flags | KGSL_CONTEXT_PWR_CONSTRAINT | kgsl_priority_flags(prio),
    };
 
    if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
-      drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
-      return -errno;
+      req.flags = base_flags | kgsl_priority_flags(prio);
+      req.drawctxt_id = 0;
+      if (kgsl_ioctl(kctx->base.fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req)) {
+         drm_err("DRAWCTXT_CREATE failed: %s", strerror(errno));
+         return -errno;
+      }
    }
 
    *out_id = req.drawctxt_id;
@@ -1611,8 +2014,15 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    switch (iocnr) {
    case DRM_MSM_GET_PARAM: {
       struct drm_msm_param *p = (void *)payload;
-      p->value = kgsl_msm_param(kctx, p->param);
-      rsp->ret = 0;
+      if (p->param == MSM_PARAM_FAULTS) {
+         uint64_t value = 0;
+         kctx->report_resets = true;   /* from now on each submission counts its context's GPU resets (kgsl_note_reset) */
+         rsp->ret = kgsl_query_faults(kctx, &value);
+         p->value = value;
+      } else {
+         p->value = kgsl_msm_param(kctx, p->param);
+         rsp->ret = 0;
+      }
       break;
    }
    case DRM_MSM_SET_PARAM:
@@ -1625,22 +2035,52 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
       bool constrained = kgsl_queue_constrained(q->flags);
       rsp->ret = kgsl_drawctxt_create(kctx, q->prio, constrained, &id);
       if (!rsp->ret) {
+         struct kgsl_queue_timestamp_map *timestamps =
+            calloc(1, sizeof(*timestamps));
+         if (!timestamps) {
+            kgsl_drawctxt_destroy(kctx, id);
+            rsp->ret = -ENOMEM;
+            break;
+         }
+
          q->id = id;
          if (constrained)
             _drm_log(VIRGL_LOG_LEVEL_WARNING, "context %u: constrained while it submits at an animation's rate\n", id);
          unsigned ring_idx = (MIN2(q->prio, g_nr_timelines - 1) + 1) |
                              (constrained ? KGSL_RING_IDX_CONSTRAINED : 0);
-         _mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
-                                 (void *)(uintptr_t)id,
-                                 (void *)(uintptr_t)ring_idx);
+         if (!_mesa_hash_table_insert(kctx->sq_to_ring_idx_table,
+                                      (void *)(uintptr_t)id,
+                                      (void *)(uintptr_t)ring_idx) ||
+             !_mesa_hash_table_insert(kctx->sq_to_timestamp_table,
+                                      (void *)(uintptr_t)id, timestamps)) {
+            _mesa_hash_table_remove_key(kctx->sq_to_ring_idx_table,
+                                        (void *)(uintptr_t)id);
+            struct hash_entry *entry = _mesa_hash_table_search(
+               kctx->sq_to_timestamp_table, (void *)(uintptr_t)id);
+            if (entry)
+               _mesa_hash_table_remove(kctx->sq_to_timestamp_table, entry);
+            kgsl_queue_timestamp_map_free(timestamps);
+            kgsl_drawctxt_destroy(kctx, id);
+            rsp->ret = -ENOMEM;
+         }
       }
       break;
    }
    case DRM_MSM_SUBMITQUEUE_CLOSE: {
       uint32_t id = *(uint32_t *)payload;
+      uint64_t ignored;
+      int fault_ret = kgsl_query_faults(kctx, &ignored);
+      if (fault_ret && kctx->shmem)
+         kctx->shmem->async_error++;
       kgsl_drawctxt_destroy(kctx, id);
       _mesa_hash_table_remove_key(kctx->sq_to_ring_idx_table,
                                   (void *)(uintptr_t)id);
+      struct hash_entry *timestamp_entry = _mesa_hash_table_search(
+         kctx->sq_to_timestamp_table, (void *)(uintptr_t)id);
+      if (timestamp_entry) {
+         kgsl_queue_timestamp_map_free(timestamp_entry->data);
+         _mesa_hash_table_remove(kctx->sq_to_timestamp_table, timestamp_entry);
+      }
       rsp->ret = 0;
       break;
    }
@@ -1667,6 +2107,10 @@ kgsl_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    struct kgsl_context *kctx = to_kgsl_context(dctx);
    uint64_t blob_size = ALIGN_POT(req->size, getpagesize());
    int ret = 0;
+
+   if (kgsl_diag_enabled())
+      kgsl_diag_log("gem_new ctx=%u blob_id=%u size=0x%" PRIx64 " flags=0x%x iova=0x%" PRIx64,
+                    dctx->base.ctx_id, req->blob_id, req->size, req->flags, req->iova);
 
    if (!drm_context_blob_id_valid(dctx, req->blob_id)) {
       drm_err("Invalid blob_id %u", req->blob_id);
@@ -2331,25 +2775,6 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
                  nd > 3 ? ib[nd - 4] : 0, nd > 2 ? ib[nd - 3] : 0,
                  nd > 1 ? ib[nd - 2] : 0, nd > 0 ? ib[nd - 1] : 0);
 
-         /* System Settings reproducibly faults after consuming 0x100 dwords
-          * from its 0x7ffc-byte IB, and after 0x13a0 dwords from its
-          * 0x85e4-byte IB.  Capture the host-visible command words around both
-          * CP positions without turning every submit into a full IB dump. */
-         uint32_t window_dw = 0;
-         if (c->size == 0x7ffc)
-            window_dw = 0xf0;
-         else if (c->size == 0x85e4)
-            window_dw = 0x1390;
-
-         if (window_dw && window_dw + 8 <= nd) {
-            for (uint32_t w = window_dw; w < window_dw + 0x28; w += 8) {
-               drm_log("IB-WINDOW iova=0x%" PRIx64 "+0x%x "
-                       "%08x %08x %08x %08x %08x %08x %08x %08x",
-                       obj->iova + c->submit_offset, w * 4,
-                       ib[w], ib[w + 1], ib[w + 2], ib[w + 3],
-                       ib[w + 4], ib[w + 5], ib[w + 6], ib[w + 7]);
-            }
-         }
          /* Do not leave host cache aliases behind after the diagnostic read.
           * The guest updates these shared BOs through a WC mapping; a later
           * GPU access must not snoop a stale line populated by this probe. */
@@ -2428,29 +2853,121 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (kctx->report_resets && kctx->shmem)
       kgsl_note_reset(kctx, req->queue_id);
 
-   if (kgsl_stream_check_enabled()) {
-      kgsl_stream_check_verify(dctx, kctx);
-      kgsl_stream_check_record(dctx, kctx, req->queue_id, KGSL_GUEST_TS(req->fence), kcmds, n);
+   struct hash_entry *timestamp_entry = _mesa_hash_table_search(
+      kctx->sq_to_timestamp_table, (void *)(uintptr_t)req->queue_id);
+   if (!timestamp_entry) {
+      drm_err("missing timestamp state for submitqueue: %u", req->queue_id);
+      free(kcmds);
+      return -EINVAL;
+   }
+   struct kgsl_queue_timestamp_map *timestamps = timestamp_entry->data;
+
+   /* Reserve the mapping before submitting any work.  The guest fence must
+    * remain waitable even when this submit contains many KGSL chunks. */
+   if (!kgsl_queue_timestamp_map_reserve(timestamps)) {
+      drm_err("timestamp map allocation failed queue=%u fence=%u",
+              req->queue_id, req->fence);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
    }
 
-   struct kgsl_gpu_command cmd = {
-      .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST,
-      .cmdlist = (uintptr_t)kcmds,
-      .cmdsize = sizeof(struct kgsl_command_object),
-      .numcmds = n,
-      .context_id = req->queue_id,
-      .timestamp = KGSL_GUEST_TS(req->fence), /* guest seqno (USER_GENERATED_TS) */
-   };
+   uint32_t first_timestamp = KGSL_GUEST_TS(req->fence);
+   if (first_timestamp <= timestamps->last_host_timestamp) {
+      if (timestamps->last_host_timestamp == UINT32_MAX) {
+         drm_err("KGSL timestamp sequence exhausted queue=%u", req->queue_id);
+         free(kcmds);
+         if (kctx->shmem)
+            kctx->shmem->async_error++;
+         return 0;
+      }
+      first_timestamp = timestamps->last_host_timestamp + 1;
+   }
 
-   int ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
-   free(kcmds);
+   /* g_chip_id keeps KGSL's fuse byte (see the probe), so the Adreno 830 is told with it masked off */
+   const unsigned max_ibs = (g_chip_id & ~UINT64_C(0xff)) == KGSL_A830_CHIP_ID
+                               ? KGSL_A830_GPU_COMMAND_MAX_IBS
+                               : KGSL_GPU_COMMAND_MAX_IBS;
+
+   /* Filtering can leave no IBs. Preserve the empty KGSL marker submit
+    * without underflowing n - 1 and generating out-of-bounds chunks. */
+   const unsigned chunk_count =
+      n ? (n - 1) / max_ibs + 1 : 1;
+   uint64_t final_timestamp64 = (uint64_t)first_timestamp + chunk_count - 1;
+   if (final_timestamp64 > UINT32_MAX) {
+      drm_err("KGSL timestamp range exhausted queue=%u fence=%u chunks=%u",
+              req->queue_id, req->fence, chunk_count);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
+   }
+
+   /* The stream check keeps a submission under the KGSL timestamp its last chunk retires at */
+   if (kgsl_stream_check_enabled()) {
+      kgsl_stream_check_verify(dctx, kctx);
+      kgsl_stream_check_record(dctx, kctx, req->queue_id, (uint32_t)final_timestamp64, kcmds, n);
+   }
+
+   int ret = 0;
+   unsigned submitted = 0;
+   /* Rate window is process-wide (DWM+MC share the Graphics ring).  The
+    * cmdbatch flag is what makes a stored SETPROPERTY floor take effect.
+    * A deadline queue (KGSL_RING_IDX_CONSTRAINED) has its own constraint,
+    * kgsl_constraint_update's, which this floor's clear would undo; it is
+    * left out of the rate window. */
+   const bool pwr_flag = !((uintptr_t)entry->data & KGSL_RING_IDX_CONSTRAINED) &&
+                         kgsl_pwr_on_submit(dctx->fd, req->queue_id);
+   for (unsigned chunk = 0; chunk < chunk_count; chunk++) {
+      unsigned first = chunk * max_ibs;
+      unsigned count = MIN2(n - first, max_ibs);
+      struct kgsl_gpu_command cmd = {
+         .flags = KGSL_CMDBATCH_SUBMIT_IB_LIST |
+                  (pwr_flag ? KGSL_CMDBATCH_PWR_CONSTRAINT : 0),
+         .cmdlist = (uintptr_t)&kcmds[first],
+         .cmdsize = sizeof(struct kgsl_command_object),
+         .numcmds = count,
+         .context_id = req->queue_id,
+         .timestamp = first_timestamp + chunk,
+      };
+
+      ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_GPU_COMMAND, &cmd);
+      if (ret)
+         break;
+      submitted++;
+   }
 
    if (ret) {
-      drm_err("GPU_COMMAND failed: %s", strerror(errno));
+      drm_err("GPU_COMMAND failed: %s queue=%u fence=%u cmds=%u "
+              "chunk=%u/%u submitted=%u", strerror(errno), req->queue_id,
+              req->fence, n, submitted, chunk_count, submitted);
+      if (submitted < chunk_count) {
+         unsigned first = submitted * max_ibs;
+         unsigned count = MIN2(n - first, max_ibs);
+         drm_err("GPU_COMMAND failed chunk range: [%u, %u)", first,
+                 first + count);
+      }
+      free(kcmds);
       if (kctx->shmem)
          kctx->shmem->async_error++;
       return 0; /* async error, not a protocol error */
    }
+
+   uint32_t final_timestamp = (uint32_t)final_timestamp64;
+   if (!kgsl_queue_timestamp_map_append(timestamps, req->fence,
+                                        final_timestamp)) {
+      /* This should be impossible because the slot was reserved above, but
+       * keep the submit from becoming unwaitable if the map implementation
+       * changes later. */
+      drm_err("timestamp map append failed queue=%u fence=%u",
+              req->queue_id, req->fence);
+      free(kcmds);
+      if (kctx->shmem)
+         kctx->shmem->async_error++;
+      return 0;
+   }
+   free(kcmds);
 
 
    /* Feed the ring timeline so the vdrm ring fence signals when the GPU passes
@@ -2462,12 +2979,12 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
    if (!getenv("NCTX_NO_FENCE")) {
       if (kctx->use_wait_timestamp) {
          drm_timeline_set_last_timestamp(&kctx->timelines[ring_idx - 1],
-                                         req->queue_id, KGSL_GUEST_TS(req->fence));
+                                         req->queue_id, final_timestamp);
       } else {
          struct kgsl_timestamp_event_fence fence_priv = { .fence_fd = -1 };
          struct kgsl_timestamp_event event = {
             .type = KGSL_TIMESTAMP_EVENT_FENCE,
-            .timestamp = KGSL_GUEST_TS(req->fence),
+            .timestamp = final_timestamp,
             .context_id = req->queue_id,
             .priv = &fence_priv, /* void __user *; kernel writes fence_fd back */
             .len = sizeof(fence_priv),
@@ -2522,7 +3039,7 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 
    struct kgsl_device_waittimestamp_ctxtid wait = {
       .context_id = req->queue_id,
-      .timestamp = KGSL_GUEST_TS(req->fence),
+      .timestamp = kgsl_queue_timestamp(kctx, req->queue_id, req->fence),
       .timeout = 0,
    };
 
@@ -2836,7 +3353,7 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
 
    struct kgsl_object *obj = kgsl_object_from_blob_id(kctx, blob_id);
    if (!obj) {
-      drm_err("No object for blob_id %" PRIu64, blob_id);
+      drm_err("No object for ctx=%u blob_id %" PRIu64, dctx->base.ctx_id, blob_id);
       return -ENOENT;
    }
 
@@ -3106,6 +3623,8 @@ kgsl_renderer_destroy(struct virgl_context *vctx)
       close(kctx->dma_heap_fd);
 
    _mesa_hash_table_destroy(kctx->sq_to_ring_idx_table, NULL);
+   _mesa_hash_table_destroy(kctx->sq_to_timestamp_table,
+                            kgsl_queue_timestamp_map_delete);
 
    if (kctx->constraint_on)
       kgsl_vcpu_animating(-1);
@@ -3172,8 +3691,10 @@ drm2kgsl_renderer_create(int fd, size_t debug_len, const char *debug_name)
       calloc(1, sizeof(*kctx) + g_nr_timelines * sizeof(kctx->timelines[0]));
    if (!kctx)
       return NULL;
+   bool drm_initialized = false;
 
    kctx->use_wait_timestamp = kgsl_use_wait_timestamp();
+   kctx->dma_heap_fd = -1;
    kctx->pending_guest_fd = -1;   /* calloc gives 0, which is a valid fd */
    kctx->unbind_freed = !getenv("NCTX_KEEP_FREED_RANGES");
    if (!kctx->unbind_freed)
@@ -3222,8 +3743,14 @@ drm2kgsl_renderer_create(int fd, size_t debug_len, const char *debug_name)
 
    if (!drm_context_init(&kctx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch)))
       goto fail_early;
+   drm_initialized = true;
 
    kctx->sq_to_ring_idx_table = _mesa_hash_table_create_u32_keys(NULL);
+   kctx->sq_to_timestamp_table = _mesa_hash_table_create_u32_keys(NULL);
+   if (!kctx->sq_to_ring_idx_table || !kctx->sq_to_timestamp_table) {
+      drm_err("submitqueue timestamp table allocation failed");
+      goto fail_early;
+   }
 
    for (unsigned i = 0; i < g_nr_timelines; i++) {
       drm_timeline_init(&kctx->timelines[i], &kctx->base.base, "kgsl-sync",
@@ -3254,9 +3781,15 @@ fail_early:
     * failed create (e.g. drm_context_init OOM) permanently leaks a slice;
     * after 32 leaks all CtxCreate return ENOMEM until crosvm restarts. */
    kgsl_va_slice_release(kctx);
+   if (drm_initialized)
+      drm_context_deinit(&kctx->base);
+   _mesa_hash_table_destroy(kctx->sq_to_ring_idx_table, NULL);
+   _mesa_hash_table_destroy(kctx->sq_to_timestamp_table,
+                            kgsl_queue_timestamp_map_delete);
    if (kctx->dma_heap_fd >= 0)
       close(kctx->dma_heap_fd);
-   close(fd);
+   if (!drm_initialized)
+      close(fd);
    free(kctx);
    return NULL;
 }

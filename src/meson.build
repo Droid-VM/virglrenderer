@@ -28,6 +28,8 @@ virgl_sources = [
    'iov.c',
    'virgl_context.c',
    'virgl_context.h',
+   'virgl_fence.c',
+   'virgl_fence.h',
    'virgl_hw.h',
    'virgl_protocol.h',
    'virgl_resource.c',
